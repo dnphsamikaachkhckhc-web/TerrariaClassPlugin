@@ -1,0 +1,2 @@
+# TerrariaClassPlugin
+TerrariaClassPlugin
