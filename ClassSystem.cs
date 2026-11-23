@@ -153,7 +153,6 @@ namespace ClassSystemPlugin
             return item.type == ItemID.BlandWhip ||
                    item.type == ItemID.ThornWhip ||
                    item.type == ItemID.BoneWhip ||
-                   item.type == ItemID.Firecracker ||
                    item.type == ItemID.CoolWhip ||
                    item.type == ItemID.SwordWhip ||
                    item.type == ItemID.MaceWhip ||
