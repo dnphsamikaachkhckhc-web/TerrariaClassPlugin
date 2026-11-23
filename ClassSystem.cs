@@ -16,8 +16,8 @@ namespace ClassSystemPlugin
     {
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
-        public override string Description => "Account-bound class system with underworld & webbed lock, starter gear replacement, strict weapon locks, tool damage only for Warrior, and real-time Max HP sync.";
-        public override Version Version => new Version(15, 6, 0);
+        public override string Description => "Account-bound class system with underworld lock before login, webbed lock before class selection, starter gear replacement, strict weapon locks, tool damage only for Warrior, and real-time Max HP sync.";
+        public override Version Version => new Version(15, 6, 1);
 
         private SqliteConnection _db;
         private bool _dbReady;
@@ -139,7 +139,25 @@ namespace ClassSystemPlugin
             return new Vector2(tileX * 16f, tileY * 16f);
         }
 
-        private void ApplyUnderworldWebLock(TSPlayer player)
+        private void ClearWebBuff(TSPlayer player)
+        {
+            if (player == null) return;
+            bool removed = false;
+            for (int i = 0; i < Player.maxBuffs; i++)
+            {
+                if (player.TPlayer.buffType[i] == BuffID.Webbed)
+                {
+                    player.TPlayer.DelBuff(i);
+                    removed = true;
+                }
+            }
+            if (removed)
+            {
+                NetMessage.SendData((int)PacketTypes.PlayerBuff, -1, -1, null, player.Index);
+            }
+        }
+
+        private void ApplyUnderworldLock(TSPlayer player, bool applyWeb)
         {
             if (player == null || !player.Active) return;
 
@@ -152,7 +170,14 @@ namespace ClassSystemPlugin
                 player.Teleport(hellPos.X, hellPos.Y);
             }
 
-            player.SetBuff(BuffID.Webbed, 180, true);
+            if (applyWeb)
+            {
+                player.SetBuff(BuffID.Webbed, 180, true);
+            }
+            else
+            {
+                ClearWebBuff(player);
+            }
         }
 
         private void ClearWebAndTeleportToSpawn(TSPlayer player)
@@ -160,15 +185,7 @@ namespace ClassSystemPlugin
             if (player == null) return;
 
             _frozenPositions.Remove(player.Index);
-
-            for (int i = 0; i < Player.maxBuffs; i++)
-            {
-                if (player.TPlayer.buffType[i] == BuffID.Webbed)
-                {
-                    player.TPlayer.DelBuff(i);
-                }
-            }
-            NetMessage.SendData((int)PacketTypes.PlayerBuff, -1, -1, null, player.Index);
+            ClearWebBuff(player);
 
             Vector2 spawn = GetSurfaceSpawnPosition();
             player.TPlayer.velocity = Vector2.Zero;
@@ -247,7 +264,7 @@ namespace ClassSystemPlugin
             var player = TShock.Players[args.Who];
             if (player != null && !player.IsLoggedIn)
             {
-                ApplyUnderworldWebLock(player);
+                ApplyUnderworldLock(player, false);
                 player.SendWarningMessage("[ClassSystem] Welcome to the Underworld! Log in with /login and pick a class with /class <warrior|ranger|mage|summoner> to break free.");
             }
         }
@@ -270,7 +287,7 @@ namespace ClassSystemPlugin
             }
             else
             {
-                ApplyUnderworldWebLock(args.Player);
+                ApplyUnderworldLock(args.Player, true);
                 args.Player.SendWarningMessage("[ClassSystem] You are webbed in the Underworld until you select a class using /class <warrior|ranger|mage|summoner>.");
             }
         }
@@ -298,7 +315,6 @@ namespace ClassSystemPlugin
         {
             if (item == null || item.IsAir || item.type == ItemID.None) return true;
 
-            // Always allow pickaxes, axes, and hammers in inventory for farming/mining
             if (IsGatheringTool(item)) return true;
 
             if (_restrictedArmorsAndAccessories.TryGetValue(item.type, out string reqClass))
@@ -306,7 +322,6 @@ namespace ClassSystemPlugin
                 return string.Equals(className, reqClass, StringComparison.OrdinalIgnoreCase);
             }
 
-            // Block weapons belonging to other classes immediately
             bool isClassWeapon = item.melee || item.ranged || item.magic || item.summon;
             if (!isClassWeapon || item.damage <= 0) return true;
 
@@ -357,7 +372,7 @@ namespace ClassSystemPlugin
 
             if (!player.IsLoggedIn)
             {
-                ApplyUnderworldWebLock(player);
+                ApplyUnderworldLock(player, false);
                 if (!_warnCooldown.TryGetValue(player.Index, out DateTime lastWarn) || (DateTime.UtcNow - lastWarn).TotalSeconds >= 5)
                 {
                     _warnCooldown[player.Index] = DateTime.UtcNow;
@@ -371,7 +386,7 @@ namespace ClassSystemPlugin
                 string currentClass = GetPlayerClass(player);
                 if (string.IsNullOrEmpty(currentClass))
                 {
-                    ApplyUnderworldWebLock(player);
+                    ApplyUnderworldLock(player, true);
                     if (!_warnCooldown.TryGetValue(player.Index, out DateTime lastWarn) || (DateTime.UtcNow - lastWarn).TotalSeconds >= 4)
                     {
                         _warnCooldown[player.Index] = DateTime.UtcNow;
@@ -424,14 +439,14 @@ namespace ClassSystemPlugin
 
                 if (!player.IsLoggedIn || player.Account == null)
                 {
-                    ApplyUnderworldWebLock(player);
+                    ApplyUnderworldLock(player, false);
                     continue;
                 }
 
                 string playerClass = GetPlayerClass(player);
                 if (string.IsNullOrEmpty(playerClass))
                 {
-                    ApplyUnderworldWebLock(player);
+                    ApplyUnderworldLock(player, true);
                     continue;
                 }
 
@@ -466,7 +481,6 @@ namespace ClassSystemPlugin
             var heldItem = args.Player.HeldItem;
             if (heldItem == null) return;
 
-            // Pickaxes, axes, and hammers can deal damage ONLY for Warrior; 0 damage for all other classes
             if (IsGatheringTool(heldItem))
             {
                 if (string.Equals(playerClass, "warrior", StringComparison.OrdinalIgnoreCase))
@@ -634,7 +648,7 @@ namespace ClassSystemPlugin
                 DeleteClassFromDB(target.Account.ID);
                 _playerClasses.Remove(target.Account.ID);
                 _lastSyncedMaxLife.Remove(target.Index);
-                ApplyUnderworldWebLock(target);
+                ApplyUnderworldLock(target, true);
                 target.SendWarningMessage("[ClassSystem] Your class has been reset. You are webbed in the Underworld until you select a class with /class.");
                 args.Player.SendSuccessMessage($"Reset class for {target.Name}.");
                 return;
