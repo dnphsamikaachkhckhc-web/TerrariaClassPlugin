@@ -16,8 +16,8 @@ namespace ClassSystemPlugin
     {
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
-        public override string Description => "Account-bound class system with underworld lock before login, webbed lock before class selection, starter gear replacement, strict weapon locks, tool damage only for Warrior, and real-time Max HP sync.";
-        public override Version Version => new Version(15, 6, 1);
+        public override string Description => "Account-bound class system with underworld lock before login, webbed lock only after login until class selection, starter gear replacement, strict weapon locks, tool damage only for Warrior, and real-time Max HP sync.";
+        public override Version Version => new Version(15, 6, 2);
 
         private SqliteConnection _db;
         private bool _dbReady;
@@ -97,6 +97,7 @@ namespace ClassSystemPlugin
             ServerApi.Hooks.ServerLeave.Register(this, OnServerLeave);
             ServerApi.Hooks.NpcStrike.Register(this, OnNpcStrike);
 
+            PlayerHooks.PlayerLogin += OnPlayerLogin;
             PlayerHooks.PlayerPostLogin += OnPlayerPostLogin;
             GetDataHandlers.PlayerUpdate += OnPlayerUpdate;
             GetDataHandlers.PlayerSlot += OnPlayerSlot;
@@ -112,6 +113,7 @@ namespace ClassSystemPlugin
                 ServerApi.Hooks.ServerLeave.Deregister(this, OnServerLeave);
                 ServerApi.Hooks.NpcStrike.Deregister(this, OnNpcStrike);
 
+                PlayerHooks.PlayerLogin -= OnPlayerLogin;
                 PlayerHooks.PlayerPostLogin -= OnPlayerPostLogin;
                 GetDataHandlers.PlayerUpdate -= OnPlayerUpdate;
                 GetDataHandlers.PlayerSlot -= OnPlayerSlot;
@@ -141,19 +143,21 @@ namespace ClassSystemPlugin
 
         private void ClearWebBuff(TSPlayer player)
         {
-            if (player == null) return;
+            if (player == null || player.TPlayer == null) return;
             bool removed = false;
             for (int i = 0; i < Player.maxBuffs; i++)
             {
                 if (player.TPlayer.buffType[i] == BuffID.Webbed)
                 {
-                    player.TPlayer.DelBuff(i);
+                    player.TPlayer.buffType[i] = 0;
+                    player.TPlayer.buffTime[i] = 0;
                     removed = true;
                 }
             }
             if (removed)
             {
                 NetMessage.SendData((int)PacketTypes.PlayerBuff, -1, -1, null, player.Index);
+                NetMessage.SendData((int)PacketTypes.PlayerBuff, player.Index, -1, null, player.Index);
             }
         }
 
@@ -168,6 +172,13 @@ namespace ClassSystemPlugin
             {
                 player.TPlayer.velocity = Vector2.Zero;
                 player.Teleport(hellPos.X, hellPos.Y);
+            }
+
+            // Never apply Webbed before login so /login and /register always work
+            if (!player.IsLoggedIn)
+            {
+                ClearWebBuff(player);
+                return;
             }
 
             if (applyWeb)
@@ -264,14 +275,25 @@ namespace ClassSystemPlugin
             var player = TShock.Players[args.Who];
             if (player != null && !player.IsLoggedIn)
             {
+                ClearWebBuff(player);
                 ApplyUnderworldLock(player, false);
-                player.SendWarningMessage("[ClassSystem] Welcome to the Underworld! Log in with /login and pick a class with /class <warrior|ranger|mage|summoner> to break free.");
+                player.SendWarningMessage("[ClassSystem] Welcome to the Underworld! Log in with /login and pick a class with /class <warrior|ranger|mage|summoner>.");
+            }
+        }
+
+        private void OnPlayerLogin(PlayerLoginEventArgs args)
+        {
+            if (args.Player != null)
+            {
+                ClearWebBuff(args.Player);
             }
         }
 
         private void OnPlayerPostLogin(PlayerPostLoginEventArgs args)
         {
             if (args.Player?.Account == null) return;
+
+            ClearWebBuff(args.Player);
 
             int accountId = args.Player.Account.ID;
             string savedClass = GetClassFromDB(accountId);
@@ -396,6 +418,7 @@ namespace ClassSystemPlugin
                 else
                 {
                     _frozenPositions.Remove(player.Index);
+                    ClearWebBuff(player);
                     Item held = player.TPlayer.HeldItem;
                     if (!IsItemAllowedInInventory(held, currentClass))
                     {
@@ -450,6 +473,7 @@ namespace ClassSystemPlugin
                     continue;
                 }
 
+                ClearWebBuff(player);
                 ApplyClassStats(player, playerClass);
 
                 if (playerClass == "ranger" && RangerArcheryBuff)
