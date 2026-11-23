@@ -18,7 +18,7 @@ namespace ClassSystemPlugin
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
         public override string Description => "Account-bound class system with underworld lock before login, webbed lock after login until class selection, starter gear, instant item drop on cross-class usage (ignoring coins/ammo/misc), Max HP modifiers per class + Summoning buff (+1 minion) only (other stat buffs/nerfs removed), quick /c shortcuts, Life Crystal limit, and real-time HP sync.";
-        public override Version Version => new Version(15, 24, 1);
+        public override Version Version => new Version(15, 24, 2);
 
         private SqliteConnection _db;
         private bool _dbReady;
@@ -184,17 +184,28 @@ namespace ClassSystemPlugin
 
             if (itemType > ItemID.None)
             {
-                Item.NewItem(
+                int droppedIndex = Item.NewItem(
                     (int)player.TPlayer.position.X,
                     (int)player.TPlayer.position.Y,
                     player.TPlayer.width,
                     player.TPlayer.height,
                     itemType,
                     stack,
-                    noBroadcast: false,
-                    prefixGiven: prefix,
-                    noGrabDelay: false
+                    false,
+                    0,
+                    false,
+                    false
                 );
+
+                if (droppedIndex >= 0 && droppedIndex < Main.maxItems)
+                {
+                    if (prefix > 0)
+                    {
+                        Main.item[droppedIndex].prefix = prefix;
+                    }
+                    NetMessage.SendData((int)PacketTypes.ItemDrop, -1, -1, null, droppedIndex);
+                    NetMessage.SendData((int)PacketTypes.ItemOwner, -1, -1, null, droppedIndex);
+                }
             }
 
             if (slotIndex >= 0 && slotIndex < player.TPlayer.inventory.Length)
