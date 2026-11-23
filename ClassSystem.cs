@@ -8,6 +8,7 @@ using Terraria.DataStructures;
 using Terraria.ID;
 using TerrariaApi.Server;
 using TShockAPI;
+using TShockAPI.DB;
 using TShockAPI.Hooks;
 
 namespace ClassSystemPlugin
@@ -27,8 +28,8 @@ namespace ClassSystemPlugin
     {
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
-        public override string Description => "Class & starter-choice (/ch 1|2) system with smooth native client movement/jump buffs (no position rubberbanding), custom class-selection and per-class starter-weapon prompts, server-wide broadcasts, underworld lock before login, webbed lock in underworld until completed, inventory weapon wipe on /ch selection, permanent class/choice buffs & debuffs, Max HP modifiers, cross-class item ejection, Life Crystal cap, and real-time HP sync.";
-        public override Version Version => new Version(16, 4, 0);
+        public override string Description => "Class & starter-choice (/ch 1|2) system with /n (register+login) and /l (login) commands, SlimeStaff for summoner /ch 1, smooth native client movement/jump buffs, custom prompts, server-wide broadcasts, underworld lock, inventory weapon wipe, permanent class/choice buffs & debuffs, Max HP modifiers, cross-class item ejection, Life Crystal cap, and real-time HP sync.";
+        public override Version Version => new Version(16, 5, 0);
 
         private const string ClassSelectPrompt =
             "Chat by Shokuya :3 Please select your class >w<\n\n" +
@@ -359,53 +360,53 @@ namespace ClassSystemPlugin
             {
                 if (ch == 1)
                 {
-                    list.Add(BuffID.Slow);     // เดินช้า (Client-side native, ลื่นไม่กระตุก)
-                    list.Add(BuffID.Ironskin); // บัฟยาเพิ่มเกราะ
+                    list.Add(BuffID.Slow);
+                    list.Add(BuffID.Ironskin);
                 }
                 else if (ch == 2)
                 {
-                    list.Add(BuffID.Swiftness); // บัฟยาวิ่งเร็ว (Client-side native, ลื่นไม่กระตุก)
+                    list.Add(BuffID.Swiftness);
                 }
             }
             else if (c == "ranger")
             {
                 bool hasImmunity = HasBrokenArmorImmunityItem(tPlayer);
                 list.Add(hasImmunity ? BuffID.WitheredArmor : BuffID.BrokenArmor);
-                list.Add(BuffID.Swiftness); // บัฟยาวิ่งเร็ว (Client-side native, ลื่นไม่กระตุก)
+                list.Add(BuffID.Swiftness);
                 if (ch == 1)
                 {
-                    list.Add(BuffID.Archery); // บัฟยาธนูถาวรติดตัว
+                    list.Add(BuffID.Archery);
                 }
                 else if (ch == 2)
                 {
-                    list.Add(BuffID.AmmoReservation); // บัฟยาประหยัดกระสุนปืนติดตัวถาวร
+                    list.Add(BuffID.AmmoReservation);
                 }
             }
             else if (c == "mage")
             {
                 bool hasImmunity = HasBrokenArmorImmunityItem(tPlayer);
                 list.Add(hasImmunity ? BuffID.WitheredArmor : BuffID.BrokenArmor);
-                list.Add(BuffID.Swiftness); // บัฟยาวิ่งเร็ว (Client-side native, ลื่นไม่กระตุก)
+                list.Add(BuffID.Swiftness);
                 if (ch == 1)
                 {
-                    list.Add(BuffID.MagicPower); // บัฟยาเพิ่มดาเมจสายเวทติดตัวถาวร
+                    list.Add(BuffID.MagicPower);
                 }
                 else if (ch == 2)
                 {
-                    list.Add(BuffID.ManaRegeneration); // บัฟยารีมานาเร็วถาวรติดตัว
+                    list.Add(BuffID.ManaRegeneration);
                 }
             }
             else if (c == "summoner")
             {
                 if (ch == 1)
                 {
-                    list.Add(BuffID.Summoning); // บัฟยาเพิ่มซัมม่อน +1
-                    list.Add(BuffID.Honey);     // บัฟน้ำผึ้งรีเลือดเร็ว 20%
-                    list.Add(BuffID.Swiftness); // บัฟยาวิ่งไว (Client-side native, ลื่นไม่กระตุก)
+                    list.Add(BuffID.Summoning);
+                    list.Add(BuffID.Honey);
+                    list.Add(BuffID.Swiftness);
                 }
                 else if (ch == 2)
                 {
-                    list.Add(BuffID.Swiftness); // บัฟยาวิ่งไว (Client-side native, ลื่นไม่กระตุก)
+                    list.Add(BuffID.Swiftness);
                 }
             }
 
@@ -1126,6 +1127,105 @@ namespace ClassSystemPlugin
             });
         }
 
+        private void HandleCustomRegister(TSPlayer player, string password)
+        {
+            if (player == null) return;
+            if (player.IsLoggedIn)
+            {
+                player.SendErrorMessage("[ClassSystem] You are already logged in.");
+                return;
+            }
+            if (string.IsNullOrWhiteSpace(player.Name))
+            {
+                player.SendErrorMessage("[ClassSystem] Invalid character name.");
+                return;
+            }
+            if (string.IsNullOrWhiteSpace(password))
+            {
+                player.SendErrorMessage("Usage: /n <password>");
+                return;
+            }
+            if (password.Length < TShock.Config.Settings.MinimumPasswordLength)
+            {
+                player.SendErrorMessage($"[ClassSystem] Password must be at least {TShock.Config.Settings.MinimumPasswordLength} characters.");
+                return;
+            }
+
+            var existing = TShock.UserAccounts.GetUserAccountByName(player.Name);
+            if (existing != null)
+            {
+                player.SendErrorMessage("[ClassSystem] This account already exists. Use /l <password> to log in.");
+                return;
+            }
+
+            try
+            {
+                var account = new UserAccount
+                {
+                    Name = player.Name,
+                    Group = TShock.Config.Settings.DefaultRegistrationGroupName
+                };
+                account.CreateBCryptHash(password);
+                TShock.UserAccounts.AddUserAccount(account);
+
+                player.PlayerAccount = TShock.UserAccounts.GetUserAccountByName(player.Name) ?? account;
+                player.Group = TShock.Utils.GetGroup(player.PlayerAccount.Group);
+                player.IsLoggedIn = true;
+                player.HasBeenSpotted = false;
+
+                ClearWebBuff(player);
+                player.SendSuccessMessage("[ClassSystem] Registered and logged in with /n!");
+                PlayerHooks.OnPlayerPostLogin(player);
+            }
+            catch (Exception ex)
+            {
+                TShock.Log.Error($"[ClassSystem] /n register error: {ex.Message}");
+                player.SendErrorMessage("[ClassSystem] Could not register account.");
+            }
+        }
+
+        private void HandleCustomLogin(TSPlayer player, string password)
+        {
+            if (player == null) return;
+            if (player.IsLoggedIn)
+            {
+                player.SendErrorMessage("[ClassSystem] You are already logged in.");
+                return;
+            }
+            if (string.IsNullOrWhiteSpace(player.Name))
+            {
+                player.SendErrorMessage("[ClassSystem] Invalid character name.");
+                return;
+            }
+            if (string.IsNullOrWhiteSpace(password))
+            {
+                player.SendErrorMessage("Usage: /l <password>");
+                return;
+            }
+
+            var account = TShock.UserAccounts.GetUserAccountByName(player.Name);
+            if (account == null)
+            {
+                player.SendErrorMessage("[ClassSystem] Account not found. Register first with /n <password>.");
+                return;
+            }
+
+            if (!account.VerifyPassword(password))
+            {
+                player.SendErrorMessage("[ClassSystem] Incorrect password.");
+                return;
+            }
+
+            player.PlayerAccount = account;
+            player.Group = TShock.Utils.GetGroup(account.Group);
+            player.IsLoggedIn = true;
+            player.HasBeenSpotted = false;
+
+            ClearWebBuff(player);
+            player.SendSuccessMessage("[ClassSystem] Logged in with /l!");
+            PlayerHooks.OnPlayerPostLogin(player);
+        }
+
         private void OnPlayerCommand(PlayerCommandEventArgs args)
         {
             if (args.Player == null || string.IsNullOrWhiteSpace(args.CommandName)) return;
@@ -1133,6 +1233,22 @@ namespace ClassSystemPlugin
             if (cmdName == "login" || cmdName == "register")
             {
                 ClearWebBuff(args.Player);
+                return;
+            }
+
+            if (cmdName == "n")
+            {
+                args.Handled = true;
+                string rawText = args.CommandText ?? "";
+                string password = rawText.Length > 2 ? rawText.Substring(2).Trim() : "";
+                HandleCustomRegister(args.Player, password);
+            }
+            else if (cmdName == "l")
+            {
+                args.Handled = true;
+                string rawText = args.CommandText ?? "";
+                string password = rawText.Length > 2 ? rawText.Substring(2).Trim() : "";
+                HandleCustomLogin(args.Player, password);
             }
         }
 
@@ -1143,7 +1259,7 @@ namespace ClassSystemPlugin
             {
                 ClearWebBuff(player);
                 ApplyUnderworldLock(player, false);
-                player.SendWarningMessage("[ClassSystem] Welcome to the Underworld! Log in with /login and pick a class with /c <Me|Rg|Mg|sm> or /class <warrior|ranger|mage|summoner>.");
+                player.SendWarningMessage("[ClassSystem] Welcome to the Underworld! Register with /n <password> or log in with /l <password>, then pick a class with /c <Me|Rg|Mg|sm>.");
             }
         }
 
@@ -1305,7 +1421,7 @@ namespace ClassSystemPlugin
                 if (!_warnCooldown.TryGetValue(player.Index, out DateTime lastWarn) || (DateTime.UtcNow - lastWarn).TotalSeconds >= 5)
                 {
                     _warnCooldown[player.Index] = DateTime.UtcNow;
-                    player.SendWarningMessage("[ClassSystem] Please log in with /login first to escape the Underworld.");
+                    player.SendWarningMessage("[ClassSystem] Please register with /n <password> or log in with /l <password> first to escape the Underworld.");
                 }
                 return;
             }
