@@ -21,8 +21,8 @@ namespace ClassSystemPlugin
     {
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
-        public override string Description => "Account-bound class system with underworld lock before login, webbed lock after login until class selection, starter gear, full-inventory cross-class weapon/armor drop & pickup lock (accessories allowed freely), Max HP modifiers per class + Summoning buff (+1 minion) only, +15% Honey buff life regen for Summoner only, uncleansable 5% Broken Armor reduction for Summoner, quick /c shortcuts, Life Crystal limit, and real-time HP sync.";
-        public override Version Version => new Version(15, 29, 0);
+        public override string Description => "Account-bound class system with underworld lock before login, webbed lock after login until class selection, starter gear, cross-class inventory ejection and dropped item pickup lock (accessories allowed freely), Max HP modifiers per class + Summoning buff (+1 minion) only, +15% Honey buff life regen for Summoner, uncleansable 5% Broken Armor reduction for Summoner, quick /c shortcuts, Life Crystal limit, and real-time HP sync.";
+        public override Version Version => new Version(15, 32, 0);
 
         private SqliteConnection _db;
         private bool _dbReady;
@@ -34,15 +34,16 @@ namespace ClassSystemPlugin
         private readonly Dictionary<int, DateTime> _summonBuffCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, int> _lastSyncedMaxLife = new Dictionary<int, int>();
         private readonly Dictionary<int, double> _honeyRegenAccumulator = new Dictionary<int, double>();
-        private readonly Dictionary<int, int> _preBrokenArmorDefense = new Dictionary<int, int>();
         private readonly Dictionary<int, DateTime> _brokenArmorExpiresAt = new Dictionary<int, DateTime>();
+        private readonly Dictionary<int, DateTime> _lastBrokenArmorReapply = new Dictionary<int, DateTime>();
+        private readonly Dictionary<int, HashSet<int>> _blockedWorldItemsByPlayer = new Dictionary<int, HashSet<int>>();
         private DateTime _lastTickSync = DateTime.MinValue;
         private DateTime _lastHoneyTick = DateTime.UtcNow;
 
         private const int MaxLifeCrystalsAllowed = 15;
         private const int BaseStartHp = 100;
         private const int HpPerLifeCrystal = 20;
-        private const double HoneyBonusLifeRegenMultiplier = 0.15;
+        private const double HoneyBonusLifeRegenMultiplier = 0.15; // รีเลือดเร็วขึ้น 15%
         private const double SummonerBrokenArmorReduction = 0.05; // ลดเกราะ 5% เฉพาะสาย Summoner
 
         // Max HP modifiers per class only
@@ -223,6 +224,8 @@ namespace ClassSystemPlugin
             PlayerHooks.PlayerPostLogin += OnPlayerPostLogin;
             GetDataHandlers.PlayerUpdate += OnPlayerUpdate;
             GetDataHandlers.PlayerSlot += OnPlayerSlot;
+            GetDataHandlers.ItemDrop += OnItemDrop;
+            GetDataHandlers.PlayerDamage += OnPlayerDamage;
         }
 
         protected override void Dispose(bool disposing)
@@ -239,6 +242,8 @@ namespace ClassSystemPlugin
                 PlayerHooks.PlayerPostLogin -= OnPlayerPostLogin;
                 GetDataHandlers.PlayerUpdate -= OnPlayerUpdate;
                 GetDataHandlers.PlayerSlot -= OnPlayerSlot;
+                GetDataHandlers.ItemDrop -= OnItemDrop;
+                GetDataHandlers.PlayerDamage -= OnPlayerDamage;
 
                 if (_db != null)
                 {
@@ -247,6 +252,66 @@ namespace ClassSystemPlugin
                 }
             }
             base.Dispose(disposing);
+        }
+
+        private int CalculatePlayerEquipmentDefense(Player tPlayer)
+        {
+            if (tPlayer == null) return 0;
+            int totalDef = 0;
+
+            // เกราะหลัก 3 ช่อง (หัว, ตัว, ขา)
+            for (int i = 0; i < 3 && i < tPlayer.armor.Length; i++)
+            {
+                Item arm = tPlayer.armor[i];
+                if (arm != null && !arm.IsAir && arm.type > ItemID.None)
+                {
+                    totalDef += Math.Max(0, arm.defense);
+                }
+            }
+
+            // เครื่องประดับช่อง 3..9 (รวมช่องพิเศษ) + Warding / Armored / Hard / Guarding
+            for (int i = 3; i < 10 && i < tPlayer.armor.Length; i++)
+            {
+                Item acc = tPlayer.armor[i];
+                if (acc != null && !acc.IsAir && acc.type > ItemID.None)
+                {
+                    totalDef += Math.Max(0, acc.defense);
+                    totalDef += GetDefensePrefixBonus(acc.prefix);
+                }
+            }
+
+            if (HasBuff(tPlayer, BuffID.Ironskin)) totalDef += 8;
+            if (HasBuff(tPlayer, BuffID.WellFed)) totalDef += 2;
+            if (HasBuff(tPlayer, BuffID.WellFed2)) totalDef += 3;
+            if (HasBuff(tPlayer, BuffID.WellFed3)) totalDef += 4;
+            if (HasBuff(tPlayer, BuffID.BastStatue)) totalDef += 5;
+
+            return Math.Max(0, totalDef);
+        }
+
+        private int GetDefensePrefixBonus(byte prefix)
+        {
+            switch (prefix)
+            {
+                case PrefixID.Hard: return 1;
+                case PrefixID.Guarding: return 2;
+                case PrefixID.Armored: return 3;
+                case PrefixID.Warding: return 4;
+                default: return 0;
+            }
+        }
+
+        private bool HasBuff(Player tPlayer, int buffId)
+        {
+            if (tPlayer == null) return false;
+            for (int i = 0; i < Player.maxBuffs; i++)
+            {
+                if (tPlayer.buffType[i] == buffId && tPlayer.buffTime[i] > 0)
+                {
+                    return true;
+                }
+            }
+            return false;
         }
 
         private bool HasBuff(TSPlayer player, int buffId, out int remainingTicks)
@@ -269,6 +334,47 @@ namespace ClassSystemPlugin
             return HasBuff(player, buffId, out _);
         }
 
+        private void OnPlayerDamage(object sender, GetDataHandlers.PlayerDamageEventArgs args)
+        {
+            var player = TShock.Players[args.ID];
+            if (player == null || !player.Active || !player.IsLoggedIn || player.Account == null) return;
+
+            string playerClass = GetPlayerClass(player);
+            if (!string.Equals(playerClass, "summoner", StringComparison.OrdinalIgnoreCase)) return;
+
+            DateTime now = DateTime.UtcNow;
+            bool isBrokenArmorActive = HasBuff(player, BuffID.BrokenArmor) ||
+                                       HasBuff(player, BuffID.WitheredArmor) ||
+                                       (_brokenArmorExpiresAt.TryGetValue(player.Index, out DateTime exp) && now < exp);
+
+            if (!isBrokenArmorActive || args.Damage <= 1) return;
+
+            // ฝั่ง Client หักเกราะไป 50% (ทำให้โดนดาเมจแรงขึ้น) แต่สาย Summoner ให้ลดเกราะแค่ 5%
+            // จึงคำนวณส่วนต่างของเกราะ 45% ที่ Client หักเกินไป และฮีลคืนกลับให้ตรงกับลดเกราะ 5% จริง
+            int baseDefense = CalculatePlayerEquipmentDefense(player.TPlayer);
+            if (baseDefense <= 0) return;
+
+            // อัตราลดดาเมจต่อเกราะ 1 หน่วย: Classic = 0.5, Expert = 0.75, Master = 1.0
+            double defenseEffectiveness = Main.masterMode ? 1.0 : (Main.expertMode ? 0.75 : 0.5);
+
+            int defAt50Percent = (int)Math.Floor(baseDefense * 0.50);
+            int defAt5PercentLoss = (int)Math.Floor(baseDefense * (1.0 - SummonerBrokenArmorReduction));
+            int extraDefenseSaved = Math.Max(0, defAt5PercentLoss - defAt50Percent);
+
+            int damageRefund = (int)Math.Floor(extraDefenseSaved * defenseEffectiveness);
+            if (damageRefund > 0)
+            {
+                int maxRefund = Math.Max(0, args.Damage - 1);
+                int actualRefund = Math.Min(damageRefund, maxRefund);
+                if (actualRefund > 0 && player.TPlayer.statLife > 0)
+                {
+                    player.TPlayer.statLife = Math.Min(player.TPlayer.statLifeMax2, player.TPlayer.statLife + actualRefund);
+                    NetMessage.SendData((int)PacketTypes.PlayerHp, -1, -1, null, player.Index);
+                    NetMessage.SendData((int)PacketTypes.PlayerHp, player.Index, -1, null, player.Index);
+                }
+            }
+        }
+
         private void ApplySummonerBrokenArmor5Percent(TSPlayer player, string playerClass, DateTime now)
         {
             if (player?.TPlayer == null || !player.Active) return;
@@ -276,17 +382,10 @@ namespace ClassSystemPlugin
             var tPlayer = player.TPlayer;
             bool isSummoner = string.Equals(playerClass, "summoner", StringComparison.OrdinalIgnoreCase);
 
-            if (!isSummoner)
+            if (!isSummoner || tPlayer.dead)
             {
-                _preBrokenArmorDefense.Remove(player.Index);
                 _brokenArmorExpiresAt.Remove(player.Index);
-                return;
-            }
-
-            if (tPlayer.dead)
-            {
-                _preBrokenArmorDefense.Remove(player.Index);
-                _brokenArmorExpiresAt.Remove(player.Index);
+                _lastBrokenArmorReapply.Remove(player.Index);
                 return;
             }
 
@@ -294,8 +393,7 @@ namespace ClassSystemPlugin
 
             if (hasBrokenArmor)
             {
-                // อัปเดตเวลาหมดอายุของสถานะเกราะแตก
-                double secLeft = Math.Max(0.1, remainingTicks / 60.0);
+                double secLeft = Math.Max(0.2, remainingTicks / 60.0);
                 DateTime newExpiry = now.AddSeconds(secLeft);
                 if (!_brokenArmorExpiresAt.TryGetValue(player.Index, out DateTime existingExpiry) || newExpiry > existingExpiry)
                 {
@@ -304,35 +402,24 @@ namespace ClassSystemPlugin
             }
             else if (_brokenArmorExpiresAt.TryGetValue(player.Index, out DateTime expiry) && now < expiry)
             {
-                // หากถูกของล้างดีบัฟ/ของกันดีบัฟลบออกก่อนหมดเวลา ให้คืนบัฟเกราะแตกกลับเข้าไปทันที
-                int ticksToRestore = Math.Max(1, (int)Math.Ceiling((expiry - now).TotalSeconds * 60.0));
-                player.SetBuff(BuffID.BrokenArmor, ticksToRestore, true);
-                hasBrokenArmor = true;
+                // หากใส่ของล้างดีบัฟ (เช่น Ankh Shield / Armor Polish) ให้ยิงบัฟ BrokenArmor กลับเข้าไปทุกๆ 0.25 วินาทีเพื่อไม่ให้ล้างได้
+                if (!_lastBrokenArmorReapply.TryGetValue(player.Index, out DateTime lastReapply) || (now - lastReapply).TotalMilliseconds >= 250)
+                {
+                    _lastBrokenArmorReapply[player.Index] = now;
+                    int ticksToRestore = Math.Max(15, (int)Math.Ceiling((expiry - now).TotalSeconds * 60.0));
+                    player.SetBuff(BuffID.BrokenArmor, ticksToRestore, true);
+                }
             }
             else
             {
-                _preBrokenArmorDefense.Remove(player.Index);
                 _brokenArmorExpiresAt.Remove(player.Index);
+                _lastBrokenArmorReapply.Remove(player.Index);
                 return;
             }
 
-            if (!hasBrokenArmor) return;
-
-            int currentDef = Math.Max(0, tPlayer.statDefense);
-            if (!_preBrokenArmorDefense.TryGetValue(player.Index, out int originalDef) || originalDef <= 0)
-            {
-                originalDef = currentDef > 0 ? Math.Max(currentDef, currentDef * 2) : 0;
-                _preBrokenArmorDefense[player.Index] = originalDef;
-            }
-            else if (currentDef > originalDef)
-            {
-                originalDef = currentDef;
-                _preBrokenArmorDefense[player.Index] = originalDef;
-            }
-
-            int reducedAmount = (int)Math.Floor(originalDef * SummonerBrokenArmorReduction);
-            int targetDefense = Math.Max(0, originalDef - reducedAmount);
-            tPlayer.statDefense = targetDefense;
+            int baseDef = CalculatePlayerEquipmentDefense(tPlayer);
+            int reducedAmount = (int)Math.Floor(baseDef * SummonerBrokenArmorReduction);
+            tPlayer.statDefense = Math.Max(0, baseDef - reducedAmount);
         }
 
         private void ApplyHoneyRegenBonus(TSPlayer player, string playerClass, double deltaSeconds)
@@ -346,17 +433,20 @@ namespace ClassSystemPlugin
             }
 
             var tPlayer = player.TPlayer;
-            int baseRegen = Math.Max(0, tPlayer.lifeRegen);
-            int bonusRegen = baseRegen > 0
-                ? Math.Max(1, (int)Math.Ceiling(baseRegen * HoneyBonusLifeRegenMultiplier))
-                : 0;
-            tPlayer.lifeRegen += bonusRegen;
+
+            // บัฟน้ำผึ้งปกติในเกมให้ +2 lifeRegen (+1 HP/วินาที) และเพิ่มอัตราฟื้นฟูธรรมชาติ
+            // เพิ่มอีก 15% ของอัตราฟื้นฟูรวม (ฐาน + น้ำผึ้ง) และฮีลจริงส่งแพ็กเก็ตให้ Client เห็นผลชัดเจนในเกม
+            double baseHoneyHpPerSec = 2.5; // อัตราฟื้นฟูเฉลี่ยเมื่อมีบัฟน้ำผึ้ง (ยืนนิ่ง/เคลื่อนที่)
+            if (HasBuff(player, BuffID.Campfire)) baseHoneyHpPerSec += 0.5;
+            if (HasBuff(player, BuffID.HeartLamp)) baseHoneyHpPerSec += 1.0;
+            if (HasBuff(player, BuffID.Regeneration)) baseHoneyHpPerSec += 2.0;
+
+            double bonusHpPerSec = Math.Max(0.45, baseHoneyHpPerSec * HoneyBonusLifeRegenMultiplier);
 
             if (tPlayer.statLife > 0 && tPlayer.statLife < tPlayer.statLifeMax2 && deltaSeconds > 0)
             {
-                double effectiveHpPerSec = Math.Max(0.25, (baseRegen * 0.5) * HoneyBonusLifeRegenMultiplier);
                 _honeyRegenAccumulator.TryGetValue(player.Index, out double acc);
-                acc += effectiveHpPerSec * deltaSeconds;
+                acc += bonusHpPerSec * deltaSeconds;
 
                 int healAmount = (int)Math.Floor(acc);
                 if (healAmount > 0)
@@ -371,6 +461,99 @@ namespace ClassSystemPlugin
                     }
                 }
                 _honeyRegenAccumulator[player.Index] = acc;
+            }
+        }
+
+        private void RegisterBlockedWorldItem(int playerIndex, int worldItemIndex)
+        {
+            if (playerIndex < 0 || worldItemIndex < 0 || worldItemIndex >= Main.maxItems) return;
+            if (!_blockedWorldItemsByPlayer.TryGetValue(playerIndex, out var set))
+            {
+                set = new HashSet<int>();
+                _blockedWorldItemsByPlayer[playerIndex] = set;
+            }
+            set.Add(worldItemIndex);
+        }
+
+        private bool IsBlockedWorldItem(int playerIndex, int worldItemIndex)
+        {
+            if (worldItemIndex < 0 || worldItemIndex >= Main.maxItems) return false;
+            var wItem = Main.item[worldItemIndex];
+            if (wItem == null || !wItem.active || wItem.type <= ItemID.None) return false;
+
+            if (_blockedWorldItemsByPlayer.TryGetValue(playerIndex, out var set) && set.Contains(worldItemIndex))
+            {
+                return true;
+            }
+
+            var player = TShock.Players[playerIndex];
+            if (player?.Account != null && player.IsLoggedIn)
+            {
+                string currentClass = GetPlayerClass(player);
+                if (!string.IsNullOrEmpty(currentClass))
+                {
+                    Item checkItem = new Item();
+                    checkItem.SetDefaults(wItem.type);
+                    checkItem.stack = Math.Max(1, wItem.stack);
+                    if (!IsItemAllowedForClass(checkItem, currentClass))
+                    {
+                        RegisterBlockedWorldItem(playerIndex, worldItemIndex);
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        private void CleanupInactiveBlockedWorldItems(int playerIndex)
+        {
+            if (!_blockedWorldItemsByPlayer.TryGetValue(playerIndex, out var set) || set.Count == 0) return;
+            var expired = new List<int>();
+            foreach (int idx in set)
+            {
+                if (idx < 0 || idx >= Main.maxItems || Main.item[idx] == null || !Main.item[idx].active || Main.item[idx].type <= ItemID.None)
+                {
+                    expired.Add(idx);
+                }
+            }
+            foreach (int idx in expired)
+            {
+                set.Remove(idx);
+            }
+        }
+
+        private void OnItemDrop(object sender, GetDataHandlers.ItemDropEventArgs args)
+        {
+            var player = TShock.Players[args.PlayerId];
+            if (player == null || !player.Active || !player.IsLoggedIn || player.Account == null) return;
+
+            string currentClass = GetPlayerClass(player);
+            if (string.IsNullOrEmpty(currentClass)) return;
+
+            if (args.ID >= 0 && args.ID < Main.maxItems)
+            {
+                var worldItem = Main.item[args.ID];
+                if (worldItem != null && worldItem.active && worldItem.type > ItemID.None)
+                {
+                    Item checkItem = new Item();
+                    checkItem.SetDefaults(worldItem.type);
+                    checkItem.stack = Math.Max(1, worldItem.stack);
+
+                    if (!IsItemAllowedForClass(checkItem, currentClass))
+                    {
+                        RegisterBlockedWorldItem(player.Index, args.ID);
+                    }
+                }
+
+                if (args.Stacks <= 0 && IsBlockedWorldItem(player.Index, args.ID))
+                {
+                    args.Handled = true;
+                    NetMessage.SendData((int)PacketTypes.ItemDrop, player.Index, -1, null, args.ID);
+                    var wItem = Main.item[args.ID];
+                    string itemName = (wItem != null && wItem.type > ItemID.None) ? Lang.GetItemNameValue(wItem.type) : "item";
+                    NotifyBlockedPickup(player, itemName);
+                }
             }
         }
 
@@ -412,9 +595,9 @@ namespace ClassSystemPlugin
             player.TPlayer.itemTime = 0;
         }
 
-        private void SpawnDroppedItemOnGround(TSPlayer player, int itemType, int stack, byte prefix)
+        private int SpawnDroppedItemOnGround(TSPlayer player, int itemType, int stack, byte prefix)
         {
-            if (player?.TPlayer == null || itemType <= ItemID.None) return;
+            if (player?.TPlayer == null || itemType <= ItemID.None) return -1;
 
             int droppedIndex = Item.NewItem(
                 new MiscEntitySource(),
@@ -425,23 +608,27 @@ namespace ClassSystemPlugin
 
             if (droppedIndex >= 0 && droppedIndex < Main.maxItems)
             {
+                float dir = player.TPlayer.direction != 0 ? player.TPlayer.direction : 1f;
                 Main.item[droppedIndex].prefix = prefix;
                 Main.item[droppedIndex].playerIndexTheItemIsReservedFor = 255;
-                Main.item[droppedIndex].velocity = new Vector2(player.TPlayer.direction * 3f, -2.5f);
+                Main.item[droppedIndex].velocity = new Vector2(dir * 4f, -2.5f);
 
                 NetMessage.SendData((int)PacketTypes.ItemDrop, -1, -1, null, droppedIndex);
                 NetMessage.SendData((int)PacketTypes.ItemOwner, -1, -1, null, droppedIndex);
+                RegisterBlockedWorldItem(player.Index, droppedIndex);
             }
+
+            return droppedIndex;
         }
 
-        private void NotifyDroppedCrossClassItem(TSPlayer player, string itemName)
+        private void NotifyBlockedPickup(TSPlayer player, string itemName)
         {
             if (player == null) return;
             if (!_dropWarnCooldown.TryGetValue(player.Index, out DateTime lastWarn) || (DateTime.UtcNow - lastWarn).TotalSeconds >= 2)
             {
                 _dropWarnCooldown[player.Index] = DateTime.UtcNow;
                 string className = GetPlayerClass(player) ?? "class";
-                player.SendWarningMessage($"[ClassSystem] Dropped '{itemName}' — {className.ToUpper()} cannot hold or pick up weapons/armor from other classes.");
+                player.SendWarningMessage($"[ClassSystem] Ejected '{itemName}' — {className.ToUpper()} cannot hold or pick up items from other classes.");
             }
         }
 
@@ -476,7 +663,7 @@ namespace ClassSystemPlugin
                 ClearPlayerNetSlot(player, netSlotIndex);
             }
 
-            NotifyDroppedCrossClassItem(player, itemName);
+            NotifyBlockedPickup(player, itemName);
         }
 
         private void ClearPlayerNetSlot(TSPlayer player, int netSlotIndex)
@@ -784,8 +971,9 @@ namespace ClassSystemPlugin
             _summonBuffCooldown.Remove(args.Who);
             _lastSyncedMaxLife.Remove(args.Who);
             _honeyRegenAccumulator.Remove(args.Who);
-            _preBrokenArmorDefense.Remove(args.Who);
             _brokenArmorExpiresAt.Remove(args.Who);
+            _lastBrokenArmorReapply.Remove(args.Who);
+            _blockedWorldItemsByPlayer.Remove(args.Who);
         }
 
         private bool IsGatheringTool(Item item)
@@ -888,6 +1076,7 @@ namespace ClassSystemPlugin
                 else
                 {
                     _frozenPositions.Remove(player.Index);
+                    CleanupInactiveBlockedWorldItems(player.Index);
                     Item held = player.TPlayer.HeldItem;
 
                     if (held != null && !held.IsAir && held.type == ItemID.LifeCrystal && IsLifeCrystalAtLimit(player))
@@ -928,10 +1117,8 @@ namespace ClassSystemPlugin
                 if (!IsItemAllowedForClass(testItem, currentClass))
                 {
                     args.Handled = true;
-                    Item existing = (args.Slot >= 0 && args.Slot < player.TPlayer.inventory.Length)
-                        ? player.TPlayer.inventory[args.Slot]
-                        : null;
-                    DropDisallowedItemAndClearSlot(player, args.Slot, existing, args.Type, args.Stack);
+                    ClearPlayerNetSlot(player, args.Slot);
+                    NotifyBlockedPickup(player, testItem.Name);
                 }
             }
         }
@@ -955,8 +1142,8 @@ namespace ClassSystemPlugin
                 if (!player.IsLoggedIn || player.Account == null)
                 {
                     _honeyRegenAccumulator.Remove(player.Index);
-                    _preBrokenArmorDefense.Remove(player.Index);
                     _brokenArmorExpiresAt.Remove(player.Index);
+                    _lastBrokenArmorReapply.Remove(player.Index);
                     if (runPeriodicSync)
                     {
                         ApplyUnderworldLock(player, false);
@@ -968,8 +1155,8 @@ namespace ClassSystemPlugin
                 if (string.IsNullOrEmpty(playerClass))
                 {
                     _honeyRegenAccumulator.Remove(player.Index);
-                    _preBrokenArmorDefense.Remove(player.Index);
                     _brokenArmorExpiresAt.Remove(player.Index);
+                    _lastBrokenArmorReapply.Remove(player.Index);
                     if (runPeriodicSync)
                     {
                         ApplyUnderworldLock(player, true);
@@ -984,6 +1171,7 @@ namespace ClassSystemPlugin
                 if (runPeriodicSync)
                 {
                     ClearWebBuff(player);
+                    CleanupInactiveBlockedWorldItems(player.Index);
                     EnforceAllowedInventory(player, playerClass);
 
                     if (playerClass == "summoner")
