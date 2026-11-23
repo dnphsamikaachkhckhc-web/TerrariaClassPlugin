@@ -17,8 +17,8 @@ namespace ClassSystemPlugin
     {
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
-        public override string Description => "Account-bound class system with underworld lock before login, webbed lock only after login until class selection, starter gear replacement, strict cross-class weapon blocks (including StrikeNpc & DamageClass checks) without deleting items, +1 minion via Summoning buff (2 total minions at start), direct nerf on all whips from 1.0 base, boosted summon damage, gathering tool damage rules, quick /c shortcuts, hard Life Crystal usage block, custom stat modifiers, smooth update loop, and real-time HP/Mana sync.";
-        public override Version Version => new Version(15, 20, 10);
+        public override string Description => "Account-bound class system with underworld lock before login, webbed lock only after login until class selection, starter gear replacement, strict cross-class weapon blocks without deleting items, +1 minion via Summoning buff (2 total minions at start), direct nerf on all whips from 1.0 base, boosted summon damage, gathering tool damage rules, quick /c shortcuts, hard Life Crystal usage block, custom stat modifiers, smooth update loop, and real-time HP/Mana sync.";
+        public override Version Version => new Version(15, 20, 11);
 
         private SqliteConnection _db;
         private bool _dbReady;
@@ -121,7 +121,6 @@ namespace ClassSystemPlugin
             GetDataHandlers.PlayerUpdate += OnPlayerUpdate;
             GetDataHandlers.PlayerSlot += OnPlayerSlot;
             GetDataHandlers.PlayerDamage += OnPlayerDamage;
-            GetDataHandlers.StrikeNpc += OnStrikeNpcPacket;
         }
 
         protected override void Dispose(bool disposing)
@@ -139,7 +138,6 @@ namespace ClassSystemPlugin
                 GetDataHandlers.PlayerUpdate -= OnPlayerUpdate;
                 GetDataHandlers.PlayerSlot -= OnPlayerSlot;
                 GetDataHandlers.PlayerDamage -= OnPlayerDamage;
-                GetDataHandlers.StrikeNpc -= OnStrikeNpcPacket;
 
                 if (_db != null)
                 {
@@ -621,32 +619,6 @@ namespace ClassSystemPlugin
                 args.Handled = true;
                 BlockItemUsage(player, true);
                 NotifyBlockedItem(player, Lang.GetItemNameValue(args.Type), currentClass);
-            }
-        }
-
-        private void OnStrikeNpcPacket(object sender, GetDataHandlers.StrikeNpcEventArgs args)
-        {
-            var player = args.Player;
-            if (player == null || !player.Active || !player.IsLoggedIn || player.Account == null) return;
-
-            string currentClass = GetPlayerClass(player);
-            if (string.IsNullOrEmpty(currentClass)) return;
-
-            Item held = player.TPlayer.HeldItem;
-            if (held != null && !held.IsAir)
-            {
-                if (IsGatheringTool(held) && !HasClassLifeRegen(player, currentClass))
-                {
-                    args.Handled = true;
-                    return;
-                }
-
-                if (!IsItemAllowedForClass(held, currentClass))
-                {
-                    args.Handled = true;
-                    BlockItemUsage(player, true);
-                    NotifyBlockedItem(player, held.Name, currentClass);
-                }
             }
         }
 
