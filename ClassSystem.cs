@@ -27,8 +27,8 @@ namespace ClassSystemPlugin
     {
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
-        public override string Description => "Class & starter-choice (/ch 1|2) system with custom class-selection and per-class starter-weapon prompts, server-wide broadcasts during selection phases, underworld lock before login, webbed lock in underworld until completed, inventory weapon wipe on /ch selection, permanent class/choice buffs & debuffs, Max HP modifiers, cross-class item ejection, Life Crystal cap, and real-time HP sync.";
-        public override Version Version => new Version(16, 3, 1);
+        public override string Description => "Class & starter-choice (/ch 1|2) system with smooth native client movement/jump buffs (no position rubberbanding), custom class-selection and per-class starter-weapon prompts, server-wide broadcasts, underworld lock before login, webbed lock in underworld until completed, inventory weapon wipe on /ch selection, permanent class/choice buffs & debuffs, Max HP modifiers, cross-class item ejection, Life Crystal cap, and real-time HP sync.";
+        public override Version Version => new Version(16, 4, 0);
 
         private const string ClassSelectPrompt =
             "Chat by Shokuya :3 Please select your class >w<\n\n" +
@@ -335,36 +335,6 @@ namespace ClassSystemPlugin
             return 0.0;
         }
 
-        private float GetMoveSpeedMultiplierDelta(PlayerClassState state)
-        {
-            if (state == null || string.IsNullOrEmpty(state.ClassName) || state.StarterChoice <= 0)
-                return 0f;
-
-            string c = state.ClassName.ToLowerInvariant();
-            int ch = state.StarterChoice;
-
-            if (c == "warrior")
-            {
-                if (ch == 1) return -0.10f;
-                if (ch == 2) return 0.10f;
-            }
-            else if (c == "ranger")
-            {
-                if (ch == 1 || ch == 2) return 0.20f;
-            }
-            else if (c == "mage")
-            {
-                if (ch == 1 || ch == 2) return 0.15f;
-            }
-            else if (c == "summoner")
-            {
-                if (ch == 1) return 0.15f;
-                if (ch == 2) return 0.10f;
-            }
-
-            return 0f;
-        }
-
         private double GetHoneyBonusMultiplier(PlayerClassState state)
         {
             if (state == null || string.IsNullOrEmpty(state.ClassName) || state.StarterChoice <= 0)
@@ -389,53 +359,53 @@ namespace ClassSystemPlugin
             {
                 if (ch == 1)
                 {
-                    list.Add(BuffID.Slow);
-                    list.Add(BuffID.Ironskin);
+                    list.Add(BuffID.Slow);     // เดินช้า (Client-side native, ลื่นไม่กระตุก)
+                    list.Add(BuffID.Ironskin); // บัฟยาเพิ่มเกราะ
                 }
                 else if (ch == 2)
                 {
-                    list.Add(BuffID.Swiftness);
+                    list.Add(BuffID.Swiftness); // บัฟยาวิ่งเร็ว (Client-side native, ลื่นไม่กระตุก)
                 }
             }
             else if (c == "ranger")
             {
                 bool hasImmunity = HasBrokenArmorImmunityItem(tPlayer);
                 list.Add(hasImmunity ? BuffID.WitheredArmor : BuffID.BrokenArmor);
-                list.Add(BuffID.Swiftness);
+                list.Add(BuffID.Swiftness); // บัฟยาวิ่งเร็ว (Client-side native, ลื่นไม่กระตุก)
                 if (ch == 1)
                 {
-                    list.Add(BuffID.Archery);
+                    list.Add(BuffID.Archery); // บัฟยาธนูถาวรติดตัว
                 }
                 else if (ch == 2)
                 {
-                    list.Add(BuffID.AmmoReservation);
+                    list.Add(BuffID.AmmoReservation); // บัฟยาประหยัดกระสุนปืนติดตัวถาวร
                 }
             }
             else if (c == "mage")
             {
                 bool hasImmunity = HasBrokenArmorImmunityItem(tPlayer);
                 list.Add(hasImmunity ? BuffID.WitheredArmor : BuffID.BrokenArmor);
-                list.Add(BuffID.Swiftness);
+                list.Add(BuffID.Swiftness); // บัฟยาวิ่งเร็ว (Client-side native, ลื่นไม่กระตุก)
                 if (ch == 1)
                 {
-                    list.Add(BuffID.MagicPower);
+                    list.Add(BuffID.MagicPower); // บัฟยาเพิ่มดาเมจสายเวทติดตัวถาวร
                 }
                 else if (ch == 2)
                 {
-                    list.Add(BuffID.ManaRegeneration);
+                    list.Add(BuffID.ManaRegeneration); // บัฟยารีมานาเร็วถาวรติดตัว
                 }
             }
             else if (c == "summoner")
             {
                 if (ch == 1)
                 {
-                    list.Add(BuffID.Summoning);
-                    list.Add(BuffID.Honey);
-                    list.Add(BuffID.Swiftness);
+                    list.Add(BuffID.Summoning); // บัฟยาเพิ่มซัมม่อน +1
+                    list.Add(BuffID.Honey);     // บัฟน้ำผึ้งรีเลือดเร็ว 20%
+                    list.Add(BuffID.Swiftness); // บัฟยาวิ่งไว (Client-side native, ลื่นไม่กระตุก)
                 }
                 else if (ch == 2)
                 {
-                    list.Add(BuffID.Swiftness);
+                    list.Add(BuffID.Swiftness); // บัฟยาวิ่งไว (Client-side native, ลื่นไม่กระตุก)
                 }
             }
 
@@ -447,7 +417,7 @@ namespace ClassSystemPlugin
             if (player == null || player.TPlayer == null || !player.Active || player.TPlayer.dead) return;
             if (state == null || string.IsNullOrEmpty(state.ClassName) || state.StarterChoice <= 0) return;
 
-            if (_buffRefreshCooldown.TryGetValue(player.Index, out DateTime lastCd) && (DateTime.UtcNow - lastCd).TotalMilliseconds < 400)
+            if (_buffRefreshCooldown.TryGetValue(player.Index, out DateTime lastCd) && (DateTime.UtcNow - lastCd).TotalMilliseconds < 1500)
                 return;
 
             int[] requiredBuffs = GetPermanentBuffsForState(state, player.TPlayer);
@@ -459,7 +429,7 @@ namespace ClassSystemPlugin
                 bool found = false;
                 for (int i = 0; i < Player.maxBuffs; i++)
                 {
-                    if (player.TPlayer.buffType[i] == buffId && player.TPlayer.buffTime[i] > 60)
+                    if (player.TPlayer.buffType[i] == buffId && player.TPlayer.buffTime[i] > 180)
                     {
                         found = true;
                         break;
@@ -468,7 +438,7 @@ namespace ClassSystemPlugin
 
                 if (!found)
                 {
-                    player.SetBuff(buffId, 240, true);
+                    player.SetBuff(buffId, 600, true);
                     appliedAny = true;
                 }
             }
@@ -476,21 +446,6 @@ namespace ClassSystemPlugin
             if (appliedAny)
             {
                 _buffRefreshCooldown[player.Index] = DateTime.UtcNow;
-            }
-        }
-
-        private void ApplyMovementSpeedDelta(TSPlayer player, PlayerClassState state)
-        {
-            if (player?.TPlayer == null || !player.Active || player.TPlayer.dead) return;
-            float delta = GetMoveSpeedMultiplierDelta(state);
-            if (Math.Abs(delta) < 0.001f) return;
-
-            var tPlayer = player.TPlayer;
-            if (Math.Abs(tPlayer.velocity.X) > 0.1f)
-            {
-                float moveDeltaX = tPlayer.velocity.X * delta;
-                tPlayer.position.X += moveDeltaX;
-                NetMessage.SendData((int)PacketTypes.PlayerUpdate, -1, -1, null, player.Index);
             }
         }
 
@@ -1391,7 +1346,6 @@ namespace ClassSystemPlugin
                 {
                     _frozenPositions.Remove(player.Index);
                     CleanupInactiveBlockedWorldItems(player.Index);
-                    ApplyMovementSpeedDelta(player, state);
                     Item held = player.TPlayer.HeldItem;
 
                     if (held != null && !held.IsAir && held.type == ItemID.LifeCrystal && IsLifeCrystalAtLimit(player))
