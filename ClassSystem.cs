@@ -21,8 +21,8 @@ namespace ClassSystemPlugin
     {
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
-        public override string Description => "Account-bound class system with underworld lock before login, webbed lock after login until class selection, starter gear, cross-class inventory ejection (never deleted) and dropped item pickup lock, Max HP modifiers per class + permanent Summoning buff + permanent Honey buff (+15% life regen) + permanent uncleansable Broken Armor buff (5% defense reduction) for Summoner, quick /c shortcuts, Life Crystal limit, and real-time HP sync.";
-        public override Version Version => new Version(15, 34, 0);
+        public override string Description => "Account-bound class system with underworld lock before login, webbed lock after login until class selection, starter gear, safe cross-class inventory ejection (never deleted) and dropped item pickup lock, Max HP modifiers per class + permanent Summoning buff + permanent Honey buff (+15% life regen) + permanent uncleansable Broken Armor buff (5% defense reduction) for Summoner, quick /c shortcuts, Life Crystal limit, and real-time HP sync.";
+        public override Version Version => new Version(15, 35, 0);
 
         private SqliteConnection _db;
         private bool _dbReady;
@@ -30,6 +30,7 @@ namespace ClassSystemPlugin
         private readonly Dictionary<int, Vector2> _frozenPositions = new Dictionary<int, Vector2>();
         private readonly Dictionary<int, DateTime> _warnCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, DateTime> _dropWarnCooldown = new Dictionary<int, DateTime>();
+        private readonly Dictionary<int, DateTime> _slotEjectCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, DateTime> _crystalWarnCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, DateTime> _summonBuffCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, DateTime> _honeyBuffCooldown = new Dictionary<int, DateTime>();
@@ -569,8 +570,13 @@ namespace ClassSystemPlugin
                 if (args.Stacks <= 0 && IsBlockedWorldItem(player.Index, args.ID))
                 {
                     args.Handled = true;
-                    NetMessage.SendData((int)PacketTypes.ItemDrop, player.Index, -1, null, args.ID);
                     var wItem = Main.item[args.ID];
+                    if (wItem != null && wItem.active && wItem.type > ItemID.None)
+                    {
+                        wItem.playerIndexTheItemIsReservedFor = 255;
+                    }
+                    NetMessage.SendData((int)PacketTypes.ItemDrop, -1, -1, null, args.ID);
+                    NetMessage.SendData((int)PacketTypes.ItemOwner, -1, -1, null, args.ID);
                     string itemName = (wItem != null && wItem.type > ItemID.None) ? Lang.GetItemNameValue(wItem.type) : "item";
                     NotifyBlockedPickup(player, itemName);
                 }
@@ -631,7 +637,7 @@ namespace ClassSystemPlugin
                 float dir = player.TPlayer.direction != 0 ? player.TPlayer.direction : 1f;
                 Main.item[droppedIndex].prefix = prefix;
                 Main.item[droppedIndex].playerIndexTheItemIsReservedFor = 255;
-                Main.item[droppedIndex].velocity = new Vector2(dir * 4f, -2.5f);
+                Main.item[droppedIndex].velocity = new Vector2(dir * 3.5f, -2.5f);
 
                 NetMessage.SendData((int)PacketTypes.ItemDrop, -1, -1, null, droppedIndex);
                 NetMessage.SendData((int)PacketTypes.ItemOwner, -1, -1, null, droppedIndex);
@@ -648,17 +654,31 @@ namespace ClassSystemPlugin
             {
                 _dropWarnCooldown[player.Index] = DateTime.UtcNow;
                 string className = GetPlayerClass(player) ?? "class";
-                player.SendWarningMessage($"[ClassSystem] Ejected '{itemName}' — {className.ToUpper()} cannot hold or pick up items from other classes.");
+                player.SendWarningMessage($"[ClassSystem] Dropped '{itemName}' onto the ground (not deleted) — {className.ToUpper()} cannot use or pick up items from other classes.");
             }
         }
 
-        private void DropDisallowedItemAndClearSlot(TSPlayer player, int netSlotIndex, Item itemToDrop, int fallbackType, int fallbackStack, byte fallbackPrefix = 0)
+        private bool CanEjectSlotNow(int playerIndex, int netSlotIndex)
+        {
+            int key = (playerIndex * 1000) + Math.Max(0, netSlotIndex);
+            if (_slotEjectCooldown.TryGetValue(key, out DateTime lastTime) && (DateTime.UtcNow - lastTime).TotalMilliseconds < 350)
+            {
+                return false;
+            }
+            _slotEjectCooldown[key] = DateTime.UtcNow;
+            return true;
+        }
+
+        private void EjectDisallowedItemSafely(TSPlayer player, int netSlotIndex, Item itemToDrop, int fallbackType, int fallbackStack, byte fallbackPrefix = 0)
         {
             if (player?.TPlayer == null) return;
+            if (!CanEjectSlotNow(player.Index, netSlotIndex)) return;
 
             int itemType = itemToDrop != null && !itemToDrop.IsAir && itemToDrop.type > ItemID.None
                 ? itemToDrop.type
                 : fallbackType;
+
+            if (itemType <= ItemID.None) return;
 
             int stack = itemToDrop != null && itemToDrop.stack > 0
                 ? itemToDrop.stack
@@ -676,7 +696,9 @@ namespace ClassSystemPlugin
             player.TPlayer.itemTime = 0;
             CancelActivePlayerProjectiles(player);
 
-            SpawnDroppedItemOnGround(player, itemType, stack, prefix);
+            // เสกไอเทมตกพื้นก่อนเสมอ เพื่อไม่ให้ไอเทมหายหากเกิดการขัดข้องใดๆ
+            int droppedIdx = SpawnDroppedItemOnGround(player, itemType, stack, prefix);
+            if (droppedIdx < 0) return;
 
             if (netSlotIndex >= 0)
             {
@@ -742,7 +764,7 @@ namespace ClassSystemPlugin
                 Item item = tPlayer.inventory[i];
                 if (item != null && !item.IsAir && item.type > ItemID.None && !IsItemAllowedForClass(item, currentClass))
                 {
-                    DropDisallowedItemAndClearSlot(player, i, item, item.type, item.stack, item.prefix);
+                    EjectDisallowedItemSafely(player, i, item, item.type, item.stack, item.prefix);
                 }
             }
 
@@ -751,13 +773,13 @@ namespace ClassSystemPlugin
                 Item armorItem = tPlayer.armor[i];
                 if (armorItem != null && !armorItem.IsAir && armorItem.type > ItemID.None && !IsItemAllowedForClass(armorItem, currentClass))
                 {
-                    DropDisallowedItemAndClearSlot(player, 59 + i, armorItem, armorItem.type, armorItem.stack, armorItem.prefix);
+                    EjectDisallowedItemSafely(player, 59 + i, armorItem, armorItem.type, armorItem.stack, armorItem.prefix);
                 }
             }
 
             if (tPlayer.trashItem != null && !tPlayer.trashItem.IsAir && tPlayer.trashItem.type > ItemID.None && !IsItemAllowedForClass(tPlayer.trashItem, currentClass))
             {
-                DropDisallowedItemAndClearSlot(player, 179, tPlayer.trashItem, tPlayer.trashItem.type, tPlayer.trashItem.stack, tPlayer.trashItem.prefix);
+                EjectDisallowedItemSafely(player, 179, tPlayer.trashItem, tPlayer.trashItem.type, tPlayer.trashItem.stack, tPlayer.trashItem.prefix);
             }
         }
 
@@ -996,6 +1018,19 @@ namespace ClassSystemPlugin
             _lastSyncedMaxLife.Remove(args.Who);
             _honeyRegenAccumulator.Remove(args.Who);
             _blockedWorldItemsByPlayer.Remove(args.Who);
+
+            var keysToRemove = new List<int>();
+            foreach (var kv in _slotEjectCooldown)
+            {
+                if (kv.Key / 1000 == args.Who)
+                {
+                    keysToRemove.Add(kv.Key);
+                }
+            }
+            foreach (int k in keysToRemove)
+            {
+                _slotEjectCooldown.Remove(k);
+            }
         }
 
         private bool IsGatheringTool(Item item)
@@ -1140,7 +1175,7 @@ namespace ClassSystemPlugin
                 if (!IsItemAllowedForClass(testItem, currentClass))
                 {
                     args.Handled = true;
-                    DropDisallowedItemAndClearSlot(player, args.Slot, testItem, args.Type, args.Stack, (byte)args.Prefix);
+                    EjectDisallowedItemSafely(player, args.Slot, testItem, args.Type, args.Stack, (byte)args.Prefix);
                 }
             }
         }
