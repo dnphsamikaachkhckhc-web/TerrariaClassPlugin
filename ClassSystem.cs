@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Data;
 using System.IO;
 using Microsoft.Data.Sqlite;
 using Microsoft.Xna.Framework;
@@ -17,14 +16,16 @@ namespace ClassSystemPlugin
     {
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
-        public override string Description => "Account-bound class system with movement lock before selection, starter weapon loadouts, item restrictions, Life Crystal cap, and custom buffs/nerfs.";
-        public override Version Version => new Version(15, 0, 3);
+        public override string Description => "Account-bound class system with underworld lock before login/class selection, starter weapon loadouts, item restrictions, Life Crystal cap, and custom buffs/nerfs.";
+        public override Version Version => new Version(15, 3, 1);
 
         private SqliteConnection _db;
         private bool _dbReady;
         private readonly Dictionary<int, string> _playerClasses = new Dictionary<int, string>();
         private readonly Dictionary<int, Vector2> _frozenPositions = new Dictionary<int, Vector2>();
         private readonly Dictionary<int, DateTime> _warnCooldown = new Dictionary<int, DateTime>();
+        private readonly Dictionary<int, DateTime> _slotWarnCooldown = new Dictionary<int, DateTime>();
+        private readonly Dictionary<int, int> _lastSyncedMaxLife = new Dictionary<int, int>();
 
         private const int MaxLifeCrystalsAllowed = 15;
         private const int BaseStartHp = 100;
@@ -120,6 +121,29 @@ namespace ClassSystemPlugin
             base.Dispose(disposing);
         }
 
+        private Vector2 GetSurfaceSpawnPosition()
+        {
+            int tileX = Main.spawnTileX > 0 ? Main.spawnTileX : Main.maxTilesX / 2;
+            int tileY = Main.spawnTileY > 0 ? Main.spawnTileY - 3 : (int)(Main.worldSurface * 0.35);
+            return new Vector2(tileX * 16f, tileY * 16f);
+        }
+
+        private Vector2 GetUnderworldPosition()
+        {
+            int tileX = Main.maxTilesX / 2;
+            int tileY = Math.Max(100, Main.maxTilesY - 60);
+            return new Vector2(tileX * 16f, tileY * 16f);
+        }
+
+        private void TeleportToSurfaceSpawn(TSPlayer player)
+        {
+            if (player == null) return;
+            Vector2 spawn = GetSurfaceSpawnPosition();
+            player.TPlayer.velocity = Vector2.Zero;
+            player.TPlayer.fallStart = (int)(spawn.Y / 16f);
+            player.Teleport(spawn.X, spawn.Y);
+        }
+
         private void SetupDatabase()
         {
             try
@@ -175,7 +199,7 @@ namespace ClassSystemPlugin
                 SetupDatabase();
             }
 
-            Commands.ChatCommands.Add(new Command("class.use", CmdClass, "class")
+            Commands.ChatCommands.Add(new Command("", CmdClass, "class")
             {
                 HelpText = "Select or view your class: /class [classname]"
             });
@@ -191,7 +215,10 @@ namespace ClassSystemPlugin
             var player = TShock.Players[args.Who];
             if (player != null && !player.IsLoggedIn)
             {
-                player.SendInfoMessage("[ClassSystem] Please log in to your TShock account to use the class system.");
+                Vector2 hellPos = GetUnderworldPosition();
+                _frozenPositions[player.Index] = hellPos;
+                player.Teleport(hellPos.X, hellPos.Y);
+                player.SendWarningMessage("[ClassSystem] Welcome to the Underworld! Log in with /login and pick a class with /class <warrior|ranger|mage|summoner>.");
             }
         }
 
@@ -206,13 +233,16 @@ namespace ClassSystemPlugin
             {
                 _playerClasses[accountId] = savedClass;
                 _frozenPositions.Remove(args.Player.Index);
+                TeleportToSurfaceSpawn(args.Player);
                 ApplyClassStats(args.Player, savedClass);
                 args.Player.SendSuccessMessage($"[ClassSystem] Welcome back! Your class is: {savedClass.ToUpper()}");
             }
             else
             {
-                _frozenPositions[args.Player.Index] = args.Player.TPlayer.position;
-                args.Player.SendWarningMessage("[ClassSystem] You cannot move until you select a class using /class <warrior|ranger|mage|summoner>.");
+                Vector2 hellPos = GetUnderworldPosition();
+                _frozenPositions[args.Player.Index] = hellPos;
+                args.Player.Teleport(hellPos.X, hellPos.Y);
+                args.Player.SendWarningMessage("[ClassSystem] You are in the Underworld until you select a class using /class <warrior|ranger|mage|summoner>.");
             }
         }
 
@@ -225,6 +255,8 @@ namespace ClassSystemPlugin
             }
             _frozenPositions.Remove(args.Who);
             _warnCooldown.Remove(args.Who);
+            _slotWarnCooldown.Remove(args.Who);
+            _lastSyncedMaxLife.Remove(args.Who);
         }
 
         private void OnPlayerUpdate(object sender, GetDataHandlers.PlayerUpdateEventArgs args)
@@ -232,16 +264,42 @@ namespace ClassSystemPlugin
             var player = TShock.Players[args.PlayerId];
             if (player == null || !player.Active) return;
 
-            if (player.IsLoggedIn && player.Account != null && !_playerClasses.ContainsKey(player.Account.ID))
+            if (!player.IsLoggedIn)
             {
-                if (_frozenPositions.TryGetValue(player.Index, out Vector2 frozenPos))
+                Vector2 hellPos = GetUnderworldPosition();
+                _frozenPositions[player.Index] = hellPos;
+                if (Vector2.Distance(player.TPlayer.position, hellPos) > 128f)
                 {
-                    player.Teleport(frozenPos.X, frozenPos.Y);
+                    player.Teleport(hellPos.X, hellPos.Y);
+                }
+                if (!_warnCooldown.TryGetValue(player.Index, out DateTime lastWarn) || (DateTime.UtcNow - lastWarn).TotalSeconds >= 5)
+                {
+                    _warnCooldown[player.Index] = DateTime.UtcNow;
+                    player.SendWarningMessage("[ClassSystem] Please log in with /login first to escape the Underworld.");
+                }
+                return;
+            }
+
+            if (player.Account != null)
+            {
+                string currentClass = GetPlayerClass(player);
+                if (string.IsNullOrEmpty(currentClass))
+                {
+                    Vector2 hellPos = GetUnderworldPosition();
+                    _frozenPositions[player.Index] = hellPos;
+                    if (Vector2.Distance(player.TPlayer.position, hellPos) > 128f)
+                    {
+                        player.Teleport(hellPos.X, hellPos.Y);
+                    }
                     if (!_warnCooldown.TryGetValue(player.Index, out DateTime lastWarn) || (DateTime.UtcNow - lastWarn).TotalSeconds >= 4)
                     {
                         _warnCooldown[player.Index] = DateTime.UtcNow;
-                        player.SendWarningMessage("[ClassSystem] Select a class first using /class <warrior|ranger|mage|summoner>.");
+                        player.SendWarningMessage("[ClassSystem] Select a class using /class <warrior|ranger|mage|summoner> to leave the Underworld.");
                     }
+                }
+                else
+                {
+                    _frozenPositions.Remove(player.Index);
                 }
             }
         }
@@ -256,7 +314,15 @@ namespace ClassSystemPlugin
                 string currentClass = GetPlayerClass(player);
                 if (!string.Equals(currentClass, requiredClass, StringComparison.OrdinalIgnoreCase))
                 {
-                    player.SendWarningMessage($"[ClassSystem] Item '{Lang.GetItemNameValue(args.Type)}' requires class: {requiredClass.ToUpper()}.");
+                    args.Handled = true;
+                    player.TPlayer.inventory[args.Slot] = new Item();
+                    NetMessage.SendData(PacketTypes.PlayerSlot, -1, -1, null, player.Index, args.Slot, 0, 0, 0);
+
+                    if (!_slotWarnCooldown.TryGetValue(player.Index, out DateTime lastWarn) || (DateTime.UtcNow - lastWarn).TotalSeconds >= 3)
+                    {
+                        _slotWarnCooldown[player.Index] = DateTime.UtcNow;
+                        player.SendWarningMessage($"[ClassSystem] Removed '{Lang.GetItemNameValue(args.Type)}' — requires class: {requiredClass.ToUpper()}.");
+                    }
                 }
             }
         }
@@ -324,6 +390,39 @@ namespace ClassSystemPlugin
             }
         }
 
+        private void GiveStarterItems(TSPlayer player, string className)
+        {
+            if (!_classStarterItems.TryGetValue(className, out var items)) return;
+
+            foreach (var (itemId, stack) in items)
+            {
+                Item item = new Item();
+                item.SetDefaults(itemId);
+                item.stack = stack;
+
+                int placedSlot = -1;
+                for (int i = 0; i < 50; i++)
+                {
+                    if (player.TPlayer.inventory[i] == null || player.TPlayer.inventory[i].IsAir || player.TPlayer.inventory[i].type == ItemID.None)
+                    {
+                        player.TPlayer.inventory[i] = item;
+                        placedSlot = i;
+                        break;
+                    }
+                }
+
+                if (placedSlot >= 0)
+                {
+                    NetMessage.SendData(PacketTypes.PlayerSlot, -1, -1, null, player.Index, placedSlot, item.prefix, 0, 0);
+                    NetMessage.SendData(PacketTypes.PlayerSlot, player.Index, -1, null, player.Index, placedSlot, item.prefix, 0, 0);
+                }
+                else
+                {
+                    player.GiveItem(itemId, stack);
+                }
+            }
+        }
+
         private void CmdClass(CommandArgs args)
         {
             if (!args.Player.IsLoggedIn || args.Player.Account == null)
@@ -357,16 +456,10 @@ namespace ClassSystemPlugin
             _playerClasses[args.Player.Account.ID] = chosen;
             _frozenPositions.Remove(args.Player.Index);
 
-            if (_classStarterItems.TryGetValue(chosen, out var items))
-            {
-                foreach (var (itemId, stack) in items)
-                {
-                    args.Player.GiveItem(itemId, stack);
-                }
-            }
-
+            TeleportToSurfaceSpawn(args.Player);
+            GiveStarterItems(args.Player, chosen);
             ApplyClassStats(args.Player, chosen);
-            args.Player.SendSuccessMessage($"[ClassSystem] Class selected: {chosen.ToUpper()}!");
+            args.Player.SendSuccessMessage($"[ClassSystem] Class selected: {chosen.ToUpper()}! Teleported back to spawn with starter items.");
         }
 
         private void CmdSetClass(CommandArgs args)
@@ -396,8 +489,10 @@ namespace ClassSystemPlugin
             {
                 DeleteClassFromDB(target.Account.ID);
                 _playerClasses.Remove(target.Account.ID);
-                _frozenPositions[target.Index] = target.TPlayer.position;
-                target.SendWarningMessage("[ClassSystem] Your class has been reset. Use /class to select again.");
+                Vector2 hellPos = GetUnderworldPosition();
+                _frozenPositions[target.Index] = hellPos;
+                target.Teleport(hellPos.X, hellPos.Y);
+                target.SendWarningMessage("[ClassSystem] Your class has been reset. You have been sent to the Underworld until you select a class with /class.");
                 args.Player.SendSuccessMessage($"Reset class for {target.Name}.");
                 return;
             }
@@ -411,6 +506,8 @@ namespace ClassSystemPlugin
             SaveClassToDB(target.Account.ID, option);
             _playerClasses[target.Account.ID] = option;
             _frozenPositions.Remove(target.Index);
+            TeleportToSurfaceSpawn(target);
+            GiveStarterItems(target, option);
             ApplyClassStats(target, option);
             target.SendSuccessMessage($"[ClassSystem] Admin set your class to {option.ToUpper()}.");
             args.Player.SendSuccessMessage($"Set {target.Name}'s class to {option.ToUpper()}.");
@@ -432,33 +529,45 @@ namespace ClassSystemPlugin
         {
             var tPlayer = player.TPlayer;
             int maxCrystals = Math.Max(0, MaxLifeCrystalsAllowed);
-            int allowedMaxLife = Math.Min(tPlayer.statLifeMax2, BaseStartHp + maxCrystals * HpPerLifeCrystal);
+            int baseCapLife = BaseStartHp + maxCrystals * HpPerLifeCrystal;
+            int referenceLife = Math.Min(Math.Max(BaseStartHp, tPlayer.statLifeMax), baseCapLife);
 
             if (className == "warrior")
             {
-                tPlayer.statLifeMax2 = (int)Math.Round(Math.Max(BaseStartHp, tPlayer.statLifeMax2) * (1.0 + WarriorMaxHpMult));
+                tPlayer.statLifeMax2 = (int)Math.Round(referenceLife * (1.0 + WarriorMaxHpMult));
                 tPlayer.statDefense = (int)Math.Round(tPlayer.statDefense * (1.0 + WarriorDefenseMult));
                 tPlayer.moveSpeed *= (float)(1.0 + WarriorMoveSpeedMult);
             }
             else if (className == "ranger")
             {
-                tPlayer.statLifeMax2 = Math.Max(50, allowedMaxLife + RangerMaxHpFlat);
+                tPlayer.statLifeMax2 = Math.Max(50, referenceLife + RangerMaxHpFlat);
                 tPlayer.statDefense = (int)Math.Round(tPlayer.statDefense * (1.0 + RangerDefenseMult));
                 tPlayer.moveSpeed *= (float)(1.0 + RangerMoveSpeedMult);
             }
             else if (className == "mage")
             {
-                tPlayer.statLifeMax2 = Math.Max(50, allowedMaxLife + MageMaxHpFlat);
+                tPlayer.statLifeMax2 = Math.Max(50, referenceLife + MageMaxHpFlat);
                 tPlayer.statManaMax2 += MageMaxManaFlat;
                 tPlayer.statDefense = (int)Math.Round(tPlayer.statDefense * (1.0 + MageDefenseMult));
                 tPlayer.moveSpeed *= (float)(1.0 + MageMoveSpeedMult);
             }
             else if (className == "summoner")
             {
-                tPlayer.statLifeMax2 = Math.Max(50, allowedMaxLife + SummonerMaxHpFlat);
+                tPlayer.statLifeMax2 = Math.Max(50, referenceLife + SummonerMaxHpFlat);
                 tPlayer.maxMinions += SummonerExtraMinions;
                 tPlayer.statDefense = (int)Math.Round(tPlayer.statDefense * (1.0 + SummonerDefenseMult));
                 tPlayer.moveSpeed *= (float)(1.0 + SummonerMoveSpeedMult);
+            }
+
+            if (tPlayer.statLife > tPlayer.statLifeMax2)
+            {
+                tPlayer.statLife = tPlayer.statLifeMax2;
+            }
+
+            if (!_lastSyncedMaxLife.TryGetValue(player.Index, out int lastMaxLife) || lastMaxLife != tPlayer.statLifeMax2)
+            {
+                _lastSyncedMaxLife[player.Index] = tPlayer.statLifeMax2;
+                NetMessage.SendData(PacketTypes.PlayerHp, -1, -1, null, player.Index);
             }
         }
 
