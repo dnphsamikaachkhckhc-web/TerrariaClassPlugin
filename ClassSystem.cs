@@ -17,8 +17,8 @@ namespace ClassSystemPlugin
     {
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
-        public override string Description => "Account-bound class system with underworld lock before login, webbed lock only after login until class selection, starter gear replacement, hard usage blocks without deleting items, +1 minion via Summoning buff (2 total minions at start), direct nerf on all whips from 1.0 base, boosted summon damage, gathering tool damage rules, quick /c shortcuts, hard Life Crystal usage block, custom stat modifiers, smooth update loop, and real-time HP/Mana sync.";
-        public override Version Version => new Version(15, 20, 9);
+        public override string Description => "Account-bound class system with underworld lock before login, webbed lock only after login until class selection, starter gear replacement, strict cross-class weapon blocks (including StrikeNpc & DamageClass checks) without deleting items, +1 minion via Summoning buff (2 total minions at start), direct nerf on all whips from 1.0 base, boosted summon damage, gathering tool damage rules, quick /c shortcuts, hard Life Crystal usage block, custom stat modifiers, smooth update loop, and real-time HP/Mana sync.";
+        public override Version Version => new Version(15, 20, 10);
 
         private SqliteConnection _db;
         private bool _dbReady;
@@ -121,6 +121,7 @@ namespace ClassSystemPlugin
             GetDataHandlers.PlayerUpdate += OnPlayerUpdate;
             GetDataHandlers.PlayerSlot += OnPlayerSlot;
             GetDataHandlers.PlayerDamage += OnPlayerDamage;
+            GetDataHandlers.StrikeNpc += OnStrikeNpcPacket;
         }
 
         protected override void Dispose(bool disposing)
@@ -138,6 +139,7 @@ namespace ClassSystemPlugin
                 GetDataHandlers.PlayerUpdate -= OnPlayerUpdate;
                 GetDataHandlers.PlayerSlot -= OnPlayerSlot;
                 GetDataHandlers.PlayerDamage -= OnPlayerDamage;
+                GetDataHandlers.StrikeNpc -= OnStrikeNpcPacket;
 
                 if (_db != null)
                 {
@@ -190,7 +192,7 @@ namespace ClassSystemPlugin
         {
             if (item == null || item.IsAir || item.type == ItemID.None) return false;
 
-            if (item.summon && item.useStyle == ItemUseStyleID.Swing && item.noMelee)
+            if ((item.summon || item.CountsAsClass(DamageClass.Summon)) && item.useStyle == ItemUseStyleID.Swing && item.noMelee)
                 return true;
 
             return item.type == ItemID.BlandWhip ||
@@ -505,19 +507,24 @@ namespace ClassSystemPlugin
                 return string.Equals(className, reqClass, StringComparison.OrdinalIgnoreCase);
             }
 
-            bool isClassWeapon = item.melee || item.ranged || item.magic || item.summon;
+            bool isMelee = item.melee || item.CountsAsClass(DamageClass.Melee);
+            bool isRanged = item.ranged || item.CountsAsClass(DamageClass.Ranged);
+            bool isMagic = item.magic || item.CountsAsClass(DamageClass.Magic);
+            bool isSummon = item.summon || item.CountsAsClass(DamageClass.Summon);
+
+            bool isClassWeapon = isMelee || isRanged || isMagic || isSummon;
             if (!isClassWeapon || item.damage <= 0) return true;
 
             switch (className.ToLowerInvariant())
             {
                 case "warrior":
-                    return item.melee;
+                    return isMelee;
                 case "ranger":
-                    return item.ranged;
+                    return isRanged;
                 case "mage":
-                    return item.magic;
+                    return isMagic;
                 case "summoner":
-                    return item.summon;
+                    return isSummon;
                 default:
                     return false;
             }
@@ -617,6 +624,32 @@ namespace ClassSystemPlugin
             }
         }
 
+        private void OnStrikeNpcPacket(object sender, GetDataHandlers.StrikeNpcEventArgs args)
+        {
+            var player = args.Player;
+            if (player == null || !player.Active || !player.IsLoggedIn || player.Account == null) return;
+
+            string currentClass = GetPlayerClass(player);
+            if (string.IsNullOrEmpty(currentClass)) return;
+
+            Item held = player.TPlayer.HeldItem;
+            if (held != null && !held.IsAir)
+            {
+                if (IsGatheringTool(held) && !HasClassLifeRegen(player, currentClass))
+                {
+                    args.Handled = true;
+                    return;
+                }
+
+                if (!IsItemAllowedForClass(held, currentClass))
+                {
+                    args.Handled = true;
+                    BlockItemUsage(player, true);
+                    NotifyBlockedItem(player, held.Name, currentClass);
+                }
+            }
+        }
+
         private void OnGameUpdate(EventArgs args)
         {
             bool runPeriodicSync = (DateTime.UtcNow - _lastTickSync).TotalMilliseconds >= 100;
@@ -689,7 +722,16 @@ namespace ClassSystemPlugin
 
             var heldItem = args.Player.HeldItem;
 
-            // 1. เนิฟแส้ทุกกระบอก (คิดจากฐาน 1.0 + WhipNerfMult)
+            // 1. บล็อกอาวุธ/ของไม่ตรงคลาสก่อนทุกอย่าง (ไม่ลบของออกจากตัว)
+            if (heldItem != null && !heldItem.IsAir && !IsItemAllowedForClass(heldItem, playerClass))
+            {
+                args.Damage = 0;
+                BlockItemUsage(tsPlayer, true);
+                NotifyBlockedItem(tsPlayer, heldItem.Name, playerClass);
+                return;
+            }
+
+            // 2. เนิฟแส้ทุกกระบอก (คิดจากฐาน 1.0 + WhipNerfMult)
             if (IsWhipItem(heldItem))
             {
                 if (args.Damage > 0)
@@ -701,7 +743,7 @@ namespace ClassSystemPlugin
                 return;
             }
 
-            // 2. กฎเครื่องมือขุด/ตัด/ทุบ
+            // 3. กฎเครื่องมือขุด/ตัด/ทุบ
             if (heldItem != null && IsGatheringTool(heldItem))
             {
                 if (!HasClassLifeRegen(tsPlayer, playerClass))
@@ -717,7 +759,7 @@ namespace ClassSystemPlugin
                 return;
             }
 
-            // 3. คลาส Summoner (ดาเมจซัมม่อน/การโจมตีที่ไม่ใช่แส้)
+            // 4. คลาส Summoner (ดาเมจซัมม่อน/การโจมตีที่ไม่ใช่แส้)
             if (playerClass == "summoner")
             {
                 if (args.Damage > 0)
@@ -729,27 +771,18 @@ namespace ClassSystemPlugin
 
             if (heldItem == null) return;
 
-            // 4. บล็อกอาวุธ/ของไม่ตรงคลาส (ไม่ลบของออกจากตัว)
-            if (!IsItemAllowedForClass(heldItem, playerClass))
-            {
-                args.Damage = 0;
-                BlockItemUsage(tsPlayer, true);
-                NotifyBlockedItem(tsPlayer, heldItem.Name, playerClass);
-                return;
-            }
-
             // 5. ตัวคูณดาเมจคลาสอื่นๆ
             if (args.Damage > 0)
             {
-                if (playerClass == "warrior" && heldItem.melee)
+                if (playerClass == "warrior" && (heldItem.melee || heldItem.CountsAsClass(DamageClass.Melee)))
                 {
                     args.Damage = Math.Max(1, (int)Math.Round(args.Damage * (1.0 + WarriorMeleeDamageMult)));
                 }
-                else if (playerClass == "ranger" && heldItem.ranged)
+                else if (playerClass == "ranger" && (heldItem.ranged || heldItem.CountsAsClass(DamageClass.Ranged)))
                 {
                     args.Damage = Math.Max(1, (int)Math.Round(args.Damage * (1.0 + RangerRangedDamageMult)));
                 }
-                else if (playerClass == "mage" && heldItem.magic)
+                else if (playerClass == "mage" && (heldItem.magic || heldItem.CountsAsClass(DamageClass.Magic)))
                 {
                     args.Damage = Math.Max(1, (int)Math.Round(args.Damage * (1.0 + MageMagicDamageMult)));
                 }
