@@ -16,7 +16,7 @@ namespace ClassSystemPlugin
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
         public override string Description => "Account-bound class system with movement lock before selection, starter weapon loadouts, item restrictions, Life Crystal cap, and custom buffs/nerfs.";
-        public override Version Version => new Version(15, 0, 1);
+        public override Version Version => new Version(15, 0, 2);
 
         private IDbConnection _db;
         private readonly Dictionary<int, string> _playerClasses = new Dictionary<int, string>();
@@ -117,7 +117,7 @@ namespace ClassSystemPlugin
             {
                 _db = TShock.DB;
             }
-            if (_db != null && _db.State != ConnectionState.Open)
+            if (_db != null && _db.State != System.Data.ConnectionState.Open)
             {
                 _db.Open();
             }
