@@ -16,25 +16,39 @@ namespace ClassSystemPlugin
     {
     }
 
+    internal sealed class PlayerClassState
+    {
+        public string ClassName { get; set; }
+        public int StarterChoice { get; set; } // 0 = ยังไม่เลือกไอเทม, 1 = /ch 1, 2 = /ch 2
+    }
+
     [ApiVersion(2, 1)]
     public class ClassSystem : TerrariaPlugin
     {
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
-        public override string Description => "Account-bound class system with underworld lock before login, webbed lock after login until class selection, starter gear, safe cross-class inventory ejection (never deleted) and dropped item pickup lock, Max HP modifiers per class + permanent Summoning buff + permanent Honey buff (+15% life regen) + permanent uncleansable Broken Armor buff (5% defense reduction) for Summoner, quick /c shortcuts, Life Crystal limit, and real-time HP sync.";
-        public override Version Version => new Version(15, 35, 0);
+        public override string Description => "Class & starter-choice (/ch 1|2) system with custom class-selection and per-class starter-weapon prompts, server-wide broadcasts during selection phases, underworld lock before login, webbed lock in underworld until completed, inventory weapon wipe on /ch selection, permanent class/choice buffs & debuffs, Max HP modifiers, cross-class item ejection, Life Crystal cap, and real-time HP sync.";
+        public override Version Version => new Version(16, 3, 0);
+
+        private const string ClassSelectPrompt =
+            "Chat by Shokuya :3 Please select your class >w<\n\n" +
+            "Melee = Me\n" +
+            "Ranger = Rg\n" +
+            "Magic = Mg\n" +
+            "summon = Sm\n\n" +
+            "/c and Me Rg Mg Sm";
 
         private SqliteConnection _db;
         private bool _dbReady;
-        private readonly Dictionary<int, string> _playerClasses = new Dictionary<int, string>();
+        private readonly Dictionary<int, PlayerClassState> _playerStates = new Dictionary<int, PlayerClassState>();
         private readonly Dictionary<int, Vector2> _frozenPositions = new Dictionary<int, Vector2>();
         private readonly Dictionary<int, DateTime> _warnCooldown = new Dictionary<int, DateTime>();
+        private readonly Dictionary<int, DateTime> _serverBroadcastCooldown = new Dictionary<int, DateTime>();
+        private readonly Dictionary<int, string> _lastBroadcastPhase = new Dictionary<int, string>();
         private readonly Dictionary<int, DateTime> _dropWarnCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, DateTime> _slotEjectCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, DateTime> _crystalWarnCooldown = new Dictionary<int, DateTime>();
-        private readonly Dictionary<int, DateTime> _summonBuffCooldown = new Dictionary<int, DateTime>();
-        private readonly Dictionary<int, DateTime> _honeyBuffCooldown = new Dictionary<int, DateTime>();
-        private readonly Dictionary<int, DateTime> _brokenArmorBuffCooldown = new Dictionary<int, DateTime>();
+        private readonly Dictionary<int, DateTime> _buffRefreshCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, int> _lastSyncedMaxLife = new Dictionary<int, int>();
         private readonly Dictionary<int, double> _honeyRegenAccumulator = new Dictionary<int, double>();
         private readonly Dictionary<int, HashSet<int>> _blockedWorldItemsByPlayer = new Dictionary<int, HashSet<int>>();
@@ -44,23 +58,6 @@ namespace ClassSystemPlugin
         private const int MaxLifeCrystalsAllowed = 15;
         private const int BaseStartHp = 100;
         private const int HpPerLifeCrystal = 20;
-        private const double HoneyBonusLifeRegenMultiplier = 0.15;
-        private const double SummonerBrokenArmorReduction = 0.05;
-
-        // Max HP modifiers per class only
-        private const int WarriorMaxHpFlat = 20;
-        private const int RangerMaxHpFlat = -40;
-        private const int MageMaxHpFlat = -60;
-        private const int SummonerMaxHpFlat = -80;
-
-        private readonly Dictionary<string, (short ItemId, int Stack)[]> _classStarterItems =
-            new Dictionary<string, (short ItemId, int Stack)[]>
-            {
-                ["warrior"] = new[] { (ItemID.CopperBroadsword, 1) },
-                ["ranger"] = new[] { (ItemID.WoodenBow, 1), (ItemID.WoodenArrow, 500) },
-                ["mage"] = new[] { (ItemID.WandofSparking, 1), (ItemID.LesserManaPotion, 15) },
-                ["summoner"] = new[] { (ItemID.SlimeStaff, 1), (ItemID.BlandWhip, 1) }
-            };
 
         private readonly List<string> _availableClasses = new List<string>
         {
@@ -255,58 +252,245 @@ namespace ClassSystemPlugin
             base.Dispose(disposing);
         }
 
-        private void EnsureSummonerHoneyBuff(TSPlayer player)
+        private string GetStarterChoicePrompt(string className)
         {
-            if (player == null || player.TPlayer == null || !player.Active || player.TPlayer.dead) return;
-
-            if (_honeyBuffCooldown.TryGetValue(player.Index, out DateTime lastCd) && (DateTime.UtcNow - lastCd).TotalSeconds < 1.5)
-                return;
-
-            bool hasHoney = false;
-            for (int i = 0; i < Player.maxBuffs; i++)
+            string c = (className ?? "").ToLowerInvariant();
+            if (c == "warrior")
             {
-                if (player.TPlayer.buffType[i] == BuffID.Honey && player.TPlayer.buffTime[i] > 60)
-                {
-                    hasHoney = true;
-                    break;
-                }
+                return "Please choose the origin of your ability :))))\n\n/ch 1  = sword\n/ch 2 = Boomerang";
             }
-
-            if (!hasHoney)
+            if (c == "ranger")
             {
-                _honeyBuffCooldown[player.Index] = DateTime.UtcNow;
-                player.SetBuff(BuffID.Honey, 240, true);
+                return "Please choose the origin of your ability :))))\n\n/ch 1  = Bowe\n/ch 2 = Gus";
+            }
+            if (c == "mage")
+            {
+                return "Please choose the origin of your ability :))))\n\n/ch 1 = Wands\n/ch 2 = books";
+            }
+            if (c == "summoner")
+            {
+                return "Please choose the origin of your ability :))))\n\n/ch 1 = Summon\n/ch 2 = Whips";
+            }
+            return "Please choose the origin of your ability :))))\n\n/ch 1\n/ch 2";
+        }
+
+        private void BroadcastSelectionPhase(TSPlayer player, string phaseKey, string message, double cooldownSeconds = 15.0)
+        {
+            if (player == null || string.IsNullOrWhiteSpace(player.Name)) return;
+
+            bool phaseChanged = !_lastBroadcastPhase.TryGetValue(player.Index, out string prevPhase) || prevPhase != phaseKey;
+            bool cooldownExpired = !_serverBroadcastCooldown.TryGetValue(player.Index, out DateTime lastTime) || (DateTime.UtcNow - lastTime).TotalSeconds >= cooldownSeconds;
+
+            if (phaseChanged || cooldownExpired)
+            {
+                _lastBroadcastPhase[player.Index] = phaseKey;
+                _serverBroadcastCooldown[player.Index] = DateTime.UtcNow;
+                TShock.Utils.Broadcast(message, Color.Gold);
             }
         }
 
-        private void EnsureSummonerPermanentBrokenArmorBuff(TSPlayer player)
+        private int GetMaxHpDelta(PlayerClassState state)
         {
-            if (player == null || player.TPlayer == null || !player.Active || player.TPlayer.dead) return;
+            if (state == null || string.IsNullOrEmpty(state.ClassName)) return 0;
+            string c = state.ClassName.ToLowerInvariant();
+            int ch = state.StarterChoice;
 
-            if (_brokenArmorBuffCooldown.TryGetValue(player.Index, out DateTime lastCd) && (DateTime.UtcNow - lastCd).TotalMilliseconds < 400)
-                return;
-
-            bool hasImmunityAccessory = HasBrokenArmorImmunityItem(player.TPlayer);
-            int targetBuffId = hasImmunityAccessory ? BuffID.WitheredArmor : BuffID.BrokenArmor;
-
-            bool hasActiveBuff = false;
-            for (int i = 0; i < Player.maxBuffs; i++)
+            if (c == "warrior")
             {
-                int bType = player.TPlayer.buffType[i];
-                if ((bType == BuffID.BrokenArmor || bType == BuffID.WitheredArmor) && player.TPlayer.buffTime[i] > 60)
+                if (ch == 1) return 20;
+                if (ch == 2) return -40;
+                return 0;
+            }
+            if (c == "ranger")
+            {
+                if (ch == 1 || ch == 2) return -40;
+                return 0;
+            }
+            if (c == "mage")
+            {
+                if (ch == 1 || ch == 2) return -40;
+                return 0;
+            }
+            if (c == "summoner")
+            {
+                if (ch == 1) return -80;
+                if (ch == 2) return -40;
+                return 0;
+            }
+            return 0;
+        }
+
+        private double GetBrokenArmorReduction(PlayerClassState state)
+        {
+            if (state == null || string.IsNullOrEmpty(state.ClassName) || state.StarterChoice <= 0)
+                return 0.0;
+
+            string c = state.ClassName.ToLowerInvariant();
+            if (c == "ranger" && (state.StarterChoice == 1 || state.StarterChoice == 2))
+                return 0.10;
+
+            if (c == "mage" && (state.StarterChoice == 1 || state.StarterChoice == 2))
+                return 0.10;
+
+            return 0.0;
+        }
+
+        private float GetMoveSpeedMultiplierDelta(PlayerClassState state)
+        {
+            if (state == null || string.IsNullOrEmpty(state.ClassName) || state.StarterChoice <= 0)
+                return 0f;
+
+            string c = state.ClassName.ToLowerInvariant();
+            int ch = state.StarterChoice;
+
+            if (c == "warrior")
+            {
+                if (ch == 1) return -0.10f;
+                if (ch == 2) return 0.10f;
+            }
+            else if (c == "ranger")
+            {
+                if (ch == 1 || ch == 2) return 0.20f;
+            }
+            else if (c == "mage")
+            {
+                if (ch == 1 || ch == 2) return 0.15f;
+            }
+            else if (c == "summoner")
+            {
+                if (ch == 1) return 0.15f;
+                if (ch == 2) return 0.10f;
+            }
+
+            return 0f;
+        }
+
+        private double GetHoneyBonusMultiplier(PlayerClassState state)
+        {
+            if (state == null || string.IsNullOrEmpty(state.ClassName) || state.StarterChoice <= 0)
+                return 0.0;
+
+            if (string.Equals(state.ClassName, "summoner", StringComparison.OrdinalIgnoreCase) && state.StarterChoice == 1)
+                return 0.20;
+
+            return 0.0;
+        }
+
+        private int[] GetPermanentBuffsForState(PlayerClassState state, Player tPlayer)
+        {
+            var list = new List<int>();
+            if (state == null || string.IsNullOrEmpty(state.ClassName) || state.StarterChoice <= 0)
+                return list.ToArray();
+
+            string c = state.ClassName.ToLowerInvariant();
+            int ch = state.StarterChoice;
+
+            if (c == "warrior")
+            {
+                if (ch == 1)
                 {
-                    if (!hasImmunityAccessory || bType == BuffID.WitheredArmor)
-                    {
-                        hasActiveBuff = true;
-                        break;
-                    }
+                    list.Add(BuffID.Slow);
+                    list.Add(BuffID.Ironskin);
+                }
+                else if (ch == 2)
+                {
+                    list.Add(BuffID.Swiftness);
+                }
+            }
+            else if (c == "ranger")
+            {
+                bool hasImmunity = HasBrokenArmorImmunityItem(tPlayer);
+                list.Add(hasImmunity ? BuffID.WitheredArmor : BuffID.BrokenArmor);
+                list.Add(BuffID.Swiftness);
+                if (ch == 1)
+                {
+                    list.Add(BuffID.Archery);
+                }
+                else if (ch == 2)
+                {
+                    list.Add(BuffID.AmmoReservation);
+                }
+            }
+            else if (c == "mage")
+            {
+                bool hasImmunity = HasBrokenArmorImmunityItem(tPlayer);
+                list.Add(hasImmunity ? BuffID.WitheredArmor : BuffID.BrokenArmor);
+                list.Add(BuffID.Swiftness);
+                if (ch == 1)
+                {
+                    list.Add(BuffID.MagicPower);
+                }
+                else if (ch == 2)
+                {
+                    list.Add(BuffID.ManaRegeneration);
+                }
+            }
+            else if (c == "summoner")
+            {
+                if (ch == 1)
+                {
+                    list.Add(BuffID.Summoning);
+                    list.Add(BuffID.Honey);
+                    list.Add(BuffID.Swiftness);
+                }
+                else if (ch == 2)
+                {
+                    list.Add(BuffID.Swiftness);
                 }
             }
 
-            if (!hasActiveBuff)
+            return list.ToArray();
+        }
+
+        private void EnsurePermanentClassBuffs(TSPlayer player, PlayerClassState state)
+        {
+            if (player == null || player.TPlayer == null || !player.Active || player.TPlayer.dead) return;
+            if (state == null || string.IsNullOrEmpty(state.ClassName) || state.StarterChoice <= 0) return;
+
+            if (_buffRefreshCooldown.TryGetValue(player.Index, out DateTime lastCd) && (DateTime.UtcNow - lastCd).TotalMilliseconds < 400)
+                return;
+
+            int[] requiredBuffs = GetPermanentBuffsForState(state, player.TPlayer);
+            if (requiredBuffs.Length == 0) return;
+
+            bool appliedAny = false;
+            foreach (int buffId in requiredBuffs)
             {
-                _brokenArmorBuffCooldown[player.Index] = DateTime.UtcNow;
-                player.SetBuff(targetBuffId, 240, true);
+                bool found = false;
+                for (int i = 0; i < Player.maxBuffs; i++)
+                {
+                    if (player.TPlayer.buffType[i] == buffId && player.TPlayer.buffTime[i] > 60)
+                    {
+                        found = true;
+                        break;
+                    }
+                }
+
+                if (!found)
+                {
+                    player.SetBuff(buffId, 240, true);
+                    appliedAny = true;
+                }
+            }
+
+            if (appliedAny)
+            {
+                _buffRefreshCooldown[player.Index] = DateTime.UtcNow;
+            }
+        }
+
+        private void ApplyMovementSpeedDelta(TSPlayer player, PlayerClassState state)
+        {
+            if (player?.TPlayer == null || !player.Active || player.TPlayer.dead) return;
+            float delta = GetMoveSpeedMultiplierDelta(state);
+            if (Math.Abs(delta) < 0.001f) return;
+
+            var tPlayer = player.TPlayer;
+            if (Math.Abs(tPlayer.velocity.X) > 0.1f)
+            {
+                float moveDeltaX = tPlayer.velocity.X * delta;
+                tPlayer.position.X += moveDeltaX;
+                NetMessage.SendData((int)PacketTypes.PlayerControls, -1, -1, null, player.Index);
             }
         }
 
@@ -404,10 +588,9 @@ namespace ClassSystemPlugin
             var player = TShock.Players[args.ID];
             if (player == null || !player.Active || !player.IsLoggedIn || player.Account == null) return;
 
-            string playerClass = GetPlayerClass(player);
-            if (!string.Equals(playerClass, "summoner", StringComparison.OrdinalIgnoreCase)) return;
-
-            if (args.Damage <= 1) return;
+            var state = GetPlayerState(player);
+            double reduction = GetBrokenArmorReduction(state);
+            if (reduction <= 0.0 || args.Damage <= 1) return;
 
             int baseDefense = CalculatePlayerEquipmentDefense(player.TPlayer);
             if (baseDefense <= 0) return;
@@ -415,8 +598,8 @@ namespace ClassSystemPlugin
             double defenseEffectiveness = Main.masterMode ? 1.0 : (Main.expertMode ? 0.75 : 0.5);
 
             int defAt50Percent = (int)Math.Floor(baseDefense * 0.50);
-            int defAt5PercentLoss = (int)Math.Floor(baseDefense * (1.0 - SummonerBrokenArmorReduction));
-            int extraDefenseSaved = Math.Max(0, defAt5PercentLoss - defAt50Percent);
+            int defAtCustomLoss = (int)Math.Floor(baseDefense * (1.0 - reduction));
+            int extraDefenseSaved = Math.Max(0, defAtCustomLoss - defAt50Percent);
 
             int damageRefund = (int)Math.Floor(extraDefenseSaved * defenseEffectiveness);
             if (damageRefund > 0)
@@ -432,37 +615,36 @@ namespace ClassSystemPlugin
             }
         }
 
-        private void ApplySummonerPermanentBrokenArmorEffect(TSPlayer player, string playerClass)
+        private void ApplyBrokenArmorDefenseEffect(TSPlayer player, PlayerClassState state)
         {
             if (player?.TPlayer == null || !player.Active || player.TPlayer.dead) return;
-
-            if (!string.Equals(playerClass, "summoner", StringComparison.OrdinalIgnoreCase))
-                return;
+            double reduction = GetBrokenArmorReduction(state);
+            if (reduction <= 0.0) return;
 
             var tPlayer = player.TPlayer;
             int baseDef = CalculatePlayerEquipmentDefense(tPlayer);
-            int reducedAmount = (int)Math.Floor(baseDef * SummonerBrokenArmorReduction);
+            int reducedAmount = (int)Math.Floor(baseDef * reduction);
             tPlayer.statDefense = Math.Max(0, baseDef - reducedAmount);
         }
 
-        private void ApplyHoneyRegenBonus(TSPlayer player, string playerClass, double deltaSeconds)
+        private void ApplyHoneyRegenBonus(TSPlayer player, PlayerClassState state, double deltaSeconds)
         {
             if (player?.TPlayer == null || !player.Active || player.TPlayer.dead) return;
 
-            if (!string.Equals(playerClass, "summoner", StringComparison.OrdinalIgnoreCase))
+            double bonusMult = GetHoneyBonusMultiplier(state);
+            if (bonusMult <= 0.0)
             {
                 _honeyRegenAccumulator.Remove(player.Index);
                 return;
             }
 
             var tPlayer = player.TPlayer;
-
             double baseHoneyHpPerSec = 3.0;
             if (HasBuff(player, BuffID.Campfire)) baseHoneyHpPerSec += 0.5;
             if (HasBuff(player, BuffID.HeartLamp)) baseHoneyHpPerSec += 1.0;
             if (HasBuff(player, BuffID.Regeneration)) baseHoneyHpPerSec += 2.0;
 
-            double bonusHpPerSec = Math.Max(0.5, baseHoneyHpPerSec * HoneyBonusLifeRegenMultiplier);
+            double bonusHpPerSec = Math.Max(0.5, baseHoneyHpPerSec * bonusMult);
 
             if (tPlayer.statLife > 0 && tPlayer.statLife < tPlayer.statLifeMax2 && deltaSeconds > 0)
             {
@@ -510,13 +692,13 @@ namespace ClassSystemPlugin
             var player = TShock.Players[playerIndex];
             if (player?.Account != null && player.IsLoggedIn)
             {
-                string currentClass = GetPlayerClass(player);
-                if (!string.IsNullOrEmpty(currentClass))
+                var state = GetPlayerState(player);
+                if (state != null && !string.IsNullOrEmpty(state.ClassName))
                 {
                     Item checkItem = new Item();
                     checkItem.SetDefaults(wItem.type);
                     checkItem.stack = Math.Max(1, wItem.stack);
-                    if (!IsItemAllowedForClass(checkItem, currentClass))
+                    if (!IsItemAllowedForClass(checkItem, state.ClassName))
                     {
                         RegisterBlockedWorldItem(playerIndex, worldItemIndex);
                         return true;
@@ -549,8 +731,8 @@ namespace ClassSystemPlugin
             var player = args.Player;
             if (player == null || !player.Active || !player.IsLoggedIn || player.Account == null) return;
 
-            string currentClass = GetPlayerClass(player);
-            if (string.IsNullOrEmpty(currentClass)) return;
+            var state = GetPlayerState(player);
+            if (state == null || string.IsNullOrEmpty(state.ClassName)) return;
 
             if (args.ID >= 0 && args.ID < Main.maxItems)
             {
@@ -561,7 +743,7 @@ namespace ClassSystemPlugin
                     checkItem.SetDefaults(worldItem.type);
                     checkItem.stack = Math.Max(1, worldItem.stack);
 
-                    if (!IsItemAllowedForClass(checkItem, currentClass))
+                    if (!IsItemAllowedForClass(checkItem, state.ClassName))
                     {
                         RegisterBlockedWorldItem(player.Index, args.ID);
                     }
@@ -653,7 +835,8 @@ namespace ClassSystemPlugin
             if (!_dropWarnCooldown.TryGetValue(player.Index, out DateTime lastWarn) || (DateTime.UtcNow - lastWarn).TotalSeconds >= 2)
             {
                 _dropWarnCooldown[player.Index] = DateTime.UtcNow;
-                string className = GetPlayerClass(player) ?? "class";
+                var state = GetPlayerState(player);
+                string className = state?.ClassName ?? "class";
                 player.SendWarningMessage($"[ClassSystem] Dropped '{itemName}' onto the ground (not deleted) — {className.ToUpper()} cannot use or pick up items from other classes.");
             }
         }
@@ -696,7 +879,6 @@ namespace ClassSystemPlugin
             player.TPlayer.itemTime = 0;
             CancelActivePlayerProjectiles(player);
 
-            // เสกไอเทมตกพื้นก่อนเสมอ เพื่อไม่ให้ไอเทมหายหากเกิดการขัดข้องใดๆ
             int droppedIdx = SpawnDroppedItemOnGround(player, itemType, stack, prefix);
             if (droppedIdx < 0) return;
 
@@ -753,6 +935,33 @@ namespace ClassSystemPlugin
             NetMessage.SendData((int)PacketTypes.PlayerSlot, player.Index, -1, null, player.Index, netSlotIndex, 0, 0, 0);
         }
 
+        private void RemoveAllWeaponsFromInventory(TSPlayer player)
+        {
+            if (player?.TPlayer == null) return;
+            var tPlayer = player.TPlayer;
+
+            for (int i = 0; i < tPlayer.inventory.Length && i < 59; i++)
+            {
+                Item item = tPlayer.inventory[i];
+                if (item != null && !item.IsAir && item.type > ItemID.None && IsWeaponItem(item))
+                {
+                    ClearPlayerNetSlot(player, i);
+                }
+            }
+
+            if (tPlayer.trashItem != null && !tPlayer.trashItem.IsAir && tPlayer.trashItem.type > ItemID.None && IsWeaponItem(tPlayer.trashItem))
+            {
+                ClearPlayerNetSlot(player, 179);
+            }
+        }
+
+        private bool IsWeaponItem(Item item)
+        {
+            if (item == null || item.IsAir || item.type <= ItemID.None) return false;
+            if (item.pick > 0 || item.axe > 0 || item.hammer > 0) return false;
+            return item.damage > 0 && (item.melee || item.ranged || item.magic || item.summon);
+        }
+
         private void EnforceAllowedInventory(TSPlayer player, string currentClass)
         {
             if (player?.TPlayer == null || string.IsNullOrEmpty(currentClass)) return;
@@ -780,30 +989,6 @@ namespace ClassSystemPlugin
             if (tPlayer.trashItem != null && !tPlayer.trashItem.IsAir && tPlayer.trashItem.type > ItemID.None && !IsItemAllowedForClass(tPlayer.trashItem, currentClass))
             {
                 EjectDisallowedItemSafely(player, 179, tPlayer.trashItem, tPlayer.trashItem.type, tPlayer.trashItem.stack, tPlayer.trashItem.prefix);
-            }
-        }
-
-        private void EnsureSummonerSummoningBuff(TSPlayer player)
-        {
-            if (player == null || player.TPlayer == null || !player.Active || player.TPlayer.dead) return;
-
-            if (_summonBuffCooldown.TryGetValue(player.Index, out DateTime lastCd) && (DateTime.UtcNow - lastCd).TotalSeconds < 2.0)
-                return;
-
-            bool hasBuff = false;
-            for (int i = 0; i < Player.maxBuffs; i++)
-            {
-                if (player.TPlayer.buffType[i] == BuffID.Summoning && player.TPlayer.buffTime[i] > 60)
-                {
-                    hasBuff = true;
-                    break;
-                }
-            }
-
-            if (!hasBuff)
-            {
-                _summonBuffCooldown[player.Index] = DateTime.UtcNow;
-                player.SetBuff(BuffID.Summoning, 240, true);
             }
         }
 
@@ -875,6 +1060,7 @@ namespace ClassSystemPlugin
             if (player == null) return;
 
             _frozenPositions.Remove(player.Index);
+            _lastBroadcastPhase.Remove(player.Index);
             ClearWebBuff(player);
 
             Vector2 spawn = GetSurfaceSpawnPosition();
@@ -894,7 +1080,8 @@ namespace ClassSystemPlugin
                 _db = new SqliteConnection($"Data Source={dbPath}");
                 _db.Open();
 
-                ExecuteNonQuery("CREATE TABLE IF NOT EXISTS PlayerClasses (AccountID INTEGER PRIMARY KEY, ClassName TEXT NOT NULL)");
+                ExecuteNonQuery("CREATE TABLE IF NOT EXISTS PlayerClasses (AccountID INTEGER PRIMARY KEY, ClassName TEXT NOT NULL, StarterChoice INTEGER NOT NULL DEFAULT 0)");
+                EnsureStarterChoiceColumnExists();
                 _dbReady = true;
             }
             catch (Exception ex)
@@ -902,6 +1089,36 @@ namespace ClassSystemPlugin
                 _dbReady = false;
                 TShock.Log.Error($"[ClassSystem] SetupDatabase error: {ex.Message}");
             }
+        }
+
+        private void EnsureStarterChoiceColumnExists()
+        {
+            if (_db == null) return;
+            try
+            {
+                EnsureConnectionOpen();
+                bool hasCol = false;
+                using (var cmd = _db.CreateCommand())
+                {
+                    cmd.CommandText = "PRAGMA table_info(PlayerClasses)";
+                    using (var reader = cmd.ExecuteReader())
+                    {
+                        while (reader.Read())
+                        {
+                            if (!reader.IsDBNull(1) && string.Equals(reader.GetString(1), "StarterChoice", StringComparison.OrdinalIgnoreCase))
+                            {
+                                hasCol = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (!hasCol)
+                {
+                    ExecuteNonQuery("ALTER TABLE PlayerClasses ADD COLUMN StarterChoice INTEGER NOT NULL DEFAULT 0");
+                }
+            }
+            catch { }
         }
 
         private void EnsureConnectionOpen()
@@ -943,6 +1160,11 @@ namespace ClassSystemPlugin
                 HelpText = "Select or view your class: /class [classname] or /c <Me|Rg|Mg|sm>"
             });
 
+            Commands.ChatCommands.Add(new Command("", CmdStarterChoice, "ch")
+            {
+                HelpText = "Select your starter item pack after picking a class: /ch <1|2>"
+            });
+
             Commands.ChatCommands.Add(new Command("class.admin", CmdSetClass, "setclass")
             {
                 HelpText = "Admin command to change or reset a player's class: /setclass <player> <classname|none>"
@@ -977,27 +1199,42 @@ namespace ClassSystemPlugin
             ClearWebBuff(args.Player);
 
             int accountId = args.Player.Account.ID;
-            string savedClass = GetClassFromDB(accountId);
+            var savedState = GetStateFromDB(accountId);
 
-            if (!string.IsNullOrEmpty(savedClass))
+            if (savedState != null && !string.IsNullOrEmpty(savedState.ClassName))
             {
-                _playerClasses[accountId] = savedClass;
-                ClearWebAndTeleportToSpawn(args.Player);
-                EnforceAllowedInventory(args.Player, savedClass);
+                _playerStates[accountId] = savedState;
                 _lastSyncedMaxLife.Remove(args.Player.Index);
-                ApplyClassStats(args.Player, savedClass);
-                if (savedClass == "summoner")
+
+                if (savedState.StarterChoice > 0)
                 {
-                    EnsureSummonerSummoningBuff(args.Player);
-                    EnsureSummonerHoneyBuff(args.Player);
-                    EnsureSummonerPermanentBrokenArmorBuff(args.Player);
+                    ClearWebAndTeleportToSpawn(args.Player);
+                    EnforceAllowedInventory(args.Player, savedState.ClassName);
+                    ApplyClassStats(args.Player, savedState);
+                    EnsurePermanentClassBuffs(args.Player, savedState);
+                    args.Player.SendSuccessMessage($"[ClassSystem] Welcome back! Class: {savedState.ClassName.ToUpper()} (Pack /ch {savedState.StarterChoice})");
                 }
-                args.Player.SendSuccessMessage($"[ClassSystem] Welcome back! Your class is: {savedClass.ToUpper()}");
+                else
+                {
+                    string choicePrompt = GetStarterChoicePrompt(savedState.ClassName);
+                    ApplyUnderworldLock(args.Player, true);
+                    args.Player.SendWarningMessage(choicePrompt);
+                    BroadcastSelectionPhase(
+                        args.Player,
+                        $"choose_item_{savedState.ClassName}",
+                        $"[ClassSystem] {args.Player.Name}\n{choicePrompt}"
+                    );
+                }
             }
             else
             {
                 ApplyUnderworldLock(args.Player, true);
-                args.Player.SendWarningMessage("[ClassSystem] You are webbed in the Underworld until you select a class using /c <Me|Rg|Mg|sm> or /class <warrior|ranger|mage|summoner>.");
+                args.Player.SendWarningMessage(ClassSelectPrompt);
+                BroadcastSelectionPhase(
+                    args.Player,
+                    "choose_class",
+                    $"[ClassSystem] {args.Player.Name}\n{ClassSelectPrompt}"
+                );
             }
         }
 
@@ -1006,15 +1243,15 @@ namespace ClassSystemPlugin
             var player = TShock.Players[args.Who];
             if (player?.Account != null)
             {
-                _playerClasses.Remove(player.Account.ID);
+                _playerStates.Remove(player.Account.ID);
             }
             _frozenPositions.Remove(args.Who);
             _warnCooldown.Remove(args.Who);
+            _serverBroadcastCooldown.Remove(args.Who);
+            _lastBroadcastPhase.Remove(args.Who);
             _dropWarnCooldown.Remove(args.Who);
             _crystalWarnCooldown.Remove(args.Who);
-            _summonBuffCooldown.Remove(args.Who);
-            _honeyBuffCooldown.Remove(args.Who);
-            _brokenArmorBuffCooldown.Remove(args.Who);
+            _buffRefreshCooldown.Remove(args.Who);
             _lastSyncedMaxLife.Remove(args.Who);
             _honeyRegenAccumulator.Remove(args.Who);
             _blockedWorldItemsByPlayer.Remove(args.Who);
@@ -1120,20 +1357,41 @@ namespace ClassSystemPlugin
 
             if (player.Account != null)
             {
-                string currentClass = GetPlayerClass(player);
-                if (string.IsNullOrEmpty(currentClass))
+                var state = GetPlayerState(player);
+                if (state == null || string.IsNullOrEmpty(state.ClassName))
                 {
                     ApplyUnderworldLock(player, true);
+                    BroadcastSelectionPhase(
+                        player,
+                        "choose_class",
+                        $"[ClassSystem] {player.Name}\n{ClassSelectPrompt}"
+                    );
                     if (!_warnCooldown.TryGetValue(player.Index, out DateTime lastWarn) || (DateTime.UtcNow - lastWarn).TotalSeconds >= 4)
                     {
                         _warnCooldown[player.Index] = DateTime.UtcNow;
-                        player.SendWarningMessage("[ClassSystem] Select a class using /c <Me|Rg|Mg|sm> or /class <warrior|ranger|mage|summoner> to break the web and leave the Underworld.");
+                        player.SendWarningMessage(ClassSelectPrompt);
+                    }
+                }
+                else if (state.StarterChoice <= 0)
+                {
+                    string choicePrompt = GetStarterChoicePrompt(state.ClassName);
+                    ApplyUnderworldLock(player, true);
+                    BroadcastSelectionPhase(
+                        player,
+                        $"choose_item_{state.ClassName}",
+                        $"[ClassSystem] {player.Name}\n{choicePrompt}"
+                    );
+                    if (!_warnCooldown.TryGetValue(player.Index, out DateTime lastWarn) || (DateTime.UtcNow - lastWarn).TotalSeconds >= 4)
+                    {
+                        _warnCooldown[player.Index] = DateTime.UtcNow;
+                        player.SendWarningMessage(choicePrompt);
                     }
                 }
                 else
                 {
                     _frozenPositions.Remove(player.Index);
                     CleanupInactiveBlockedWorldItems(player.Index);
+                    ApplyMovementSpeedDelta(player, state);
                     Item held = player.TPlayer.HeldItem;
 
                     if (held != null && !held.IsAir && held.type == ItemID.LifeCrystal && IsLifeCrystalAtLimit(player))
@@ -1143,7 +1401,7 @@ namespace ClassSystemPlugin
                     }
                     else
                     {
-                        EnforceAllowedInventory(player, currentClass);
+                        EnforceAllowedInventory(player, state.ClassName);
                     }
                 }
             }
@@ -1154,8 +1412,8 @@ namespace ClassSystemPlugin
             var player = TShock.Players[args.PlayerId];
             if (player == null || !player.Active || !player.IsLoggedIn || player.Account == null) return;
 
-            string currentClass = GetPlayerClass(player);
-            if (string.IsNullOrEmpty(currentClass)) return;
+            var state = GetPlayerState(player);
+            if (state == null || string.IsNullOrEmpty(state.ClassName)) return;
 
             if (args.Type == ItemID.LifeCrystal && IsLifeCrystalAtLimit(player))
             {
@@ -1172,7 +1430,7 @@ namespace ClassSystemPlugin
                 testItem.stack = Math.Max(1, (int)args.Stack);
                 testItem.prefix = (byte)args.Prefix;
 
-                if (!IsItemAllowedForClass(testItem, currentClass))
+                if (!IsItemAllowedForClass(testItem, state.ClassName))
                 {
                     args.Handled = true;
                     EjectDisallowedItemSafely(player, args.Slot, testItem, args.Type, args.Stack, (byte)args.Prefix);
@@ -1206,33 +1464,48 @@ namespace ClassSystemPlugin
                     continue;
                 }
 
-                string playerClass = GetPlayerClass(player);
-                if (string.IsNullOrEmpty(playerClass))
+                var state = GetPlayerState(player);
+                if (state == null || string.IsNullOrEmpty(state.ClassName))
                 {
                     _honeyRegenAccumulator.Remove(player.Index);
                     if (runPeriodicSync)
                     {
                         ApplyUnderworldLock(player, true);
+                        BroadcastSelectionPhase(
+                            player,
+                            "choose_class",
+                            $"[ClassSystem] {player.Name}\n{ClassSelectPrompt}"
+                        );
                     }
                     continue;
                 }
 
-                ApplyHoneyRegenBonus(player, playerClass, honeyDeltaSec);
-                ApplyClassStats(player, playerClass);
-                ApplySummonerPermanentBrokenArmorEffect(player, playerClass);
+                if (state.StarterChoice <= 0)
+                {
+                    string choicePrompt = GetStarterChoicePrompt(state.ClassName);
+                    _honeyRegenAccumulator.Remove(player.Index);
+                    if (runPeriodicSync)
+                    {
+                        ApplyUnderworldLock(player, true);
+                        BroadcastSelectionPhase(
+                            player,
+                            $"choose_item_{state.ClassName}",
+                            $"[ClassSystem] {player.Name}\n{choicePrompt}"
+                        );
+                    }
+                    continue;
+                }
+
+                ApplyHoneyRegenBonus(player, state, honeyDeltaSec);
+                ApplyClassStats(player, state);
+                ApplyBrokenArmorDefenseEffect(player, state);
 
                 if (runPeriodicSync)
                 {
                     ClearWebBuff(player);
                     CleanupInactiveBlockedWorldItems(player.Index);
-                    EnforceAllowedInventory(player, playerClass);
-
-                    if (playerClass == "summoner")
-                    {
-                        EnsureSummonerSummoningBuff(player);
-                        EnsureSummonerHoneyBuff(player);
-                        EnsureSummonerPermanentBrokenArmorBuff(player);
-                    }
+                    EnforceAllowedInventory(player, state.ClassName);
+                    EnsurePermanentClassBuffs(player, state);
                 }
             }
         }
@@ -1246,21 +1519,48 @@ namespace ClassSystemPlugin
             var tsPlayer = TShock.Players[playerIndex];
             if (tsPlayer == null || !tsPlayer.IsLoggedIn || tsPlayer.Account == null) return;
 
-            string playerClass = GetPlayerClass(tsPlayer);
-            if (string.IsNullOrEmpty(playerClass)) return;
+            var state = GetPlayerState(tsPlayer);
+            if (state == null || string.IsNullOrEmpty(state.ClassName)) return;
 
             var heldItem = args.Player.HeldItem;
 
-            if (heldItem != null && !heldItem.IsAir && !IsItemAllowedForClass(heldItem, playerClass))
+            if (heldItem != null && !heldItem.IsAir && !IsItemAllowedForClass(heldItem, state.ClassName))
             {
                 args.Damage = 0;
-                EnforceAllowedInventory(tsPlayer, playerClass);
+                EnforceAllowedInventory(tsPlayer, state.ClassName);
             }
         }
 
-        private void GiveStarterItems(TSPlayer player, string className)
+        private (short ItemId, int Stack)[] GetStarterPackItems(string className, int choice)
         {
-            if (!_classStarterItems.TryGetValue(className, out var items)) return;
+            string c = (className ?? "").ToLowerInvariant();
+            if (c == "warrior")
+            {
+                if (choice == 1) return new[] { (ItemID.EnchantedSword, 1) };
+                if (choice == 2) return new[] { (ItemID.EnchantedBoomerang, 1) };
+            }
+            else if (c == "ranger")
+            {
+                if (choice == 1) return new[] { (ItemID.TendonBow, 1), (ItemID.WoodenArrow, 1000) };
+                if (choice == 2) return new[] { (ItemID.FlintlockPistol, 1), (ItemID.MusketBall, 1000) };
+            }
+            else if (c == "mage")
+            {
+                if (choice == 1) return new[] { (ItemID.WandofSparking, 1), (ItemID.LesserManaPotion, 100) };
+                if (choice == 2) return new[] { (ItemID.WaterBolt, 1), (ItemID.LesserManaPotion, 100) };
+            }
+            else if (c == "summoner")
+            {
+                if (choice == 1) return new[] { (ItemID.Cattiva, 1) };
+                if (choice == 2) return new[] { (ItemID.LeatherWhip, 1) };
+            }
+            return Array.Empty<(short, int)>();
+        }
+
+        private void GiveStarterItems(TSPlayer player, string className, int choice)
+        {
+            var items = GetStarterPackItems(className, choice);
+            if (items == null || items.Length == 0) return;
 
             foreach (var (itemId, stack) in items)
             {
@@ -1314,44 +1614,87 @@ namespace ClassSystemPlugin
                 return;
             }
 
-            string currentClass = GetPlayerClass(args.Player);
+            var currentState = GetPlayerState(args.Player);
             if (args.Parameters.Count == 0)
             {
-                string info = string.IsNullOrEmpty(currentClass)
-                    ? "None (use /c <Me|Rg|Mg|sm> or /class <warrior|ranger|mage|summoner>)"
-                    : currentClass.ToUpper();
-                args.Player.SendInfoMessage($"[ClassSystem] Current class: {info}");
+                string info = (currentState == null || string.IsNullOrEmpty(currentState.ClassName))
+                    ? ClassSelectPrompt
+                    : (currentState.StarterChoice > 0
+                        ? $"{currentState.ClassName.ToUpper()} (Pack: /ch {currentState.StarterChoice})"
+                        : GetStarterChoicePrompt(currentState.ClassName));
+                args.Player.SendInfoMessage(info);
                 return;
             }
 
             string chosen = ResolveClassName(args.Parameters[0]);
             if (string.IsNullOrEmpty(chosen))
             {
-                args.Player.SendErrorMessage("[ClassSystem] Invalid class. Use /c <Me|Rg|Mg|sm> or /class <warrior|ranger|mage|summoner>");
+                args.Player.SendErrorMessage(ClassSelectPrompt);
                 return;
             }
 
-            if (!string.IsNullOrEmpty(currentClass))
+            if (currentState != null && !string.IsNullOrEmpty(currentState.ClassName))
             {
-                args.Player.SendErrorMessage($"[ClassSystem] Your class is already set to {currentClass.ToUpper()}. Ask an admin to reset it.");
+                args.Player.SendErrorMessage($"[ClassSystem] Your class is already set to {currentState.ClassName.ToUpper()}. Ask an admin to reset it.");
                 return;
             }
 
-            SaveClassToDB(args.Player.Account.ID, chosen);
-            _playerClasses[args.Player.Account.ID] = chosen;
+            var newState = new PlayerClassState
+            {
+                ClassName = chosen,
+                StarterChoice = 0
+            };
 
+            SaveStateToDB(args.Player.Account.ID, newState);
+            _playerStates[args.Player.Account.ID] = newState;
+
+            string choicePrompt = GetStarterChoicePrompt(chosen);
+            ApplyUnderworldLock(args.Player, true);
+            args.Player.SendSuccessMessage(choicePrompt);
+            TShock.Utils.Broadcast($"[ClassSystem] {args.Player.Name}\n{choicePrompt}", Color.Gold);
+        }
+
+        private void CmdStarterChoice(CommandArgs args)
+        {
+            if (!args.Player.IsLoggedIn || args.Player.Account == null)
+            {
+                args.Player.SendErrorMessage("[ClassSystem] Please log in first.");
+                return;
+            }
+
+            var state = GetPlayerState(args.Player);
+            if (state == null || string.IsNullOrEmpty(state.ClassName))
+            {
+                args.Player.SendErrorMessage(ClassSelectPrompt);
+                return;
+            }
+
+            if (state.StarterChoice > 0)
+            {
+                args.Player.SendErrorMessage($"[ClassSystem] You already selected starter pack /ch {state.StarterChoice}. Ask an admin to reset if needed.");
+                return;
+            }
+
+            if (args.Parameters.Count == 0 || !int.TryParse(args.Parameters[0], out int choice) || (choice != 1 && choice != 2))
+            {
+                args.Player.SendErrorMessage(GetStarterChoicePrompt(state.ClassName));
+                return;
+            }
+
+            state.StarterChoice = choice;
+            SaveStateToDB(args.Player.Account.ID, state);
+            _playerStates[args.Player.Account.ID] = state;
+
+            RemoveAllWeaponsFromInventory(args.Player);
+            EnforceAllowedInventory(args.Player, state.ClassName);
+            GiveStarterItems(args.Player, state.ClassName, choice);
             ClearWebAndTeleportToSpawn(args.Player);
-            EnforceAllowedInventory(args.Player, chosen);
-            GiveStarterItems(args.Player, chosen);
-            if (chosen == "summoner")
-            {
-                EnsureSummonerSummoningBuff(args.Player);
-                EnsureSummonerHoneyBuff(args.Player);
-                EnsureSummonerPermanentBrokenArmorBuff(args.Player);
-            }
             _lastSyncedMaxLife.Remove(args.Player.Index);
-            ApplyClassStats(args.Player, chosen);
-            args.Player.SendSuccessMessage($"[ClassSystem] Class selected: {chosen.ToUpper()}! Web cleared, starter gear equipped, and Max HP synced.");
+            ApplyClassStats(args.Player, state);
+            EnsurePermanentClassBuffs(args.Player, state);
+
+            args.Player.SendSuccessMessage($"[ClassSystem] Starter pack /ch {choice} selected for {state.ClassName.ToUpper()}! Weapons cleared, starter gear granted, buffs active, and released from the Underworld.");
+            TShock.Utils.Broadcast($"[ClassSystem] {args.Player.Name} picked starter pack /ch {choice} for {state.ClassName.ToUpper()} and joined the surface!", Color.LightGreen);
         }
 
         private void CmdSetClass(CommandArgs args)
@@ -1379,11 +1722,13 @@ namespace ClassSystemPlugin
             string option = args.Parameters[1].ToLowerInvariant();
             if (option == "none" || option == "reset")
             {
-                DeleteClassFromDB(target.Account.ID);
-                _playerClasses.Remove(target.Account.ID);
+                DeleteStateFromDB(target.Account.ID);
+                _playerStates.Remove(target.Account.ID);
                 _lastSyncedMaxLife.Remove(target.Index);
+                _lastBroadcastPhase.Remove(target.Index);
                 ApplyUnderworldLock(target, true);
-                target.SendWarningMessage("[ClassSystem] Your class has been reset. You are webbed in the Underworld until you select a class with /c <Me|Rg|Mg|sm> or /class.");
+                target.SendWarningMessage(ClassSelectPrompt);
+                TShock.Utils.Broadcast($"[ClassSystem] {target.Name}\n{ClassSelectPrompt}", Color.Gold);
                 args.Player.SendSuccessMessage($"Reset class for {target.Name}.");
                 return;
             }
@@ -1395,60 +1740,43 @@ namespace ClassSystemPlugin
                 return;
             }
 
-            SaveClassToDB(target.Account.ID, resolvedOption);
-            _playerClasses[target.Account.ID] = resolvedOption;
-            ClearWebAndTeleportToSpawn(target);
-            EnforceAllowedInventory(target, resolvedOption);
-            GiveStarterItems(target, resolvedOption);
-            if (resolvedOption == "summoner")
+            var newState = new PlayerClassState
             {
-                EnsureSummonerSummoningBuff(target);
-                EnsureSummonerHoneyBuff(target);
-                EnsureSummonerPermanentBrokenArmorBuff(target);
-            }
+                ClassName = resolvedOption,
+                StarterChoice = 0
+            };
+            SaveStateToDB(target.Account.ID, newState);
+            _playerStates[target.Account.ID] = newState;
             _lastSyncedMaxLife.Remove(target.Index);
-            ApplyClassStats(target, resolvedOption);
-            target.SendSuccessMessage($"[ClassSystem] Admin set your class to {resolvedOption.ToUpper()}.");
-            args.Player.SendSuccessMessage($"Set {target.Name}'s class to {resolvedOption.ToUpper()}.");
+            _lastBroadcastPhase.Remove(target.Index);
+            string choicePrompt = GetStarterChoicePrompt(resolvedOption);
+            ApplyUnderworldLock(target, true);
+            target.SendSuccessMessage(choicePrompt);
+            TShock.Utils.Broadcast($"[ClassSystem] {target.Name}\n{choicePrompt}", Color.Gold);
+            args.Player.SendSuccessMessage($"Set {target.Name}'s class to {resolvedOption.ToUpper()} (awaiting /ch 1 or /ch 2).");
         }
 
-        private string GetPlayerClass(TSPlayer player)
+        private PlayerClassState GetPlayerState(TSPlayer player)
         {
             if (player?.Account == null) return null;
-            if (_playerClasses.TryGetValue(player.Account.ID, out string cached)) return cached;
-            string fromDb = GetClassFromDB(player.Account.ID);
-            if (!string.IsNullOrEmpty(fromDb))
+            if (_playerStates.TryGetValue(player.Account.ID, out var cached)) return cached;
+            var fromDb = GetStateFromDB(player.Account.ID);
+            if (fromDb != null)
             {
-                _playerClasses[player.Account.ID] = fromDb;
+                _playerStates[player.Account.ID] = fromDb;
             }
             return fromDb;
         }
 
-        private void ApplyClassStats(TSPlayer player, string className)
+        private void ApplyClassStats(TSPlayer player, PlayerClassState state)
         {
             var tPlayer = player.TPlayer;
             int maxAllowedBaseLife = GetMaxAllowedBaseLife();
             int rawBaseLife = tPlayer.statLifeMax > 0 ? tPlayer.statLifeMax : BaseStartHp;
             int currentBaseLife = Math.Min(Math.Max(BaseStartHp, rawBaseLife), maxAllowedBaseLife);
 
-            int targetMaxLife = currentBaseLife;
-
-            if (className == "warrior")
-            {
-                targetMaxLife = Math.Max(40, currentBaseLife + WarriorMaxHpFlat);
-            }
-            else if (className == "ranger")
-            {
-                targetMaxLife = Math.Max(40, currentBaseLife + RangerMaxHpFlat);
-            }
-            else if (className == "mage")
-            {
-                targetMaxLife = Math.Max(40, currentBaseLife + MageMaxHpFlat);
-            }
-            else if (className == "summoner")
-            {
-                targetMaxLife = Math.Max(20, currentBaseLife + SummonerMaxHpFlat);
-            }
+            int hpDelta = GetMaxHpDelta(state);
+            int targetMaxLife = Math.Max(20, currentBaseLife + hpDelta);
 
             tPlayer.statLifeMax = targetMaxLife;
             tPlayer.statLifeMax2 = targetMaxLife;
@@ -1466,7 +1794,7 @@ namespace ClassSystemPlugin
             }
         }
 
-        private string GetClassFromDB(int accountId)
+        private PlayerClassState GetStateFromDB(int accountId)
         {
             if (_db == null) return null;
             try
@@ -1474,7 +1802,7 @@ namespace ClassSystemPlugin
                 EnsureConnectionOpen();
                 using (var cmd = _db.CreateCommand())
                 {
-                    cmd.CommandText = "SELECT ClassName FROM PlayerClasses WHERE AccountID = @0";
+                    cmd.CommandText = "SELECT ClassName, StarterChoice FROM PlayerClasses WHERE AccountID = @0";
                     var p = cmd.CreateParameter();
                     p.ParameterName = "@0";
                     p.Value = accountId;
@@ -1484,33 +1812,40 @@ namespace ClassSystemPlugin
                     {
                         if (reader.Read() && !reader.IsDBNull(0))
                         {
-                            return reader.GetString(0);
+                            string cName = reader.GetString(0);
+                            int choice = !reader.IsDBNull(1) ? reader.GetInt32(1) : 0;
+                            return new PlayerClassState
+                            {
+                                ClassName = cName,
+                                StarterChoice = choice
+                            };
                         }
                     }
                 }
             }
             catch (Exception ex)
             {
-                TShock.Log.Error($"[ClassSystem] GetClassFromDB error: {ex.Message}");
+                TShock.Log.Error($"[ClassSystem] GetStateFromDB error: {ex.Message}");
             }
             return null;
         }
 
-        private void SaveClassToDB(int accountId, string className)
+        private void SaveStateToDB(int accountId, PlayerClassState state)
         {
+            if (state == null || string.IsNullOrEmpty(state.ClassName)) return;
             try
             {
                 ExecuteNonQuery(
-                    "INSERT INTO PlayerClasses (AccountID, ClassName) VALUES (@0, @1) ON CONFLICT(AccountID) DO UPDATE SET ClassName = excluded.ClassName",
-                    ("@0", accountId), ("@1", className));
+                    "INSERT INTO PlayerClasses (AccountID, ClassName, StarterChoice) VALUES (@0, @1, @2) ON CONFLICT(AccountID) DO UPDATE SET ClassName = excluded.ClassName, StarterChoice = excluded.StarterChoice",
+                    ("@0", accountId), ("@1", state.ClassName), ("@2", state.StarterChoice));
             }
             catch (Exception ex)
             {
-                TShock.Log.Error($"[ClassSystem] SaveClassToDB error: {ex.Message}");
+                TShock.Log.Error($"[ClassSystem] SaveStateToDB error: {ex.Message}");
             }
         }
 
-        private void DeleteClassFromDB(int accountId)
+        private void DeleteStateFromDB(int accountId)
         {
             try
             {
@@ -1518,7 +1853,7 @@ namespace ClassSystemPlugin
             }
             catch (Exception ex)
             {
-                TShock.Log.Error($"[ClassSystem] DeleteClassFromDB error: {ex.Message}");
+                TShock.Log.Error($"[ClassSystem] DeleteStateFromDB error: {ex.Message}");
             }
         }
     }
