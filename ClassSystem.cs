@@ -22,7 +22,7 @@ namespace ClassSystemPlugin
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
         public override string Description => "Account-bound class system with underworld lock before login, webbed lock after login until class selection, starter gear, instant item drop on cross-class usage (ignoring coins/ammo/misc), Max HP modifiers per class + Summoning buff (+1 minion) only (other stat buffs/nerfs removed), quick /c shortcuts, Life Crystal limit, and real-time HP sync.";
-        public override Version Version => new Version(15, 24, 5);
+        public override Version Version => new Version(15, 24, 6);
 
         private SqliteConnection _db;
         private bool _dbReady;
@@ -529,3 +529,416 @@ namespace ClassSystemPlugin
                     return false;
             }
         }
+
+        private void NotifyBlockedLifeCrystal(TSPlayer player)
+        {
+            if (player == null) return;
+            if (!_crystalWarnCooldown.TryGetValue(player.Index, out DateTime lastCrystalWarn) || (DateTime.UtcNow - lastCrystalWarn).TotalSeconds >= 3)
+            {
+                _crystalWarnCooldown[player.Index] = DateTime.UtcNow;
+                player.SendWarningMessage($"[ClassSystem] Life Crystal usage blocked — limit is {MaxLifeCrystalsAllowed} crystals ({GetMaxAllowedBaseLife()} base HP). Item kept in inventory.");
+            }
+        }
+
+        private void OnPlayerUpdate(object sender, GetDataHandlers.PlayerUpdateEventArgs args)
+        {
+            var player = TShock.Players[args.PlayerId];
+            if (player == null || !player.Active) return;
+
+            if (!player.IsLoggedIn)
+            {
+                ApplyUnderworldLock(player, false);
+                if (!_warnCooldown.TryGetValue(player.Index, out DateTime lastWarn) || (DateTime.UtcNow - lastWarn).TotalSeconds >= 5)
+                {
+                    _warnCooldown[player.Index] = DateTime.UtcNow;
+                    player.SendWarningMessage("[ClassSystem] Please log in with /login first to escape the Underworld.");
+                }
+                return;
+            }
+
+            if (player.Account != null)
+            {
+                string currentClass = GetPlayerClass(player);
+                if (string.IsNullOrEmpty(currentClass))
+                {
+                    ApplyUnderworldLock(player, true);
+                    if (!_warnCooldown.TryGetValue(player.Index, out DateTime lastWarn) || (DateTime.UtcNow - lastWarn).TotalSeconds >= 4)
+                    {
+                        _warnCooldown[player.Index] = DateTime.UtcNow;
+                        player.SendWarningMessage("[ClassSystem] Select a class using /c <Me|Rg|Mg|sm> or /class <warrior|ranger|mage|summoner> to break the web and leave the Underworld.");
+                    }
+                }
+                else
+                {
+                    _frozenPositions.Remove(player.Index);
+                    Item held = player.TPlayer.HeldItem;
+
+                    if (held != null && !held.IsAir && held.type == ItemID.LifeCrystal && IsLifeCrystalAtLimit(player))
+                    {
+                        BlockLifeCrystalUsage(player);
+                        NotifyBlockedLifeCrystal(player);
+                    }
+                    else if (player.TPlayer.controlUseItem || (held != null && !held.IsAir && !IsItemAllowedForClass(held, currentClass)))
+                    {
+                        DropHeldDisallowedItemIfAny(player, currentClass);
+                    }
+                }
+            }
+        }
+
+        private void OnPlayerSlot(object sender, GetDataHandlers.PlayerSlotEventArgs args)
+        {
+            var player = TShock.Players[args.PlayerId];
+            if (player == null || !player.Active || !player.IsLoggedIn || player.Account == null) return;
+
+            string currentClass = GetPlayerClass(player);
+            if (string.IsNullOrEmpty(currentClass)) return;
+
+            if (args.Type == ItemID.LifeCrystal && IsLifeCrystalAtLimit(player))
+            {
+                args.Handled = true;
+                BlockLifeCrystalUsage(player);
+                NotifyBlockedLifeCrystal(player);
+                return;
+            }
+
+            Item testItem = new Item();
+            testItem.SetDefaults(args.Type);
+            testItem.stack = Math.Max(1, (int)args.Stack);
+
+            if (!IsItemAllowedForClass(testItem, currentClass))
+            {
+                args.Handled = true;
+                Item existing = (args.Slot >= 0 && args.Slot < player.TPlayer.inventory.Length)
+                    ? player.TPlayer.inventory[args.Slot]
+                    : null;
+                DropDisallowedItemAndClearSlot(player, args.Slot, existing, args.Type, args.Stack);
+            }
+        }
+
+        private void OnGameUpdate(EventArgs args)
+        {
+            bool runPeriodicSync = (DateTime.UtcNow - _lastTickSync).TotalMilliseconds >= 100;
+            if (runPeriodicSync)
+            {
+                _lastTickSync = DateTime.UtcNow;
+            }
+
+            foreach (var player in TShock.Players)
+            {
+                if (player == null || !player.Active) continue;
+
+                if (!player.IsLoggedIn || player.Account == null)
+                {
+                    if (runPeriodicSync)
+                    {
+                        ApplyUnderworldLock(player, false);
+                    }
+                    continue;
+                }
+
+                string playerClass = GetPlayerClass(player);
+                if (string.IsNullOrEmpty(playerClass))
+                {
+                    if (runPeriodicSync)
+                    {
+                        ApplyUnderworldLock(player, true);
+                    }
+                    continue;
+                }
+
+                ApplyClassStats(player, playerClass);
+
+                if (runPeriodicSync)
+                {
+                    ClearWebBuff(player);
+
+                    if (playerClass == "summoner")
+                    {
+                        EnsureSummonerSummoningBuff(player);
+                    }
+                }
+            }
+        }
+
+        private void OnNpcStrike(NpcStrikeEventArgs args)
+        {
+            if (args.Player == null || args.Npc == null) return;
+            int playerIndex = Array.IndexOf(Main.player, args.Player);
+            if (playerIndex < 0 || playerIndex >= TShock.Players.Length) return;
+
+            var tsPlayer = TShock.Players[playerIndex];
+            if (tsPlayer == null || !tsPlayer.IsLoggedIn || tsPlayer.Account == null) return;
+
+            string playerClass = GetPlayerClass(tsPlayer);
+            if (string.IsNullOrEmpty(playerClass)) return;
+
+            var heldItem = args.Player.HeldItem;
+
+            // ดรอปอาวุธ/ของไม่ตรงคลาสทันทีเมื่อใช้โจมตี
+            if (heldItem != null && !heldItem.IsAir && !IsItemAllowedForClass(heldItem, playerClass))
+            {
+                args.Damage = 0;
+                DropHeldDisallowedItemIfAny(tsPlayer, playerClass);
+            }
+        }
+
+        private void GiveStarterItems(TSPlayer player, string className)
+        {
+            if (!_classStarterItems.TryGetValue(className, out var items)) return;
+
+            foreach (var (itemId, stack) in items)
+            {
+                Item item = new Item();
+                item.SetDefaults(itemId);
+                item.stack = stack;
+
+                int placedSlot = -1;
+                for (int i = 0; i < 50; i++)
+                {
+                    if (player.TPlayer.inventory[i] == null || player.TPlayer.inventory[i].IsAir || player.TPlayer.inventory[i].type == ItemID.None)
+                    {
+                        player.TPlayer.inventory[i] = item;
+                        placedSlot = i;
+                        break;
+                    }
+                }
+
+                if (placedSlot >= 0)
+                {
+                    NetMessage.SendData((int)PacketTypes.PlayerSlot, -1, -1, null, player.Index, placedSlot, item.prefix, 0, 0);
+                    NetMessage.SendData((int)PacketTypes.PlayerSlot, player.Index, -1, null, player.Index, placedSlot, item.prefix, 0, 0);
+                }
+                else
+                {
+                    player.GiveItem(itemId, stack);
+                }
+            }
+        }
+
+        private string ResolveClassName(string input)
+        {
+            if (string.IsNullOrWhiteSpace(input)) return null;
+            string trimmed = input.Trim().ToLowerInvariant();
+            if (_classShortcuts.TryGetValue(trimmed, out string mapped))
+            {
+                return mapped;
+            }
+            if (_availableClasses.Contains(trimmed))
+            {
+                return trimmed;
+            }
+            return null;
+        }
+
+        private void CmdClass(CommandArgs args)
+        {
+            if (!args.Player.IsLoggedIn || args.Player.Account == null)
+            {
+                args.Player.SendErrorMessage("[ClassSystem] Please log in first.");
+                return;
+            }
+
+            string currentClass = GetPlayerClass(args.Player);
+            if (args.Parameters.Count == 0)
+            {
+                string info = string.IsNullOrEmpty(currentClass)
+                    ? "None (use /c <Me|Rg|Mg|sm> or /class <warrior|ranger|mage|summoner>)"
+                    : currentClass.ToUpper();
+                args.Player.SendInfoMessage($"[ClassSystem] Current class: {info}");
+                return;
+            }
+
+            string chosen = ResolveClassName(args.Parameters[0]);
+            if (string.IsNullOrEmpty(chosen))
+            {
+                args.Player.SendErrorMessage("[ClassSystem] Invalid class. Use /c <Me|Rg|Mg|sm> or /class <warrior|ranger|mage|summoner>");
+                return;
+            }
+
+            if (!string.IsNullOrEmpty(currentClass))
+            {
+                args.Player.SendErrorMessage($"[ClassSystem] Your class is already set to {currentClass.ToUpper()}. Ask an admin to reset it.");
+                return;
+            }
+
+            SaveClassToDB(args.Player.Account.ID, chosen);
+            _playerClasses[args.Player.Account.ID] = chosen;
+
+            ClearWebAndTeleportToSpawn(args.Player);
+            GiveStarterItems(args.Player, chosen);
+            if (chosen == "summoner")
+            {
+                EnsureSummonerSummoningBuff(args.Player);
+            }
+            _lastSyncedMaxLife.Remove(args.Player.Index);
+            ApplyClassStats(args.Player, chosen);
+            args.Player.SendSuccessMessage($"[ClassSystem] Class selected: {chosen.ToUpper()}! Web cleared, starter gear equipped, and Max HP synced.");
+        }
+
+        private void CmdSetClass(CommandArgs args)
+        {
+            if (args.Parameters.Count < 2)
+            {
+                args.Player.SendErrorMessage("Usage: /setclass <player> <warrior|ranger|mage|summoner|none>");
+                return;
+            }
+
+            var targets = TSPlayer.FindByNameOrID(args.Parameters[0]);
+            if (targets.Count == 0)
+            {
+                args.Player.SendErrorMessage("Player not found.");
+                return;
+            }
+
+            var target = targets[0];
+            if (!target.IsLoggedIn || target.Account == null)
+            {
+                args.Player.SendErrorMessage("Target player is not logged in.");
+                return;
+            }
+
+            string option = args.Parameters[1].ToLowerInvariant();
+            if (option == "none" || option == "reset")
+            {
+                DeleteClassFromDB(target.Account.ID);
+                _playerClasses.Remove(target.Account.ID);
+                _lastSyncedMaxLife.Remove(target.Index);
+                ApplyUnderworldLock(target, true);
+                target.SendWarningMessage("[ClassSystem] Your class has been reset. You are webbed in the Underworld until you select a class with /c <Me|Rg|Mg|sm> or /class.");
+                args.Player.SendSuccessMessage($"Reset class for {target.Name}.");
+                return;
+            }
+
+            string resolvedOption = ResolveClassName(option);
+            if (string.IsNullOrEmpty(resolvedOption))
+            {
+                args.Player.SendErrorMessage("Invalid class. Use Me/warrior, Rg/ranger, Mg/mage, sm/summoner, or none.");
+                return;
+            }
+
+            SaveClassToDB(target.Account.ID, resolvedOption);
+            _playerClasses[target.Account.ID] = resolvedOption;
+            ClearWebAndTeleportToSpawn(target);
+            GiveStarterItems(target, resolvedOption);
+            if (resolvedOption == "summoner")
+            {
+                EnsureSummonerSummoningBuff(target);
+            }
+            _lastSyncedMaxLife.Remove(target.Index);
+            ApplyClassStats(target, resolvedOption);
+            target.SendSuccessMessage($"[ClassSystem] Admin set your class to {resolvedOption.ToUpper()}.");
+            args.Player.SendSuccessMessage($"Set {target.Name}'s class to {resolvedOption.ToUpper()}.");
+        }
+
+        private string GetPlayerClass(TSPlayer player)
+        {
+            if (player?.Account == null) return null;
+            if (_playerClasses.TryGetValue(player.Account.ID, out string cached)) return cached;
+            string fromDb = GetClassFromDB(player.Account.ID);
+            if (!string.IsNullOrEmpty(fromDb))
+            {
+                _playerClasses[player.Account.ID] = fromDb;
+            }
+            return fromDb;
+        }
+
+        private void ApplyClassStats(TSPlayer player, string className)
+        {
+            var tPlayer = player.TPlayer;
+            int maxAllowedBaseLife = GetMaxAllowedBaseLife();
+            int rawBaseLife = tPlayer.statLifeMax > 0 ? tPlayer.statLifeMax : BaseStartHp;
+            int currentBaseLife = Math.Min(Math.Max(BaseStartHp, rawBaseLife), maxAllowedBaseLife);
+
+            int targetMaxLife = currentBaseLife;
+
+            if (className == "warrior")
+            {
+                targetMaxLife = Math.Max(40, currentBaseLife + WarriorMaxHpFlat);
+            }
+            else if (className == "ranger")
+            {
+                targetMaxLife = Math.Max(40, currentBaseLife + RangerMaxHpFlat);
+            }
+            else if (className == "mage")
+            {
+                targetMaxLife = Math.Max(40, currentBaseLife + MageMaxHpFlat);
+            }
+            else if (className == "summoner")
+            {
+                targetMaxLife = Math.Max(20, currentBaseLife + SummonerMaxHpFlat);
+            }
+
+            tPlayer.statLifeMax = targetMaxLife;
+            tPlayer.statLifeMax2 = targetMaxLife;
+
+            if (tPlayer.statLife > targetMaxLife)
+            {
+                tPlayer.statLife = targetMaxLife;
+            }
+
+            if (!_lastSyncedMaxLife.TryGetValue(player.Index, out int lastMaxLife) || lastMaxLife != targetMaxLife)
+            {
+                _lastSyncedMaxLife[player.Index] = targetMaxLife;
+                NetMessage.SendData((int)PacketTypes.PlayerHp, -1, -1, null, player.Index);
+                NetMessage.SendData((int)PacketTypes.PlayerHp, player.Index, -1, null, player.Index);
+            }
+        }
+
+        private string GetClassFromDB(int accountId)
+        {
+            if (_db == null) return null;
+            try
+            {
+                EnsureConnectionOpen();
+                using (var cmd = _db.CreateCommand())
+                {
+                    cmd.CommandText = "SELECT ClassName FROM PlayerClasses WHERE AccountID = @0";
+                    var p = cmd.CreateParameter();
+                    p.ParameterName = "@0";
+                    p.Value = accountId;
+                    cmd.Parameters.Add(p);
+
+                    using (var reader = cmd.ExecuteReader())
+                    {
+                        if (reader.Read() && !reader.IsDBNull(0))
+                        {
+                            return reader.GetString(0);
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                TShock.Log.Error($"[ClassSystem] GetClassFromDB error: {ex.Message}");
+            }
+            return null;
+        }
+
+        private void SaveClassToDB(int accountId, string className)
+        {
+            try
+            {
+                ExecuteNonQuery(
+                    "INSERT INTO PlayerClasses (AccountID, ClassName) VALUES (@0, @1) ON CONFLICT(AccountID) DO UPDATE SET ClassName = excluded.ClassName",
+                    ("@0", accountId), ("@1", className));
+            }
+            catch (Exception ex)
+            {
+                TShock.Log.Error($"[ClassSystem] SaveClassToDB error: {ex.Message}");
+            }
+        }
+
+        private void DeleteClassFromDB(int accountId)
+        {
+            try
+            {
+                ExecuteNonQuery("DELETE FROM PlayerClasses WHERE AccountID = @0", ("@0", accountId));
+            }
+            catch (Exception ex)
+            {
+                TShock.Log.Error($"[ClassSystem] DeleteClassFromDB error: {ex.Message}");
+            }
+        }
+    }
+}
