@@ -21,8 +21,8 @@ namespace ClassSystemPlugin
     {
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
-        public override string Description => "Account-bound class system with underworld lock before login, webbed lock after login until class selection, starter gear, cross-class inventory ejection and dropped item pickup lock (accessories allowed freely), Max HP modifiers per class + Summoning buff (+1 minion) only, +15% Honey buff life regen for Summoner, uncleansable 5% Broken Armor reduction for Summoner, quick /c shortcuts, Life Crystal limit, and real-time HP sync.";
-        public override Version Version => new Version(15, 32, 1);
+        public override string Description => "Account-bound class system with underworld lock before login, webbed lock after login until class selection, starter gear, cross-class inventory ejection (never deleted) and dropped item pickup lock, Max HP modifiers per class + permanent Summoning buff + permanent Honey buff (+15% life regen) + permanent uncleansable Broken Armor buff (5% defense reduction) for Summoner, quick /c shortcuts, Life Crystal limit, and real-time HP sync.";
+        public override Version Version => new Version(15, 34, 0);
 
         private SqliteConnection _db;
         private bool _dbReady;
@@ -32,10 +32,10 @@ namespace ClassSystemPlugin
         private readonly Dictionary<int, DateTime> _dropWarnCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, DateTime> _crystalWarnCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, DateTime> _summonBuffCooldown = new Dictionary<int, DateTime>();
+        private readonly Dictionary<int, DateTime> _honeyBuffCooldown = new Dictionary<int, DateTime>();
+        private readonly Dictionary<int, DateTime> _brokenArmorBuffCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, int> _lastSyncedMaxLife = new Dictionary<int, int>();
         private readonly Dictionary<int, double> _honeyRegenAccumulator = new Dictionary<int, double>();
-        private readonly Dictionary<int, DateTime> _brokenArmorExpiresAt = new Dictionary<int, DateTime>();
-        private readonly Dictionary<int, DateTime> _lastBrokenArmorReapply = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, HashSet<int>> _blockedWorldItemsByPlayer = new Dictionary<int, HashSet<int>>();
         private DateTime _lastTickSync = DateTime.MinValue;
         private DateTime _lastHoneyTick = DateTime.UtcNow;
@@ -43,8 +43,8 @@ namespace ClassSystemPlugin
         private const int MaxLifeCrystalsAllowed = 15;
         private const int BaseStartHp = 100;
         private const int HpPerLifeCrystal = 20;
-        private const double HoneyBonusLifeRegenMultiplier = 0.15; // รีเลือดเร็วขึ้น 15%
-        private const double SummonerBrokenArmorReduction = 0.05; // ลดเกราะ 5% เฉพาะสาย Summoner
+        private const double HoneyBonusLifeRegenMultiplier = 0.15;
+        private const double SummonerBrokenArmorReduction = 0.05;
 
         // Max HP modifiers per class only
         private const int WarriorMaxHpFlat = 20;
@@ -254,12 +254,66 @@ namespace ClassSystemPlugin
             base.Dispose(disposing);
         }
 
+        private void EnsureSummonerHoneyBuff(TSPlayer player)
+        {
+            if (player == null || player.TPlayer == null || !player.Active || player.TPlayer.dead) return;
+
+            if (_honeyBuffCooldown.TryGetValue(player.Index, out DateTime lastCd) && (DateTime.UtcNow - lastCd).TotalSeconds < 1.5)
+                return;
+
+            bool hasHoney = false;
+            for (int i = 0; i < Player.maxBuffs; i++)
+            {
+                if (player.TPlayer.buffType[i] == BuffID.Honey && player.TPlayer.buffTime[i] > 60)
+                {
+                    hasHoney = true;
+                    break;
+                }
+            }
+
+            if (!hasHoney)
+            {
+                _honeyBuffCooldown[player.Index] = DateTime.UtcNow;
+                player.SetBuff(BuffID.Honey, 240, true);
+            }
+        }
+
+        private void EnsureSummonerPermanentBrokenArmorBuff(TSPlayer player)
+        {
+            if (player == null || player.TPlayer == null || !player.Active || player.TPlayer.dead) return;
+
+            if (_brokenArmorBuffCooldown.TryGetValue(player.Index, out DateTime lastCd) && (DateTime.UtcNow - lastCd).TotalMilliseconds < 400)
+                return;
+
+            bool hasImmunityAccessory = HasBrokenArmorImmunityItem(player.TPlayer);
+            int targetBuffId = hasImmunityAccessory ? BuffID.WitheredArmor : BuffID.BrokenArmor;
+
+            bool hasActiveBuff = false;
+            for (int i = 0; i < Player.maxBuffs; i++)
+            {
+                int bType = player.TPlayer.buffType[i];
+                if ((bType == BuffID.BrokenArmor || bType == BuffID.WitheredArmor) && player.TPlayer.buffTime[i] > 60)
+                {
+                    if (!hasImmunityAccessory || bType == BuffID.WitheredArmor)
+                    {
+                        hasActiveBuff = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!hasActiveBuff)
+            {
+                _brokenArmorBuffCooldown[player.Index] = DateTime.UtcNow;
+                player.SetBuff(targetBuffId, 240, true);
+            }
+        }
+
         private int CalculatePlayerEquipmentDefense(Player tPlayer)
         {
             if (tPlayer == null) return 0;
             int totalDef = 0;
 
-            // เกราะหลัก 3 ช่อง (หัว, ตัว, ขา)
             for (int i = 0; i < 3 && i < tPlayer.armor.Length; i++)
             {
                 Item arm = tPlayer.armor[i];
@@ -269,7 +323,6 @@ namespace ClassSystemPlugin
                 }
             }
 
-            // เครื่องประดับช่อง 3..9 + Warding / Armored / Hard / Guarding
             for (int i = 3; i < 10 && i < tPlayer.armor.Length; i++)
             {
                 Item acc = tPlayer.armor[i];
@@ -314,24 +367,35 @@ namespace ClassSystemPlugin
             return false;
         }
 
-        private bool HasBuff(TSPlayer player, int buffId, out int remainingTicks)
+        private bool HasBuff(TSPlayer player, int buffId)
         {
-            remainingTicks = 0;
             if (player?.TPlayer == null) return false;
             for (int i = 0; i < Player.maxBuffs; i++)
             {
                 if (player.TPlayer.buffType[i] == buffId && player.TPlayer.buffTime[i] > 0)
                 {
-                    remainingTicks = player.TPlayer.buffTime[i];
                     return true;
                 }
             }
             return false;
         }
 
-        private bool HasBuff(TSPlayer player, int buffId)
+        private bool HasBrokenArmorImmunityItem(Player tPlayer)
         {
-            return HasBuff(player, buffId, out _);
+            if (tPlayer == null) return false;
+            for (int i = 3; i < 10 && i < tPlayer.armor.Length; i++)
+            {
+                Item acc = tPlayer.armor[i];
+                if (acc == null || acc.IsAir) continue;
+                if (acc.type == ItemID.ArmorPolish ||
+                    acc.type == ItemID.ArmorBracing ||
+                    acc.type == ItemID.AnkhCharm ||
+                    acc.type == ItemID.AnkhShield)
+                {
+                    return true;
+                }
+            }
+            return false;
         }
 
         private void OnPlayerDamage(object sender, GetDataHandlers.PlayerDamageEventArgs args)
@@ -342,12 +406,7 @@ namespace ClassSystemPlugin
             string playerClass = GetPlayerClass(player);
             if (!string.Equals(playerClass, "summoner", StringComparison.OrdinalIgnoreCase)) return;
 
-            DateTime now = DateTime.UtcNow;
-            bool isBrokenArmorActive = HasBuff(player, BuffID.BrokenArmor) ||
-                                       HasBuff(player, BuffID.WitheredArmor) ||
-                                       (_brokenArmorExpiresAt.TryGetValue(player.Index, out DateTime exp) && now < exp);
-
-            if (!isBrokenArmorActive || args.Damage <= 1) return;
+            if (args.Damage <= 1) return;
 
             int baseDefense = CalculatePlayerEquipmentDefense(player.TPlayer);
             if (baseDefense <= 0) return;
@@ -372,47 +431,14 @@ namespace ClassSystemPlugin
             }
         }
 
-        private void ApplySummonerBrokenArmor5Percent(TSPlayer player, string playerClass, DateTime now)
+        private void ApplySummonerPermanentBrokenArmorEffect(TSPlayer player, string playerClass)
         {
-            if (player?.TPlayer == null || !player.Active) return;
+            if (player?.TPlayer == null || !player.Active || player.TPlayer.dead) return;
+
+            if (!string.Equals(playerClass, "summoner", StringComparison.OrdinalIgnoreCase))
+                return;
 
             var tPlayer = player.TPlayer;
-            bool isSummoner = string.Equals(playerClass, "summoner", StringComparison.OrdinalIgnoreCase);
-
-            if (!isSummoner || tPlayer.dead)
-            {
-                _brokenArmorExpiresAt.Remove(player.Index);
-                _lastBrokenArmorReapply.Remove(player.Index);
-                return;
-            }
-
-            bool hasBrokenArmor = HasBuff(player, BuffID.BrokenArmor, out int remainingTicks);
-
-            if (hasBrokenArmor)
-            {
-                double secLeft = Math.Max(0.2, remainingTicks / 60.0);
-                DateTime newExpiry = now.AddSeconds(secLeft);
-                if (!_brokenArmorExpiresAt.TryGetValue(player.Index, out DateTime existingExpiry) || newExpiry > existingExpiry)
-                {
-                    _brokenArmorExpiresAt[player.Index] = newExpiry;
-                }
-            }
-            else if (_brokenArmorExpiresAt.TryGetValue(player.Index, out DateTime expiry) && now < expiry)
-            {
-                if (!_lastBrokenArmorReapply.TryGetValue(player.Index, out DateTime lastReapply) || (now - lastReapply).TotalMilliseconds >= 250)
-                {
-                    _lastBrokenArmorReapply[player.Index] = now;
-                    int ticksToRestore = Math.Max(15, (int)Math.Ceiling((expiry - now).TotalSeconds * 60.0));
-                    player.SetBuff(BuffID.BrokenArmor, ticksToRestore, true);
-                }
-            }
-            else
-            {
-                _brokenArmorExpiresAt.Remove(player.Index);
-                _lastBrokenArmorReapply.Remove(player.Index);
-                return;
-            }
-
             int baseDef = CalculatePlayerEquipmentDefense(tPlayer);
             int reducedAmount = (int)Math.Floor(baseDef * SummonerBrokenArmorReduction);
             tPlayer.statDefense = Math.Max(0, baseDef - reducedAmount);
@@ -422,7 +448,7 @@ namespace ClassSystemPlugin
         {
             if (player?.TPlayer == null || !player.Active || player.TPlayer.dead) return;
 
-            if (!string.Equals(playerClass, "summoner", StringComparison.OrdinalIgnoreCase) || !HasBuff(player, BuffID.Honey))
+            if (!string.Equals(playerClass, "summoner", StringComparison.OrdinalIgnoreCase))
             {
                 _honeyRegenAccumulator.Remove(player.Index);
                 return;
@@ -430,12 +456,12 @@ namespace ClassSystemPlugin
 
             var tPlayer = player.TPlayer;
 
-            double baseHoneyHpPerSec = 2.5;
+            double baseHoneyHpPerSec = 3.0;
             if (HasBuff(player, BuffID.Campfire)) baseHoneyHpPerSec += 0.5;
             if (HasBuff(player, BuffID.HeartLamp)) baseHoneyHpPerSec += 1.0;
             if (HasBuff(player, BuffID.Regeneration)) baseHoneyHpPerSec += 2.0;
 
-            double bonusHpPerSec = Math.Max(0.45, baseHoneyHpPerSec * HoneyBonusLifeRegenMultiplier);
+            double bonusHpPerSec = Math.Max(0.5, baseHoneyHpPerSec * HoneyBonusLifeRegenMultiplier);
 
             if (tPlayer.statLife > 0 && tPlayer.statLife < tPlayer.statLifeMax2 && deltaSeconds > 0)
             {
@@ -626,7 +652,7 @@ namespace ClassSystemPlugin
             }
         }
 
-        private void DropDisallowedItemAndClearSlot(TSPlayer player, int netSlotIndex, Item itemToDrop, int fallbackType, int fallbackStack)
+        private void DropDisallowedItemAndClearSlot(TSPlayer player, int netSlotIndex, Item itemToDrop, int fallbackType, int fallbackStack, byte fallbackPrefix = 0)
         {
             if (player?.TPlayer == null) return;
 
@@ -638,7 +664,7 @@ namespace ClassSystemPlugin
                 ? itemToDrop.stack
                 : Math.Max(1, fallbackStack);
 
-            byte prefix = itemToDrop != null ? itemToDrop.prefix : (byte)0;
+            byte prefix = itemToDrop != null && itemToDrop.prefix > 0 ? itemToDrop.prefix : fallbackPrefix;
             string itemName = itemToDrop != null && !string.IsNullOrWhiteSpace(itemToDrop.Name)
                 ? itemToDrop.Name
                 : Lang.GetItemNameValue(itemType);
@@ -716,7 +742,7 @@ namespace ClassSystemPlugin
                 Item item = tPlayer.inventory[i];
                 if (item != null && !item.IsAir && item.type > ItemID.None && !IsItemAllowedForClass(item, currentClass))
                 {
-                    DropDisallowedItemAndClearSlot(player, i, item, item.type, item.stack);
+                    DropDisallowedItemAndClearSlot(player, i, item, item.type, item.stack, item.prefix);
                 }
             }
 
@@ -725,19 +751,19 @@ namespace ClassSystemPlugin
                 Item armorItem = tPlayer.armor[i];
                 if (armorItem != null && !armorItem.IsAir && armorItem.type > ItemID.None && !IsItemAllowedForClass(armorItem, currentClass))
                 {
-                    DropDisallowedItemAndClearSlot(player, 59 + i, armorItem, armorItem.type, armorItem.stack);
+                    DropDisallowedItemAndClearSlot(player, 59 + i, armorItem, armorItem.type, armorItem.stack, armorItem.prefix);
                 }
             }
 
             if (tPlayer.trashItem != null && !tPlayer.trashItem.IsAir && tPlayer.trashItem.type > ItemID.None && !IsItemAllowedForClass(tPlayer.trashItem, currentClass))
             {
-                DropDisallowedItemAndClearSlot(player, 179, tPlayer.trashItem, tPlayer.trashItem.type, tPlayer.trashItem.stack);
+                DropDisallowedItemAndClearSlot(player, 179, tPlayer.trashItem, tPlayer.trashItem.type, tPlayer.trashItem.stack, tPlayer.trashItem.prefix);
             }
         }
 
         private void EnsureSummonerSummoningBuff(TSPlayer player)
         {
-            if (player == null || player.TPlayer == null || !player.Active) return;
+            if (player == null || player.TPlayer == null || !player.Active || player.TPlayer.dead) return;
 
             if (_summonBuffCooldown.TryGetValue(player.Index, out DateTime lastCd) && (DateTime.UtcNow - lastCd).TotalSeconds < 2.0)
                 return;
@@ -941,6 +967,8 @@ namespace ClassSystemPlugin
                 if (savedClass == "summoner")
                 {
                     EnsureSummonerSummoningBuff(args.Player);
+                    EnsureSummonerHoneyBuff(args.Player);
+                    EnsureSummonerPermanentBrokenArmorBuff(args.Player);
                 }
                 args.Player.SendSuccessMessage($"[ClassSystem] Welcome back! Your class is: {savedClass.ToUpper()}");
             }
@@ -963,10 +991,10 @@ namespace ClassSystemPlugin
             _dropWarnCooldown.Remove(args.Who);
             _crystalWarnCooldown.Remove(args.Who);
             _summonBuffCooldown.Remove(args.Who);
+            _honeyBuffCooldown.Remove(args.Who);
+            _brokenArmorBuffCooldown.Remove(args.Who);
             _lastSyncedMaxLife.Remove(args.Who);
             _honeyRegenAccumulator.Remove(args.Who);
-            _brokenArmorExpiresAt.Remove(args.Who);
-            _lastBrokenArmorReapply.Remove(args.Who);
             _blockedWorldItemsByPlayer.Remove(args.Who);
         }
 
@@ -1107,12 +1135,12 @@ namespace ClassSystemPlugin
                 Item testItem = new Item();
                 testItem.SetDefaults(args.Type);
                 testItem.stack = Math.Max(1, (int)args.Stack);
+                testItem.prefix = (byte)args.Prefix;
 
                 if (!IsItemAllowedForClass(testItem, currentClass))
                 {
                     args.Handled = true;
-                    ClearPlayerNetSlot(player, args.Slot);
-                    NotifyBlockedPickup(player, testItem.Name);
+                    DropDisallowedItemAndClearSlot(player, args.Slot, testItem, args.Type, args.Stack, (byte)args.Prefix);
                 }
             }
         }
@@ -1136,8 +1164,6 @@ namespace ClassSystemPlugin
                 if (!player.IsLoggedIn || player.Account == null)
                 {
                     _honeyRegenAccumulator.Remove(player.Index);
-                    _brokenArmorExpiresAt.Remove(player.Index);
-                    _lastBrokenArmorReapply.Remove(player.Index);
                     if (runPeriodicSync)
                     {
                         ApplyUnderworldLock(player, false);
@@ -1149,8 +1175,6 @@ namespace ClassSystemPlugin
                 if (string.IsNullOrEmpty(playerClass))
                 {
                     _honeyRegenAccumulator.Remove(player.Index);
-                    _brokenArmorExpiresAt.Remove(player.Index);
-                    _lastBrokenArmorReapply.Remove(player.Index);
                     if (runPeriodicSync)
                     {
                         ApplyUnderworldLock(player, true);
@@ -1160,7 +1184,7 @@ namespace ClassSystemPlugin
 
                 ApplyHoneyRegenBonus(player, playerClass, honeyDeltaSec);
                 ApplyClassStats(player, playerClass);
-                ApplySummonerBrokenArmor5Percent(player, playerClass, now);
+                ApplySummonerPermanentBrokenArmorEffect(player, playerClass);
 
                 if (runPeriodicSync)
                 {
@@ -1171,6 +1195,8 @@ namespace ClassSystemPlugin
                     if (playerClass == "summoner")
                     {
                         EnsureSummonerSummoningBuff(player);
+                        EnsureSummonerHoneyBuff(player);
+                        EnsureSummonerPermanentBrokenArmorBuff(player);
                     }
                 }
             }
@@ -1285,6 +1311,8 @@ namespace ClassSystemPlugin
             if (chosen == "summoner")
             {
                 EnsureSummonerSummoningBuff(args.Player);
+                EnsureSummonerHoneyBuff(args.Player);
+                EnsureSummonerPermanentBrokenArmorBuff(args.Player);
             }
             _lastSyncedMaxLife.Remove(args.Player.Index);
             ApplyClassStats(args.Player, chosen);
@@ -1340,6 +1368,8 @@ namespace ClassSystemPlugin
             if (resolvedOption == "summoner")
             {
                 EnsureSummonerSummoningBuff(target);
+                EnsureSummonerHoneyBuff(target);
+                EnsureSummonerPermanentBrokenArmorBuff(target);
             }
             _lastSyncedMaxLife.Remove(target.Index);
             ApplyClassStats(target, resolvedOption);
