@@ -17,8 +17,8 @@ namespace ClassSystemPlugin
     {
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
-        public override string Description => "Account-bound class system with underworld lock before login, webbed lock only after login until class selection, starter gear replacement, hard usage blocks without deleting items, +1 minion via Summoning buff (2 total minions at start), direct nerf on all whips from 1.0 base, boosted summon damage, gathering tool damage rules, quick /c shortcuts, hard Life Crystal usage block, custom stat modifiers, and real-time HP/Mana sync.";
-        public override Version Version => new Version(15, 20, 7);
+        public override string Description => "Account-bound class system with underworld lock before login, webbed lock only after login until class selection, starter gear replacement, hard usage blocks without deleting items, +1 minion via Summoning buff (2 total minions at start), direct nerf on all whips from 1.0 base, boosted summon damage, gathering tool damage rules, quick /c shortcuts, hard Life Crystal usage block, custom stat modifiers, smooth update loop, and real-time HP/Mana sync.";
+        public override Version Version => new Version(15, 20, 8);
 
         private SqliteConnection _db;
         private bool _dbReady;
@@ -27,8 +27,10 @@ namespace ClassSystemPlugin
         private readonly Dictionary<int, DateTime> _warnCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, DateTime> _slotWarnCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, DateTime> _crystalWarnCooldown = new Dictionary<int, DateTime>();
+        private readonly Dictionary<int, DateTime> _summonBuffCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, int> _lastSyncedMaxLife = new Dictionary<int, int>();
         private readonly Dictionary<int, int> _lastSyncedMaxMana = new Dictionary<int, int>();
+        private DateTime _lastTickSync = DateTime.MinValue;
 
         private const int MaxLifeCrystalsAllowed = 15;
         private const int BaseStartHp = 100;
@@ -218,6 +220,9 @@ namespace ClassSystemPlugin
         {
             if (player == null || player.TPlayer == null || !player.Active) return;
 
+            if (_summonBuffCooldown.TryGetValue(player.Index, out DateTime lastCd) && (DateTime.UtcNow - lastCd).TotalSeconds < 2.0)
+                return;
+
             bool hasBuff = false;
             for (int i = 0; i < Player.maxBuffs; i++)
             {
@@ -230,7 +235,8 @@ namespace ClassSystemPlugin
 
             if (!hasBuff)
             {
-                player.SetBuff(BuffID.Summoning, 180, true);
+                _summonBuffCooldown[player.Index] = DateTime.UtcNow;
+                player.SetBuff(BuffID.Summoning, 240, true);
             }
         }
 
@@ -477,6 +483,7 @@ namespace ClassSystemPlugin
             _warnCooldown.Remove(args.Who);
             _slotWarnCooldown.Remove(args.Who);
             _crystalWarnCooldown.Remove(args.Who);
+            _summonBuffCooldown.Remove(args.Who);
             _lastSyncedMaxLife.Remove(args.Who);
             _lastSyncedMaxMana.Remove(args.Who);
         }
@@ -567,16 +574,14 @@ namespace ClassSystemPlugin
                 else
                 {
                     _frozenPositions.Remove(player.Index);
-                    ClearWebBuff(player);
-
                     Item held = player.TPlayer.HeldItem;
+
                     if (held != null && !held.IsAir && held.type == ItemID.LifeCrystal && IsLifeCrystalAtLimit(player))
                     {
                         BlockItemUsage(player, false);
                         NotifyBlockedLifeCrystal(player);
                     }
-
-                    if (held != null && !held.IsAir && !IsItemAllowedForClass(held, currentClass))
+                    else if (held != null && !held.IsAir && !IsItemAllowedForClass(held, currentClass))
                     {
                         BlockItemUsage(player, true);
                         NotifyBlockedItem(player, held.Name, currentClass);
@@ -614,48 +619,52 @@ namespace ClassSystemPlugin
 
         private void OnGameUpdate(EventArgs args)
         {
+            bool runPeriodicSync = (DateTime.UtcNow - _lastTickSync).TotalMilliseconds >= 100;
+            if (runPeriodicSync)
+            {
+                _lastTickSync = DateTime.UtcNow;
+            }
+
             foreach (var player in TShock.Players)
             {
                 if (player == null || !player.Active) continue;
 
                 if (!player.IsLoggedIn || player.Account == null)
                 {
-                    ApplyUnderworldLock(player, false);
+                    if (runPeriodicSync)
+                    {
+                        ApplyUnderworldLock(player, false);
+                    }
                     continue;
                 }
 
                 string playerClass = GetPlayerClass(player);
                 if (string.IsNullOrEmpty(playerClass))
                 {
-                    ApplyUnderworldLock(player, true);
+                    if (runPeriodicSync)
+                    {
+                        ApplyUnderworldLock(player, true);
+                    }
                     continue;
                 }
 
-                ClearWebBuff(player);
                 ApplyClassStats(player, playerClass);
 
-                Item held = player.TPlayer.HeldItem;
-                if (held != null && !held.IsAir && held.type == ItemID.LifeCrystal && IsLifeCrystalAtLimit(player))
+                if (runPeriodicSync)
                 {
-                    BlockItemUsage(player, false);
-                    NotifyBlockedLifeCrystal(player);
-                }
+                    ClearWebBuff(player);
 
-                if (held != null && !held.IsAir && !IsItemAllowedForClass(held, playerClass))
-                {
-                    BlockItemUsage(player, true);
-                    NotifyBlockedItem(player, held.Name, playerClass);
-                }
-
-                if (playerClass == "summoner")
-                {
-                    EnsureSummonerSummoningBuff(player);
-                }
-
-                if (playerClass == "ranger" && RangerArcheryBuff)
-                {
-                    foreach (var proj in Main.projectile)
+                    if (playerClass == "summoner")
                     {
+                        EnsureSummonerSummoningBuff(player);
+                    }
+                }
+
+                if (runPeriodicSync && playerClass == "ranger" && RangerArcheryBuff)
+                {
+                    for (int i = 0; i < Main.maxProjectiles; i++)
+                    {
+                        var proj = Main.projectile[i];
                         if (proj != null && proj.active && proj.owner == player.Index && proj.ranged && proj.ai[1] == 0f)
                         {
                             proj.velocity *= 1.02f;
@@ -680,7 +689,7 @@ namespace ClassSystemPlugin
 
             var heldItem = args.Player.HeldItem;
 
-            // เนิฟแส้ทุกกระบอกทันที (คิดจากฐาน 1.0 + WhipNerfMult)
+            // เนิฟแส้ทุกกระบอกทันที (คิดจากฐาน 1.0 + WhipNerfMult) โดยไม่ยิงแพ็กเก็ตเพิ่มตอนตีปกติ
             if (IsWhipItem(heldItem))
             {
                 double whipMult = Math.Max(0.0, 1.0 + WhipNerfMult);
