@@ -21,8 +21,8 @@ namespace ClassSystemPlugin
     {
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
-        public override string Description => "Account-bound class system with underworld lock before login, webbed lock after login until class selection, starter gear, instant item drop on cross-class usage (ignoring coins/ammo/misc), Max HP modifiers per class + Summoning buff (+1 minion) only (other stat buffs/nerfs removed), quick /c shortcuts, Life Crystal limit, and real-time HP sync.";
-        public override Version Version => new Version(15, 24, 7);
+        public override string Description => "Account-bound class system with underworld lock before login, webbed lock after login until class selection, starter gear, full-inventory cross-class weapon/armor drop & pickup lock (accessories allowed freely), Max HP modifiers per class + Summoning buff (+1 minion) only, quick /c shortcuts, Life Crystal limit, and real-time HP sync.";
+        public override Version Version => new Version(15, 26, 0);
 
         private SqliteConnection _db;
         private bool _dbReady;
@@ -67,19 +67,143 @@ namespace ClassSystemPlugin
             ["sm"] = "summoner"
         };
 
-        private readonly Dictionary<int, string> _restrictedArmorsAndAccessories = new Dictionary<int, string>
+        // ชุดเกราะที่แยกสายชัดเจน (ไม่รวมเครื่องประดับเพราะเครื่องประดับใส่อะไรก็ได้)
+        private readonly Dictionary<int, string> _restrictedArmors = new Dictionary<int, string>
         {
-            { ItemID.WarriorEmblem, "warrior" },
-            { ItemID.RangerEmblem, "ranger" },
-            { ItemID.SorcererEmblem, "mage" },
-            { ItemID.SummonerEmblem, "summoner" },
-            { ItemID.FeralClaws, "warrior" },
-            { ItemID.MagicQuiver, "ranger" },
-            { ItemID.ManaFlower, "mage" },
-            { ItemID.PygmyNecklace, "summoner" },
-            { ItemID.NecromanticScroll, "summoner" },
-            { ItemID.PapyrusScarab, "summoner" },
-            { ItemID.HerculesBeetle, "summoner" }
+            // Pre-Hardmode Melee / Warrior
+            { ItemID.GladiatorHelmet, "warrior" },
+            { ItemID.GladiatorBreastplate, "warrior" },
+            { ItemID.GladiatorLeggings, "warrior" },
+            { ItemID.ShadowHelmet, "warrior" },
+            { ItemID.ShadowScalemail, "warrior" },
+            { ItemID.ShadowGreaves, "warrior" },
+            { ItemID.AncientShadowHelmet, "warrior" },
+            { ItemID.AncientShadowScalemail, "warrior" },
+            { ItemID.AncientShadowGreaves, "warrior" },
+            { ItemID.MoltenHelmet, "warrior" },
+            { ItemID.MoltenBreastplate, "warrior" },
+            { ItemID.MoltenGreaves, "warrior" },
+
+            // Pre-Hardmode Ranged / Ranger
+            { ItemID.FossilHelm, "ranger" },
+            { ItemID.FossilPlate, "ranger" },
+            { ItemID.FossilGreaves, "ranger" },
+            { ItemID.NecroHelmet, "ranger" },
+            { ItemID.NecroBreastplate, "ranger" },
+            { ItemID.NecroGreaves, "ranger" },
+            { ItemID.AncientNecroHelmet, "ranger" },
+
+            // Pre-Hardmode Magic / Mage
+            { ItemID.WizardHat, "mage" },
+            { ItemID.MagicHat, "mage" },
+            { ItemID.JungleHat, "mage" },
+            { ItemID.JungleShirt, "mage" },
+            { ItemID.JunglePants, "mage" },
+            { ItemID.AncientCobaltHelmet, "mage" },
+            { ItemID.AncientCobaltBreastplate, "mage" },
+            { ItemID.AncientCobaltLeggings, "mage" },
+            { ItemID.GypsyRobe, "mage" },
+
+            // Pre-Hardmode Summon / Summoner
+            { ItemID.ObsidianHelm, "summoner" },
+            { ItemID.ObsidianShirt, "summoner" },
+            { ItemID.ObsidianPants, "summoner" },
+            { ItemID.BeeHeadgear, "summoner" },
+            { ItemID.BeeBreastplate, "summoner" },
+            { ItemID.BeeGreaves, "summoner" },
+
+            // Hardmode Cobalt / Palladium
+            { ItemID.CobaltHelmet, "warrior" },
+            { ItemID.CobaltHat, "ranger" },
+            { ItemID.CobaltMask, "mage" },
+            { ItemID.CobaltBreastplate, "warrior" },
+            { ItemID.CobaltLeggings, "warrior" },
+            { ItemID.PalladiumHelmet, "warrior" },
+            { ItemID.PalladiumHeadgear, "ranger" },
+            { ItemID.PalladiumMask, "mage" },
+            { ItemID.PalladiumBreastplate, "warrior" },
+            { ItemID.PalladiumLeggings, "warrior" },
+
+            // Hardmode Mythril / Orichalcum
+            { ItemID.MythrilHelmet, "warrior" },
+            { ItemID.MythrilHat, "ranger" },
+            { ItemID.MythrilHood, "mage" },
+            { ItemID.MythrilChainmail, "warrior" },
+            { ItemID.MythrilGreaves, "warrior" },
+            { ItemID.OrichalcumHelmet, "warrior" },
+            { ItemID.OrichalcumHeadgear, "ranger" },
+            { ItemID.OrichalcumMask, "mage" },
+            { ItemID.OrichalcumBreastplate, "warrior" },
+            { ItemID.OrichalcumLeggings, "warrior" },
+
+            // Hardmode Adamantite / Titanium
+            { ItemID.AdamantiteHelmet, "warrior" },
+            { ItemID.AdamantiteMask, "ranger" },
+            { ItemID.AdamantiteHeadgear, "mage" },
+            { ItemID.AdamantiteBreastplate, "warrior" },
+            { ItemID.AdamantiteLeggings, "warrior" },
+            { ItemID.TitaniumHelmet, "warrior" },
+            { ItemID.TitaniumMask, "ranger" },
+            { ItemID.TitaniumHeadgear, "mage" },
+            { ItemID.TitaniumBreastplate, "warrior" },
+            { ItemID.TitaniumLeggings, "warrior" },
+
+            // Hardmode Frost / Forbidden / Spider / Hallowed / Chlorophyte
+            { ItemID.FrostHelmet, "ranger" },
+            { ItemID.FrostBreastplate, "ranger" },
+            { ItemID.FrostLeggings, "ranger" },
+            { ItemID.ForbiddenMask, "mage" },
+            { ItemID.ForbiddenLotions, "mage" },
+            { ItemID.ForbiddenPants, "mage" },
+            { ItemID.SpiderMask, "summoner" },
+            { ItemID.SpiderBreastplate, "summoner" },
+            { ItemID.SpiderGreaves, "summoner" },
+            { ItemID.HallowedHelmet, "warrior" },
+            { ItemID.HallowedHeadgear, "ranger" },
+            { ItemID.HallowedHood, "mage" },
+            { ItemID.HallowedPlateMail, "warrior" },
+            { ItemID.HallowedGreaves, "warrior" },
+            { ItemID.ChlorophyteHelmet, "warrior" },
+            { ItemID.ChlorophyteMask, "ranger" },
+            { ItemID.ChlorophyteHeadgear, "mage" },
+            { ItemID.ChlorophytePlateMail, "warrior" },
+            { ItemID.ChlorophyteGreaves, "warrior" },
+
+            // Tiki / Turtle / Beetle / Shroomite / Spectre / Spooky / Lunar
+            { ItemID.TikiMask, "summoner" },
+            { ItemID.TikiShirt, "summoner" },
+            { ItemID.TikiPants, "summoner" },
+            { ItemID.TurtleHelmet, "warrior" },
+            { ItemID.TurtleScaleMail, "warrior" },
+            { ItemID.TurtleLeggings, "warrior" },
+            { ItemID.BeetleHelmet, "warrior" },
+            { ItemID.BeetleScaleMail, "warrior" },
+            { ItemID.BeetleShell, "warrior" },
+            { ItemID.BeetleLeggings, "warrior" },
+            { ItemID.ShroomiteHeadgear, "ranger" },
+            { ItemID.ShroomiteMask, "ranger" },
+            { ItemID.ShroomiteHelmet, "ranger" },
+            { ItemID.ShroomiteBreastplate, "ranger" },
+            { ItemID.ShroomiteLeggings, "ranger" },
+            { ItemID.SpectreHood, "mage" },
+            { ItemID.SpectreMask, "mage" },
+            { ItemID.SpectreRobe, "mage" },
+            { ItemID.SpectrePants, "mage" },
+            { ItemID.SpookyHelmet, "summoner" },
+            { ItemID.SpookyBreastplate, "summoner" },
+            { ItemID.SpookyLeggings, "summoner" },
+            { ItemID.SolarFlareHelmet, "warrior" },
+            { ItemID.SolarFlareBreastplate, "warrior" },
+            { ItemID.SolarFlareLeggings, "warrior" },
+            { ItemID.VortexHelmet, "ranger" },
+            { ItemID.VortexBreastplate, "ranger" },
+            { ItemID.VortexLeggings, "ranger" },
+            { ItemID.NebulaHelmet, "mage" },
+            { ItemID.NebulaBreastplate, "mage" },
+            { ItemID.NebulaLeggings, "mage" },
+            { ItemID.StardustHelmet, "summoner" },
+            { ItemID.StardustBreastplate, "summoner" },
+            { ItemID.StardustLeggings, "summoner" }
         };
 
         public ClassSystem(Main game) : base(game) { }
@@ -162,7 +286,41 @@ namespace ClassSystemPlugin
             player.TPlayer.itemTime = 0;
         }
 
-        private void DropDisallowedItemAndClearSlot(TSPlayer player, int slotIndex, Item itemToDrop, int fallbackType, int fallbackStack)
+        private void SpawnDroppedItemOnGround(TSPlayer player, int itemType, int stack, byte prefix)
+        {
+            if (player?.TPlayer == null || itemType <= ItemID.None) return;
+
+            int droppedIndex = Item.NewItem(
+                new MiscEntitySource(),
+                player.TPlayer.position,
+                itemType,
+                Math.Max(1, stack)
+            );
+
+            if (droppedIndex >= 0 && droppedIndex < Main.maxItems)
+            {
+                Main.item[droppedIndex].prefix = prefix;
+                Main.item[droppedIndex].playerIndexTheItemIsReservedFor = 255;
+                Main.item[droppedIndex].noGrabDelay = 0;
+                Main.item[droppedIndex].velocity = new Vector2(player.TPlayer.direction * 3f, -2.5f);
+
+                NetMessage.SendData((int)PacketTypes.ItemDrop, -1, -1, null, droppedIndex);
+                NetMessage.SendData((int)PacketTypes.ItemOwner, -1, -1, null, droppedIndex);
+            }
+        }
+
+        private void NotifyDroppedCrossClassItem(TSPlayer player, string itemName)
+        {
+            if (player == null) return;
+            if (!_dropWarnCooldown.TryGetValue(player.Index, out DateTime lastWarn) || (DateTime.UtcNow - lastWarn).TotalSeconds >= 2)
+            {
+                _dropWarnCooldown[player.Index] = DateTime.UtcNow;
+                string className = GetPlayerClass(player) ?? "class";
+                player.SendWarningMessage($"[ClassSystem] Dropped '{itemName}' — {className.ToUpper()} cannot hold or pick up weapons/armor from other classes.");
+            }
+        }
+
+        private void DropDisallowedItemAndClearSlot(TSPlayer player, int netSlotIndex, Item itemToDrop, int fallbackType, int fallbackStack)
         {
             if (player?.TPlayer == null) return;
 
@@ -186,54 +344,91 @@ namespace ClassSystemPlugin
             player.TPlayer.itemTime = 0;
             CancelActivePlayerProjectiles(player);
 
-            if (itemType > ItemID.None)
-            {
-                int droppedIndex = Item.NewItem(
-                    new MiscEntitySource(),
-                    player.TPlayer.position,
-                    itemType,
-                    stack
-                );
+            SpawnDroppedItemOnGround(player, itemType, stack, prefix);
 
-                if (droppedIndex >= 0 && droppedIndex < Main.maxItems)
-                {
-                    if (prefix > 0)
-                    {
-                        Main.item[droppedIndex].prefix = prefix;
-                    }
-                    NetMessage.SendData((int)PacketTypes.ItemDrop, -1, -1, null, droppedIndex);
-                    NetMessage.SendData((int)PacketTypes.ItemOwner, -1, -1, null, droppedIndex);
-                }
+            if (netSlotIndex >= 0)
+            {
+                ClearPlayerNetSlot(player, netSlotIndex);
             }
 
-            if (slotIndex >= 0 && slotIndex < player.TPlayer.inventory.Length)
-            {
-                player.TPlayer.inventory[slotIndex] = new Item();
-                player.TPlayer.inventory[slotIndex].TurnToAir();
-                NetMessage.SendData((int)PacketTypes.PlayerSlot, -1, -1, null, player.Index, slotIndex, 0, 0, 0);
-                NetMessage.SendData((int)PacketTypes.PlayerSlot, player.Index, -1, null, player.Index, slotIndex, 0, 0, 0);
-            }
-
-            if (!_dropWarnCooldown.TryGetValue(player.Index, out DateTime lastWarn) || (DateTime.UtcNow - lastWarn).TotalSeconds >= 2)
-            {
-                _dropWarnCooldown[player.Index] = DateTime.UtcNow;
-                string className = GetPlayerClass(player) ?? "class";
-                player.SendWarningMessage($"[ClassSystem] Dropped '{itemName}' — cannot be used by {className.ToUpper()}.");
-            }
+            NotifyDroppedCrossClassItem(player, itemName);
         }
 
-        private void DropHeldDisallowedItemIfAny(TSPlayer player, string currentClass)
+        private void ClearPlayerNetSlot(TSPlayer player, int netSlotIndex)
+        {
+            var tPlayer = player.TPlayer;
+            if (netSlotIndex >= 0 && netSlotIndex < 59)
+            {
+                tPlayer.inventory[netSlotIndex] = new Item();
+                tPlayer.inventory[netSlotIndex].TurnToAir();
+            }
+            else if (netSlotIndex >= 59 && netSlotIndex < 79)
+            {
+                int armorIdx = netSlotIndex - 59;
+                if (armorIdx < tPlayer.armor.Length)
+                {
+                    tPlayer.armor[armorIdx] = new Item();
+                    tPlayer.armor[armorIdx].TurnToAir();
+                }
+            }
+            else if (netSlotIndex >= 79 && netSlotIndex < 89)
+            {
+                int dyeIdx = netSlotIndex - 79;
+                if (dyeIdx < tPlayer.dye.Length)
+                {
+                    tPlayer.dye[dyeIdx] = new Item();
+                    tPlayer.dye[dyeIdx].TurnToAir();
+                }
+            }
+            else if (netSlotIndex >= 89 && netSlotIndex < 94)
+            {
+                int miscIdx = netSlotIndex - 89;
+                if (miscIdx < tPlayer.miscEquips.Length)
+                {
+                    tPlayer.miscEquips[miscIdx] = new Item();
+                    tPlayer.miscEquips[miscIdx].TurnToAir();
+                }
+            }
+            else if (netSlotIndex == 179)
+            {
+                tPlayer.trashItem = new Item();
+                tPlayer.trashItem.TurnToAir();
+            }
+
+            NetMessage.SendData((int)PacketTypes.PlayerSlot, -1, -1, null, player.Index, netSlotIndex, 0, 0, 0);
+            NetMessage.SendData((int)PacketTypes.PlayerSlot, player.Index, -1, null, player.Index, netSlotIndex, 0, 0, 0);
+        }
+
+        private void EnforceAllowedInventory(TSPlayer player, string currentClass)
         {
             if (player?.TPlayer == null || string.IsNullOrEmpty(currentClass)) return;
 
-            int selected = player.TPlayer.selectedItem;
-            if (selected >= 0 && selected < player.TPlayer.inventory.Length)
+            var tPlayer = player.TPlayer;
+
+            // 1. ตรวจช่องเก็บของทั้งหมด (0-58 รวมช่องถือ 0-49, เหรียญ 50-53, กระสุน 54-57, เมาส์ 58)
+            for (int i = 0; i < tPlayer.inventory.Length && i < 59; i++)
             {
-                Item held = player.TPlayer.inventory[selected];
-                if (held != null && !held.IsAir && held.type > ItemID.None && !IsItemAllowedForClass(held, currentClass))
+                Item item = tPlayer.inventory[i];
+                if (item != null && !item.IsAir && item.type > ItemID.None && !IsItemAllowedForClass(item, currentClass))
                 {
-                    DropDisallowedItemAndClearSlot(player, selected, held, held.type, held.stack);
+                    DropDisallowedItemAndClearSlot(player, i, item, item.type, item.stack);
                 }
+            }
+
+            // 2. ตรวจช่องชุดเกราะหลัก (netSlot 59-61: หัว, เสื้อ, กางเกง) เท่านั้น ไม่บล็อกช่องเครื่องประดับ (62-68)
+            for (int i = 0; i < 3 && i < tPlayer.armor.Length; i++)
+            {
+                Item armorItem = tPlayer.armor[i];
+                if (armorItem != null && !armorItem.IsAir && armorItem.type > ItemID.None && !IsItemAllowedForClass(armorItem, currentClass))
+                {
+                    DropDisallowedItemAndClearSlot(player, 59 + i, armorItem, armorItem.type, armorItem.stack);
+                }
+            }
+
+            // 3. ตรวจช่องถังขยะ (netSlot 179)
+            if (tPlayer.trashItem != null && !tPlayer.trashItem.IsAir && tPlayer.trashItem.type > ItemID.None && !IsItemAllowedForClass(tPlayer.trashItem, currentClass))
+            {
+                DropDisallowedItemAndClearSlot(player, 179, tPlayer.trashItem, tPlayer.trashItem.type, tPlayer.trashItem.stack);
             }
         }
 
@@ -437,6 +632,7 @@ namespace ClassSystemPlugin
             {
                 _playerClasses[accountId] = savedClass;
                 ClearWebAndTeleportToSpawn(args.Player);
+                EnforceAllowedInventory(args.Player, savedClass);
                 _lastSyncedMaxLife.Remove(args.Player.Index);
                 ApplyClassStats(args.Player, savedClass);
                 if (savedClass == "summoner")
@@ -497,15 +693,20 @@ namespace ClassSystemPlugin
         {
             if (item == null || item.IsAir || item.type == ItemID.None) return true;
 
+            // เครื่องประดับใส่อะไรก็ได้
+            if (item.accessory) return true;
+
             if (IsCoinOrAmmoOrMisc(item)) return true;
 
             if (IsGatheringTool(item)) return true;
 
-            if (_restrictedArmorsAndAccessories.TryGetValue(item.type, out string reqClass))
+            // ตรวจชุดเกราะเฉพาะสาย
+            if (_restrictedArmors.TryGetValue(item.type, out string reqArmorClass))
             {
-                return string.Equals(className, reqClass, StringComparison.OrdinalIgnoreCase);
+                return string.Equals(className, reqArmorClass, StringComparison.OrdinalIgnoreCase);
             }
 
+            // ตรวจอาวุธเฉพาะสาย
             bool isClassWeapon = item.melee || item.ranged || item.magic || item.summon;
             if (!isClassWeapon || item.damage <= 0) return true;
 
@@ -572,9 +773,9 @@ namespace ClassSystemPlugin
                         BlockLifeCrystalUsage(player);
                         NotifyBlockedLifeCrystal(player);
                     }
-                    else if (player.TPlayer.controlUseItem || (held != null && !held.IsAir && !IsItemAllowedForClass(held, currentClass)))
+                    else
                     {
-                        DropHeldDisallowedItemIfAny(player, currentClass);
+                        EnforceAllowedInventory(player, currentClass);
                     }
                 }
             }
@@ -596,17 +797,20 @@ namespace ClassSystemPlugin
                 return;
             }
 
-            Item testItem = new Item();
-            testItem.SetDefaults(args.Type);
-            testItem.stack = Math.Max(1, (int)args.Stack);
-
-            if (!IsItemAllowedForClass(testItem, currentClass))
+            if (args.Type > ItemID.None && args.Stack > 0)
             {
-                args.Handled = true;
-                Item existing = (args.Slot >= 0 && args.Slot < player.TPlayer.inventory.Length)
-                    ? player.TPlayer.inventory[args.Slot]
-                    : null;
-                DropDisallowedItemAndClearSlot(player, args.Slot, existing, args.Type, args.Stack);
+                Item testItem = new Item();
+                testItem.SetDefaults(args.Type);
+                testItem.stack = Math.Max(1, (int)args.Stack);
+
+                if (!IsItemAllowedForClass(testItem, currentClass))
+                {
+                    args.Handled = true;
+                    Item existing = (args.Slot >= 0 && args.Slot < player.TPlayer.inventory.Length)
+                        ? player.TPlayer.inventory[args.Slot]
+                        : null;
+                    DropDisallowedItemAndClearSlot(player, args.Slot, existing, args.Type, args.Stack);
+                }
             }
         }
 
@@ -646,6 +850,7 @@ namespace ClassSystemPlugin
                 if (runPeriodicSync)
                 {
                     ClearWebBuff(player);
+                    EnforceAllowedInventory(player, playerClass);
 
                     if (playerClass == "summoner")
                     {
@@ -669,11 +874,10 @@ namespace ClassSystemPlugin
 
             var heldItem = args.Player.HeldItem;
 
-            // ดรอปอาวุธ/ของไม่ตรงคลาสทันทีเมื่อใช้โจมตี
             if (heldItem != null && !heldItem.IsAir && !IsItemAllowedForClass(heldItem, playerClass))
             {
                 args.Damage = 0;
-                DropHeldDisallowedItemIfAny(tsPlayer, playerClass);
+                EnforceAllowedInventory(tsPlayer, playerClass);
             }
         }
 
@@ -760,6 +964,7 @@ namespace ClassSystemPlugin
             _playerClasses[args.Player.Account.ID] = chosen;
 
             ClearWebAndTeleportToSpawn(args.Player);
+            EnforceAllowedInventory(args.Player, chosen);
             GiveStarterItems(args.Player, chosen);
             if (chosen == "summoner")
             {
@@ -814,6 +1019,7 @@ namespace ClassSystemPlugin
             SaveClassToDB(target.Account.ID, resolvedOption);
             _playerClasses[target.Account.ID] = resolvedOption;
             ClearWebAndTeleportToSpawn(target);
+            EnforceAllowedInventory(target, resolvedOption);
             GiveStarterItems(target, resolvedOption);
             if (resolvedOption == "summoner")
             {
