@@ -29,96 +29,55 @@ namespace ClassSystemPlugin
         private readonly Dictionary<int, DateTime> _manaRegenTick = new Dictionary<int, DateTime>();
         private readonly Random _rng = new Random();
 
-        // ============================================================
-        // Buff / Nerf Configuration (Percentages: 0.10 = +10%, -0.10 = -10%; Flat: integer units)
-        // Edit values here directly without affecting core mechanics.
-        // ============================================================
-
-        // --- LIFE CRYSTAL / HP CAP SETTINGS ---
-        private const int MaxLifeCrystalsAllowed = 15;           // Max 15 Life Crystals (+300 HP from crystals -> 100 + 300 = 400 base HP)
+        private const int MaxLifeCrystalsAllowed = 15;
         private const int BaseStartHp = 100;
         private const int HpPerLifeCrystal = 20;
         private const bool BlockLifeCrystalUseAboveCap = true;
 
-        // --- WARRIOR / MELEE ---
-        private const double WarriorMeleeDamageMult = 0.10;       // Melee damage +10%
-        private const double WarriorMaxHpMult = 0.15;           // Max HP +15% (can exceed 400 max HP)
-        private const double WarriorDefenseMult = 0.10;         // Defense +10%
-        private const double WarriorMoveSpeedMult = -0.15;      // Movement speed -15%
-        private const double WarriorLifeRegenPenaltyMult = -0.15; // Life regeneration -15% (no mana penalty)
+        private const double WarriorMeleeDamageMult = 0.10;
+        private const double WarriorMaxHpMult = 0.15;
+        private const double WarriorDefenseMult = 0.10;
+        private const double WarriorMoveSpeedMult = -0.15;
+        private const double WarriorLifeRegenPenaltyMult = -0.15;
 
-        // --- RANGER ---
-        private const double RangerRangedDamageMult = 0.10;     // Ranged damage +10%
-        private const double RangerMoveSpeedMult = 0.30;        // Movement speed +30%
-        private const double RangerAmmoSaveChance = 0.15;       // Ammo/arrow refund chance 15%
-        private const int RangerMaxHpFlat = -60;                // Max HP -60 flat
-        private const double RangerDefenseMult = -0.15;         // Defense -15%
-        private const bool RangerArcheryBuff = true;            // Faster bow draw/velocity (Archery buff)
+        private const double RangerRangedDamageMult = 0.10;
+        private const double RangerMoveSpeedMult = 0.30;
+        private const double RangerAmmoSaveChance = 0.15;
+        private const int RangerMaxHpFlat = -60;
+        private const double RangerDefenseMult = -0.15;
+        private const bool RangerArcheryBuff = true;
 
-        // --- MAGE ---
-        private const double MageMagicDamageMult = 0.12;        // Magic damage +12%
-        private const double MageMoveSpeedMult = 0.15;          // Movement speed +15%
-        private const int MageMaxManaFlat = 80;                 // Max Mana +80 flat
-        private const double MageManaRegenMult = 0.15;          // Mana regeneration rate +15%
-        private const int MageMaxHpFlat = -40;                  // Max HP -40 flat
-        private const double MageDefenseMult = -0.10;           // Defense -10%
+        private const double MageMagicDamageMult = 0.12;
+        private const double MageMoveSpeedMult = 0.15;
+        private const int MageMaxManaFlat = 80;
+        private const double MageManaRegenMult = 0.15;
+        private const int MageMaxHpFlat = -40;
+        private const double MageDefenseMult = -0.10;
 
-        // --- SUMMONER ---
-        private const double SummonerSummonDamageMult = 0.12;   // Summon damage +12%
-        private const double SummonerWhipDamageMult = -0.15;    // Whip damage nerf -15%
-        private const int SummonerExtraMinions = 2;             // Bonus minion slots +2
-        private const double SummonerLifeRegenMult = 0.15;      // Passive life regeneration +15%
-        private const double SummonerMoveSpeedMult = 0.20;      // Movement speed +20%
-        private const int SummonerMaxHpFlat = -80;              // Max HP -80 flat
-        private const double SummonerDefenseMult = -0.20;       // Defense -20%
-
-        // ============================================================
-        // Starter Loadouts (Weapons only, no armor; replace starter sword)
-        // ============================================================
+        private const double SummonerSummonDamageMult = 0.12;
+        private const double SummonerWhipDamageMult = -0.15;
+        private const int SummonerExtraMinions = 2;
+        private const double SummonerLifeRegenMult = 0.15;
+        private const double SummonerMoveSpeedMult = 0.20;
+        private const int SummonerMaxHpFlat = -80;
+        private const double SummonerDefenseMult = -0.20;
 
         private const bool RemoveStarterSwordOnSelect = true;
 
         private readonly Dictionary<string, (int ItemId, int Stack)[]> _classStarterItems =
             new Dictionary<string, (int ItemId, int Stack)[]>
             {
-                {
-                    "warrior", new[]
-                    {
-                        (ItemID.CopperBroadsword, 1)
-                    }
-                },
-                {
-                    "ranger", new[]
-                    {
-                        (ItemID.WoodenBow, 1),
-                        (ItemID.WoodenArrow, 500)
-                    }
-                },
-                {
-                    "mage", new[]
-                    {
-                        (ItemID.WandofSparking, 1),
-                        (ItemID.LesserManaPotion, 15)
-                    }
-                },
-                {
-                    "summoner", new[]
-                    {
-                        (ItemID.FinchStaff, 1),
-                        (ItemID.Cobwhip, 1) // Spider whip (Cobwhip)
-                    }
-                }
+                { "warrior", new[] { (ItemID.CopperBroadsword, 1) } },
+                { "ranger", new[] { (ItemID.WoodenBow, 1), (ItemID.WoodenArrow, 500) } },
+                { "mage", new[] { (ItemID.WandofSparking, 1), (ItemID.LesserManaPotion, 15) } },
+                { "summoner", new[] { (ItemID.FinchStaff, 1), (ItemID.Cobwhip, 1) } }
             };
 
         private readonly List<string> _availableClasses = new List<string>
         {
-            "warrior",
-            "ranger",
-            "mage",
-            "summoner"
+            "warrior", "ranger", "mage", "summoner"
         };
 
-        // Class-specific armor/accessory restrictions (expandable with additional ItemIDs)
         private readonly Dictionary<int, string> _restrictedArmorsAndAccessories = new Dictionary<int, string>
         {
             { ItemID.WarriorEmblem, "warrior" },
@@ -142,7 +101,6 @@ namespace ClassSystemPlugin
             ServerApi.Hooks.NetGreetPlayer.Register(this, OnGreetPlayer);
             ServerApi.Hooks.ServerLeave.Register(this, OnServerLeave);
             ServerApi.Hooks.NpcStrike.Register(this, OnNpcStrike);
-            ServerApi.Hooks.ProjectileNew.Register(this, OnProjectileNew);
 
             PlayerHooks.PlayerPostLogin += OnPlayerPostLogin;
             GetDataHandlers.PlayerUpdate += OnPlayerUpdate;
@@ -158,7 +116,6 @@ namespace ClassSystemPlugin
                 ServerApi.Hooks.NetGreetPlayer.Deregister(this, OnGreetPlayer);
                 ServerApi.Hooks.ServerLeave.Deregister(this, OnServerLeave);
                 ServerApi.Hooks.NpcStrike.Deregister(this, OnNpcStrike);
-                ServerApi.Hooks.ProjectileNew.Deregister(this, OnProjectileNew);
 
                 PlayerHooks.PlayerPostLogin -= OnPlayerPostLogin;
                 GetDataHandlers.PlayerUpdate -= OnPlayerUpdate;
@@ -279,6 +236,18 @@ namespace ClassSystemPlugin
                 if (string.IsNullOrEmpty(playerClass)) continue;
 
                 ApplyClassStats(player, playerClass);
+
+                if (playerClass == "ranger" && RangerArcheryBuff)
+                {
+                    foreach (var proj in Main.projectile)
+                    {
+                        if (proj != null && proj.active && proj.owner == player.Index && proj.ranged && proj.ai[1] == 0f)
+                        {
+                            proj.velocity *= 1.02f;
+                            proj.ai[1] = 1f;
+                        }
+                    }
+                }
             }
         }
 
@@ -309,21 +278,6 @@ namespace ClassSystemPlugin
                     mult += SummonerWhipDamageMult;
                 }
                 args.Damage = (int)Math.Round(args.Damage * mult);
-            }
-        }
-
-        private void OnProjectileNew(ProjectileNewEventArgs args)
-        {
-            var proj = Main.projectile[args.ProjectileId];
-            if (proj == null || !proj.active) return;
-
-            var player = TShock.Players[proj.owner];
-            if (player == null || !player.IsLoggedIn || player.Account == null) return;
-
-            string playerClass = GetPlayerClass(player);
-            if (playerClass == "ranger" && proj.ranged && RangerArcheryBuff)
-            {
-                proj.velocity *= 1.15f;
             }
         }
 
