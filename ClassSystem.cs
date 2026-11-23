@@ -16,8 +16,8 @@ namespace ClassSystemPlugin
     {
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
-        public override string Description => "Account-bound class system with underworld lock before login/class selection, starter weapon loadouts, item restrictions, Life Crystal cap, and custom buffs/nerfs.";
-        public override Version Version => new Version(15, 3, 2);
+        public override string Description => "Account-bound class system with underworld & webbed lock, starter gear replacement, strict weapon locks, tool damage only for Warrior, and real-time Max HP sync.";
+        public override Version Version => new Version(15, 6, 0);
 
         private SqliteConnection _db;
         private bool _dbReady;
@@ -31,28 +31,32 @@ namespace ClassSystemPlugin
         private const int BaseStartHp = 100;
         private const int HpPerLifeCrystal = 20;
 
+        // Warrior stats
         private const double WarriorMeleeDamageMult = 0.10;
         private const double WarriorMaxHpMult = 0.15;
         private const double WarriorDefenseMult = 0.10;
         private const double WarriorMoveSpeedMult = -0.15;
 
+        // Ranger stats
         private const double RangerRangedDamageMult = 0.10;
         private const double RangerMoveSpeedMult = 0.30;
-        private const int RangerMaxHpFlat = -60;
+        private const int RangerMaxHpFlat = -40;
         private const double RangerDefenseMult = -0.15;
         private const bool RangerArcheryBuff = true;
 
+        // Mage stats
         private const double MageMagicDamageMult = 0.12;
         private const double MageMoveSpeedMult = 0.15;
         private const int MageMaxManaFlat = 80;
-        private const int MageMaxHpFlat = -40;
+        private const int MageMaxHpFlat = -30;
         private const double MageDefenseMult = -0.10;
 
+        // Summoner stats
         private const double SummonerSummonDamageMult = 0.12;
         private const double SummonerWhipDamageMult = -0.15;
         private const int SummonerExtraMinions = 2;
         private const double SummonerMoveSpeedMult = 0.20;
-        private const int SummonerMaxHpFlat = -80;
+        private const int SummonerMaxHpFlat = -40;
         private const double SummonerDefenseMult = -0.20;
 
         private readonly Dictionary<string, (short ItemId, int Stack)[]> _classStarterItems =
@@ -135,9 +139,37 @@ namespace ClassSystemPlugin
             return new Vector2(tileX * 16f, tileY * 16f);
         }
 
-        private void TeleportToSurfaceSpawn(TSPlayer player)
+        private void ApplyUnderworldWebLock(TSPlayer player)
+        {
+            if (player == null || !player.Active) return;
+
+            Vector2 hellPos = GetUnderworldPosition();
+            _frozenPositions[player.Index] = hellPos;
+
+            if (Vector2.Distance(player.TPlayer.position, hellPos) > 64f)
+            {
+                player.TPlayer.velocity = Vector2.Zero;
+                player.Teleport(hellPos.X, hellPos.Y);
+            }
+
+            player.SetBuff(BuffID.Webbed, 180, true);
+        }
+
+        private void ClearWebAndTeleportToSpawn(TSPlayer player)
         {
             if (player == null) return;
+
+            _frozenPositions.Remove(player.Index);
+
+            for (int i = 0; i < Player.maxBuffs; i++)
+            {
+                if (player.TPlayer.buffType[i] == BuffID.Webbed)
+                {
+                    player.TPlayer.DelBuff(i);
+                }
+            }
+            NetMessage.SendData((int)PacketTypes.PlayerBuff, -1, -1, null, player.Index);
+
             Vector2 spawn = GetSurfaceSpawnPosition();
             player.TPlayer.velocity = Vector2.Zero;
             player.TPlayer.fallStart = (int)(spawn.Y / 16f);
@@ -215,10 +247,8 @@ namespace ClassSystemPlugin
             var player = TShock.Players[args.Who];
             if (player != null && !player.IsLoggedIn)
             {
-                Vector2 hellPos = GetUnderworldPosition();
-                _frozenPositions[player.Index] = hellPos;
-                player.Teleport(hellPos.X, hellPos.Y);
-                player.SendWarningMessage("[ClassSystem] Welcome to the Underworld! Log in with /login and pick a class with /class <warrior|ranger|mage|summoner>.");
+                ApplyUnderworldWebLock(player);
+                player.SendWarningMessage("[ClassSystem] Welcome to the Underworld! Log in with /login and pick a class with /class <warrior|ranger|mage|summoner> to break free.");
             }
         }
 
@@ -232,17 +262,16 @@ namespace ClassSystemPlugin
             if (!string.IsNullOrEmpty(savedClass))
             {
                 _playerClasses[accountId] = savedClass;
-                _frozenPositions.Remove(args.Player.Index);
-                TeleportToSurfaceSpawn(args.Player);
+                ClearWebAndTeleportToSpawn(args.Player);
+                EnforceInventoryRestrictions(args.Player, savedClass);
+                _lastSyncedMaxLife.Remove(args.Player.Index);
                 ApplyClassStats(args.Player, savedClass);
                 args.Player.SendSuccessMessage($"[ClassSystem] Welcome back! Your class is: {savedClass.ToUpper()}");
             }
             else
             {
-                Vector2 hellPos = GetUnderworldPosition();
-                _frozenPositions[args.Player.Index] = hellPos;
-                args.Player.Teleport(hellPos.X, hellPos.Y);
-                args.Player.SendWarningMessage("[ClassSystem] You are in the Underworld until you select a class using /class <warrior|ranger|mage|summoner>.");
+                ApplyUnderworldWebLock(args.Player);
+                args.Player.SendWarningMessage("[ClassSystem] You are webbed in the Underworld until you select a class using /class <warrior|ranger|mage|summoner>.");
             }
         }
 
@@ -259,6 +288,68 @@ namespace ClassSystemPlugin
             _lastSyncedMaxLife.Remove(args.Who);
         }
 
+        private bool IsGatheringTool(Item item)
+        {
+            if (item == null || item.IsAir || item.type == ItemID.None) return false;
+            return item.pick > 0 || item.axe > 0 || item.hammer > 0;
+        }
+
+        private bool IsItemAllowedInInventory(Item item, string className)
+        {
+            if (item == null || item.IsAir || item.type == ItemID.None) return true;
+
+            // Always allow pickaxes, axes, and hammers in inventory for farming/mining
+            if (IsGatheringTool(item)) return true;
+
+            if (_restrictedArmorsAndAccessories.TryGetValue(item.type, out string reqClass))
+            {
+                return string.Equals(className, reqClass, StringComparison.OrdinalIgnoreCase);
+            }
+
+            // Block weapons belonging to other classes immediately
+            bool isClassWeapon = item.melee || item.ranged || item.magic || item.summon;
+            if (!isClassWeapon || item.damage <= 0) return true;
+
+            switch (className.ToLowerInvariant())
+            {
+                case "warrior":
+                    return item.melee;
+                case "ranger":
+                    return item.ranged;
+                case "mage":
+                    return item.magic;
+                case "summoner":
+                    return item.summon;
+                default:
+                    return false;
+            }
+        }
+
+        private void EnforceInventoryRestrictions(TSPlayer player, string className)
+        {
+            if (player?.TPlayer?.inventory == null) return;
+
+            for (int i = 0; i < 50; i++)
+            {
+                Item invItem = player.TPlayer.inventory[i];
+                if (invItem == null || invItem.IsAir || invItem.type == ItemID.None) continue;
+
+                if (!IsItemAllowedInInventory(invItem, className))
+                {
+                    string itemName = invItem.Name;
+                    player.TPlayer.inventory[i] = new Item();
+                    NetMessage.SendData((int)PacketTypes.PlayerSlot, -1, -1, null, player.Index, i, 0, 0, 0);
+                    NetMessage.SendData((int)PacketTypes.PlayerSlot, player.Index, -1, null, player.Index, i, 0, 0, 0);
+
+                    if (!_slotWarnCooldown.TryGetValue(player.Index, out DateTime lastWarn) || (DateTime.UtcNow - lastWarn).TotalSeconds >= 3)
+                    {
+                        _slotWarnCooldown[player.Index] = DateTime.UtcNow;
+                        player.SendWarningMessage($"[ClassSystem] Blocked '{itemName}' — not allowed for class {className.ToUpper()}.");
+                    }
+                }
+            }
+        }
+
         private void OnPlayerUpdate(object sender, GetDataHandlers.PlayerUpdateEventArgs args)
         {
             var player = TShock.Players[args.PlayerId];
@@ -266,12 +357,7 @@ namespace ClassSystemPlugin
 
             if (!player.IsLoggedIn)
             {
-                Vector2 hellPos = GetUnderworldPosition();
-                _frozenPositions[player.Index] = hellPos;
-                if (Vector2.Distance(player.TPlayer.position, hellPos) > 128f)
-                {
-                    player.Teleport(hellPos.X, hellPos.Y);
-                }
+                ApplyUnderworldWebLock(player);
                 if (!_warnCooldown.TryGetValue(player.Index, out DateTime lastWarn) || (DateTime.UtcNow - lastWarn).TotalSeconds >= 5)
                 {
                     _warnCooldown[player.Index] = DateTime.UtcNow;
@@ -285,21 +371,21 @@ namespace ClassSystemPlugin
                 string currentClass = GetPlayerClass(player);
                 if (string.IsNullOrEmpty(currentClass))
                 {
-                    Vector2 hellPos = GetUnderworldPosition();
-                    _frozenPositions[player.Index] = hellPos;
-                    if (Vector2.Distance(player.TPlayer.position, hellPos) > 128f)
-                    {
-                        player.Teleport(hellPos.X, hellPos.Y);
-                    }
+                    ApplyUnderworldWebLock(player);
                     if (!_warnCooldown.TryGetValue(player.Index, out DateTime lastWarn) || (DateTime.UtcNow - lastWarn).TotalSeconds >= 4)
                     {
                         _warnCooldown[player.Index] = DateTime.UtcNow;
-                        player.SendWarningMessage("[ClassSystem] Select a class using /class <warrior|ranger|mage|summoner> to leave the Underworld.");
+                        player.SendWarningMessage("[ClassSystem] Select a class using /class <warrior|ranger|mage|summoner> to break the web and leave the Underworld.");
                     }
                 }
                 else
                 {
                     _frozenPositions.Remove(player.Index);
+                    Item held = player.TPlayer.HeldItem;
+                    if (!IsItemAllowedInInventory(held, currentClass))
+                    {
+                        EnforceInventoryRestrictions(player, currentClass);
+                    }
                 }
             }
         }
@@ -309,20 +395,23 @@ namespace ClassSystemPlugin
             var player = TShock.Players[args.PlayerId];
             if (player == null || !player.Active || !player.IsLoggedIn || player.Account == null) return;
 
-            if (_restrictedArmorsAndAccessories.TryGetValue(args.Type, out string requiredClass))
-            {
-                string currentClass = GetPlayerClass(player);
-                if (!string.Equals(currentClass, requiredClass, StringComparison.OrdinalIgnoreCase))
-                {
-                    args.Handled = true;
-                    player.TPlayer.inventory[args.Slot] = new Item();
-                    NetMessage.SendData((int)PacketTypes.PlayerSlot, -1, -1, null, player.Index, args.Slot, 0, 0, 0);
+            string currentClass = GetPlayerClass(player);
+            if (string.IsNullOrEmpty(currentClass)) return;
 
-                    if (!_slotWarnCooldown.TryGetValue(player.Index, out DateTime lastWarn) || (DateTime.UtcNow - lastWarn).TotalSeconds >= 3)
-                    {
-                        _slotWarnCooldown[player.Index] = DateTime.UtcNow;
-                        player.SendWarningMessage($"[ClassSystem] Removed '{Lang.GetItemNameValue(args.Type)}' — requires class: {requiredClass.ToUpper()}.");
-                    }
+            Item testItem = new Item();
+            testItem.SetDefaults(args.Type);
+
+            if (!IsItemAllowedInInventory(testItem, currentClass))
+            {
+                args.Handled = true;
+                player.TPlayer.inventory[args.Slot] = new Item();
+                NetMessage.SendData((int)PacketTypes.PlayerSlot, -1, -1, null, player.Index, args.Slot, 0, 0, 0);
+                NetMessage.SendData((int)PacketTypes.PlayerSlot, player.Index, -1, null, player.Index, args.Slot, 0, 0, 0);
+
+                if (!_slotWarnCooldown.TryGetValue(player.Index, out DateTime lastWarn) || (DateTime.UtcNow - lastWarn).TotalSeconds >= 3)
+                {
+                    _slotWarnCooldown[player.Index] = DateTime.UtcNow;
+                    player.SendWarningMessage($"[ClassSystem] Blocked '{Lang.GetItemNameValue(args.Type)}' — not allowed for {currentClass.ToUpper()}.");
                 }
             }
         }
@@ -331,10 +420,20 @@ namespace ClassSystemPlugin
         {
             foreach (var player in TShock.Players)
             {
-                if (player == null || !player.Active || !player.IsLoggedIn || player.Account == null) continue;
+                if (player == null || !player.Active) continue;
+
+                if (!player.IsLoggedIn || player.Account == null)
+                {
+                    ApplyUnderworldWebLock(player);
+                    continue;
+                }
 
                 string playerClass = GetPlayerClass(player);
-                if (string.IsNullOrEmpty(playerClass)) continue;
+                if (string.IsNullOrEmpty(playerClass))
+                {
+                    ApplyUnderworldWebLock(player);
+                    continue;
+                }
 
                 ApplyClassStats(player, playerClass);
 
@@ -367,6 +466,30 @@ namespace ClassSystemPlugin
             var heldItem = args.Player.HeldItem;
             if (heldItem == null) return;
 
+            // Pickaxes, axes, and hammers can deal damage ONLY for Warrior; 0 damage for all other classes
+            if (IsGatheringTool(heldItem))
+            {
+                if (string.Equals(playerClass, "warrior", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (heldItem.melee)
+                    {
+                        args.Damage = (int)Math.Round(args.Damage * (1.0 + WarriorMeleeDamageMult));
+                    }
+                }
+                else
+                {
+                    args.Damage = 0;
+                }
+                return;
+            }
+
+            if (!IsItemAllowedInInventory(heldItem, playerClass))
+            {
+                args.Damage = 0;
+                EnforceInventoryRestrictions(tsPlayer, playerClass);
+                return;
+            }
+
             if (playerClass == "warrior" && heldItem.melee)
             {
                 args.Damage = (int)Math.Round(args.Damage * (1.0 + WarriorMeleeDamageMult));
@@ -390,8 +513,27 @@ namespace ClassSystemPlugin
             }
         }
 
+        private void ClearDefaultStarterWeapons(TSPlayer player)
+        {
+            for (int i = 0; i < 50; i++)
+            {
+                Item inv = player.TPlayer.inventory[i];
+                if (inv == null || inv.IsAir) continue;
+                if (IsGatheringTool(inv)) continue;
+
+                if (inv.type == ItemID.CopperShortsword || inv.type == ItemID.CopperBroadsword || inv.type == ItemID.WoodenSword)
+                {
+                    player.TPlayer.inventory[i] = new Item();
+                    NetMessage.SendData((int)PacketTypes.PlayerSlot, -1, -1, null, player.Index, i, 0, 0, 0);
+                    NetMessage.SendData((int)PacketTypes.PlayerSlot, player.Index, -1, null, player.Index, i, 0, 0, 0);
+                }
+            }
+        }
+
         private void GiveStarterItems(TSPlayer player, string className)
         {
+            ClearDefaultStarterWeapons(player);
+
             if (!_classStarterItems.TryGetValue(className, out var items)) return;
 
             foreach (var (itemId, stack) in items)
@@ -421,6 +563,8 @@ namespace ClassSystemPlugin
                     player.GiveItem(itemId, stack);
                 }
             }
+
+            EnforceInventoryRestrictions(player, className);
         }
 
         private void CmdClass(CommandArgs args)
@@ -454,12 +598,12 @@ namespace ClassSystemPlugin
 
             SaveClassToDB(args.Player.Account.ID, chosen);
             _playerClasses[args.Player.Account.ID] = chosen;
-            _frozenPositions.Remove(args.Player.Index);
 
-            TeleportToSurfaceSpawn(args.Player);
+            ClearWebAndTeleportToSpawn(args.Player);
             GiveStarterItems(args.Player, chosen);
+            _lastSyncedMaxLife.Remove(args.Player.Index);
             ApplyClassStats(args.Player, chosen);
-            args.Player.SendSuccessMessage($"[ClassSystem] Class selected: {chosen.ToUpper()}! Teleported back to spawn with starter items.");
+            args.Player.SendSuccessMessage($"[ClassSystem] Class selected: {chosen.ToUpper()}! Web cleared, starter weapons replaced, and stats synced.");
         }
 
         private void CmdSetClass(CommandArgs args)
@@ -489,10 +633,9 @@ namespace ClassSystemPlugin
             {
                 DeleteClassFromDB(target.Account.ID);
                 _playerClasses.Remove(target.Account.ID);
-                Vector2 hellPos = GetUnderworldPosition();
-                _frozenPositions[target.Index] = hellPos;
-                target.Teleport(hellPos.X, hellPos.Y);
-                target.SendWarningMessage("[ClassSystem] Your class has been reset. You have been sent to the Underworld until you select a class with /class.");
+                _lastSyncedMaxLife.Remove(target.Index);
+                ApplyUnderworldWebLock(target);
+                target.SendWarningMessage("[ClassSystem] Your class has been reset. You are webbed in the Underworld until you select a class with /class.");
                 args.Player.SendSuccessMessage($"Reset class for {target.Name}.");
                 return;
             }
@@ -505,9 +648,9 @@ namespace ClassSystemPlugin
 
             SaveClassToDB(target.Account.ID, option);
             _playerClasses[target.Account.ID] = option;
-            _frozenPositions.Remove(target.Index);
-            TeleportToSurfaceSpawn(target);
+            ClearWebAndTeleportToSpawn(target);
             GiveStarterItems(target, option);
+            _lastSyncedMaxLife.Remove(target.Index);
             ApplyClassStats(target, option);
             target.SendSuccessMessage($"[ClassSystem] Admin set your class to {option.ToUpper()}.");
             args.Player.SendSuccessMessage($"Set {target.Name}'s class to {option.ToUpper()}.");
@@ -530,44 +673,50 @@ namespace ClassSystemPlugin
             var tPlayer = player.TPlayer;
             int maxCrystals = Math.Max(0, MaxLifeCrystalsAllowed);
             int baseCapLife = BaseStartHp + maxCrystals * HpPerLifeCrystal;
-            int referenceLife = Math.Min(Math.Max(BaseStartHp, tPlayer.statLifeMax), baseCapLife);
+            int currentBaseLife = Math.Min(Math.Max(BaseStartHp, tPlayer.statLifeMax), baseCapLife);
+
+            int targetMaxLife = currentBaseLife;
 
             if (className == "warrior")
             {
-                tPlayer.statLifeMax2 = (int)Math.Round(referenceLife * (1.0 + WarriorMaxHpMult));
+                targetMaxLife = (int)Math.Round(currentBaseLife * (1.0 + WarriorMaxHpMult));
                 tPlayer.statDefense = (int)Math.Round(tPlayer.statDefense * (1.0 + WarriorDefenseMult));
                 tPlayer.moveSpeed *= (float)(1.0 + WarriorMoveSpeedMult);
             }
             else if (className == "ranger")
             {
-                tPlayer.statLifeMax2 = Math.Max(50, referenceLife + RangerMaxHpFlat);
+                targetMaxLife = Math.Max(40, currentBaseLife + RangerMaxHpFlat);
                 tPlayer.statDefense = (int)Math.Round(tPlayer.statDefense * (1.0 + RangerDefenseMult));
                 tPlayer.moveSpeed *= (float)(1.0 + RangerMoveSpeedMult);
             }
             else if (className == "mage")
             {
-                tPlayer.statLifeMax2 = Math.Max(50, referenceLife + MageMaxHpFlat);
+                targetMaxLife = Math.Max(40, currentBaseLife + MageMaxHpFlat);
                 tPlayer.statManaMax2 += MageMaxManaFlat;
                 tPlayer.statDefense = (int)Math.Round(tPlayer.statDefense * (1.0 + MageDefenseMult));
                 tPlayer.moveSpeed *= (float)(1.0 + MageMoveSpeedMult);
             }
             else if (className == "summoner")
             {
-                tPlayer.statLifeMax2 = Math.Max(50, referenceLife + SummonerMaxHpFlat);
+                targetMaxLife = Math.Max(40, currentBaseLife + SummonerMaxHpFlat);
                 tPlayer.maxMinions += SummonerExtraMinions;
                 tPlayer.statDefense = (int)Math.Round(tPlayer.statDefense * (1.0 + SummonerDefenseMult));
                 tPlayer.moveSpeed *= (float)(1.0 + SummonerMoveSpeedMult);
             }
 
-            if (tPlayer.statLife > tPlayer.statLifeMax2)
+            tPlayer.statLifeMax = targetMaxLife;
+            tPlayer.statLifeMax2 = targetMaxLife;
+
+            if (tPlayer.statLife > targetMaxLife)
             {
-                tPlayer.statLife = tPlayer.statLifeMax2;
+                tPlayer.statLife = targetMaxLife;
             }
 
-            if (!_lastSyncedMaxLife.TryGetValue(player.Index, out int lastMaxLife) || lastMaxLife != tPlayer.statLifeMax2)
+            if (!_lastSyncedMaxLife.TryGetValue(player.Index, out int lastMaxLife) || lastMaxLife != targetMaxLife)
             {
-                _lastSyncedMaxLife[player.Index] = tPlayer.statLifeMax2;
+                _lastSyncedMaxLife[player.Index] = targetMaxLife;
                 NetMessage.SendData((int)PacketTypes.PlayerHp, -1, -1, null, player.Index);
+                NetMessage.SendData((int)PacketTypes.PlayerHp, player.Index, -1, null, player.Index);
             }
         }
 
