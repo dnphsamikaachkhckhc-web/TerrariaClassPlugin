@@ -18,7 +18,7 @@ namespace ClassSystemPlugin
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
         public override string Description => "Account-bound class system with underworld lock before login, webbed lock only after login until class selection, starter gear replacement, strict weapon locks, non-conflicting minion stacking, custom stat modifiers, and real-time HP/Mana sync.";
-        public override Version Version => new Version(15, 9, 0);
+        public override Version Version => new Version(15, 9, 1);
 
         private SqliteConnection _db;
         private bool _dbReady;
@@ -101,13 +101,13 @@ namespace ClassSystemPlugin
             ServerApi.Hooks.NetGreetPlayer.Register(this, OnGreetPlayer);
             ServerApi.Hooks.ServerLeave.Register(this, OnServerLeave);
             ServerApi.Hooks.NpcStrike.Register(this, OnNpcStrike);
-            ServerApi.Hooks.ProjectileNew.Register(this, OnProjectileNew);
 
             PlayerHooks.PlayerCommand += OnPlayerCommand;
             PlayerHooks.PlayerPostLogin += OnPlayerPostLogin;
             GetDataHandlers.PlayerUpdate += OnPlayerUpdate;
             GetDataHandlers.PlayerSlot += OnPlayerSlot;
             GetDataHandlers.PlayerDamage += OnPlayerDamage;
+            GetDataHandlers.NewProjectile += OnNewProjectile;
         }
 
         protected override void Dispose(bool disposing)
@@ -119,13 +119,13 @@ namespace ClassSystemPlugin
                 ServerApi.Hooks.NetGreetPlayer.Deregister(this, OnGreetPlayer);
                 ServerApi.Hooks.ServerLeave.Deregister(this, OnServerLeave);
                 ServerApi.Hooks.NpcStrike.Deregister(this, OnNpcStrike);
-                ServerApi.Hooks.ProjectileNew.Deregister(this, OnProjectileNew);
 
                 PlayerHooks.PlayerCommand -= OnPlayerCommand;
                 PlayerHooks.PlayerPostLogin -= OnPlayerPostLogin;
                 GetDataHandlers.PlayerUpdate -= OnPlayerUpdate;
                 GetDataHandlers.PlayerSlot -= OnPlayerSlot;
                 GetDataHandlers.PlayerDamage -= OnPlayerDamage;
+                GetDataHandlers.NewProjectile -= OnNewProjectile;
 
                 if (_db != null)
                 {
@@ -136,9 +136,10 @@ namespace ClassSystemPlugin
             base.Dispose(disposing);
         }
 
-        private void OnProjectileNew(ProjectileNewEventArgs args)
+        private void OnNewProjectile(object sender, GetDataHandlers.NewProjectileEventArgs args)
         {
-            var proj = args.Projectile;
+            if (args.Index < 0 || args.Index >= Main.maxProjectiles) return;
+            var proj = Main.projectile[args.Index];
             if (proj == null || !proj.active) return;
 
             if (_spawnedByPlugin.Remove(proj.identity))
@@ -214,11 +215,9 @@ namespace ClassSystemPlugin
             int adjustedDef = Math.Max(0, (int)Math.Round(baseDef * (1.0 + defenseMult)));
             int defDiff = adjustedDef - baseDef;
 
-            // Classic/Expert/Master damage reduction factor (~0.75 average)
             int hpDelta = (int)Math.Round(defDiff * 0.75);
             if (hpDelta > 0)
             {
-                // Warrior takes reduced damage
                 int healBack = Math.Min(hpDelta, Math.Max(0, args.Damage - 1));
                 if (healBack > 0)
                 {
@@ -229,7 +228,6 @@ namespace ClassSystemPlugin
             }
             else if (hpDelta < 0)
             {
-                // Ranger/Mage/Summoner take extra damage matching their defense penalty
                 int extraDamage = -hpDelta;
                 player.TPlayer.statLife = Math.Max(1, player.TPlayer.statLife - extraDamage);
                 NetMessage.SendData((int)PacketTypes.PlayerHp, -1, -1, null, player.Index);
