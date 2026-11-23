@@ -18,7 +18,7 @@ namespace ClassSystemPlugin
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
         public override string Description => "Account-bound class system with underworld lock before login, webbed lock only after login until class selection, starter gear replacement, strict weapon locks, non-conflicting minion stacking, custom stat modifiers, and real-time HP/Mana sync.";
-        public override Version Version => new Version(15, 9, 1);
+        public override Version Version => new Version(15, 9, 2);
 
         private SqliteConnection _db;
         private bool _dbReady;
@@ -142,7 +142,7 @@ namespace ClassSystemPlugin
             var proj = Main.projectile[args.Index];
             if (proj == null || !proj.active) return;
 
-            if (_spawnedByPlugin.Remove(proj.identity))
+            if (_spawnedByPlugin.Remove(args.Index))
             {
                 return;
             }
@@ -189,7 +189,7 @@ namespace ClassSystemPlugin
 
                 if (idx >= 0 && idx < Main.maxProjectiles && Main.projectile[idx] != null)
                 {
-                    _spawnedByPlugin.Add(Main.projectile[idx].identity);
+                    _spawnedByPlugin.Add(idx);
                     NetMessage.SendData((int)PacketTypes.ProjectileNew, -1, -1, null, idx);
                 }
             }
