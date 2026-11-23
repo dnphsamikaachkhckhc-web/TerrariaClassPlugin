@@ -22,7 +22,7 @@ namespace ClassSystemPlugin
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
         public override string Description => "Account-bound class system with underworld lock before login, webbed lock after login until class selection, starter gear, cross-class inventory ejection and dropped item pickup lock (accessories allowed freely), Max HP modifiers per class + Summoning buff (+1 minion) only, +15% Honey buff life regen for Summoner, uncleansable 5% Broken Armor reduction for Summoner, quick /c shortcuts, Life Crystal limit, and real-time HP sync.";
-        public override Version Version => new Version(15, 32, 0);
+        public override Version Version => new Version(15, 32, 1);
 
         private SqliteConnection _db;
         private bool _dbReady;
@@ -269,7 +269,7 @@ namespace ClassSystemPlugin
                 }
             }
 
-            // เครื่องประดับช่อง 3..9 (รวมช่องพิเศษ) + Warding / Armored / Hard / Guarding
+            // เครื่องประดับช่อง 3..9 + Warding / Armored / Hard / Guarding
             for (int i = 3; i < 10 && i < tPlayer.armor.Length; i++)
             {
                 Item acc = tPlayer.armor[i];
@@ -284,7 +284,7 @@ namespace ClassSystemPlugin
             if (HasBuff(tPlayer, BuffID.WellFed)) totalDef += 2;
             if (HasBuff(tPlayer, BuffID.WellFed2)) totalDef += 3;
             if (HasBuff(tPlayer, BuffID.WellFed3)) totalDef += 4;
-            if (HasBuff(tPlayer, BuffID.BastStatue)) totalDef += 5;
+            if (HasBuff(tPlayer, BuffID.CatBast)) totalDef += 5;
 
             return Math.Max(0, totalDef);
         }
@@ -349,12 +349,9 @@ namespace ClassSystemPlugin
 
             if (!isBrokenArmorActive || args.Damage <= 1) return;
 
-            // ฝั่ง Client หักเกราะไป 50% (ทำให้โดนดาเมจแรงขึ้น) แต่สาย Summoner ให้ลดเกราะแค่ 5%
-            // จึงคำนวณส่วนต่างของเกราะ 45% ที่ Client หักเกินไป และฮีลคืนกลับให้ตรงกับลดเกราะ 5% จริง
             int baseDefense = CalculatePlayerEquipmentDefense(player.TPlayer);
             if (baseDefense <= 0) return;
 
-            // อัตราลดดาเมจต่อเกราะ 1 หน่วย: Classic = 0.5, Expert = 0.75, Master = 1.0
             double defenseEffectiveness = Main.masterMode ? 1.0 : (Main.expertMode ? 0.75 : 0.5);
 
             int defAt50Percent = (int)Math.Floor(baseDefense * 0.50);
@@ -402,7 +399,6 @@ namespace ClassSystemPlugin
             }
             else if (_brokenArmorExpiresAt.TryGetValue(player.Index, out DateTime expiry) && now < expiry)
             {
-                // หากใส่ของล้างดีบัฟ (เช่น Ankh Shield / Armor Polish) ให้ยิงบัฟ BrokenArmor กลับเข้าไปทุกๆ 0.25 วินาทีเพื่อไม่ให้ล้างได้
                 if (!_lastBrokenArmorReapply.TryGetValue(player.Index, out DateTime lastReapply) || (now - lastReapply).TotalMilliseconds >= 250)
                 {
                     _lastBrokenArmorReapply[player.Index] = now;
@@ -434,9 +430,7 @@ namespace ClassSystemPlugin
 
             var tPlayer = player.TPlayer;
 
-            // บัฟน้ำผึ้งปกติในเกมให้ +2 lifeRegen (+1 HP/วินาที) และเพิ่มอัตราฟื้นฟูธรรมชาติ
-            // เพิ่มอีก 15% ของอัตราฟื้นฟูรวม (ฐาน + น้ำผึ้ง) และฮีลจริงส่งแพ็กเก็ตให้ Client เห็นผลชัดเจนในเกม
-            double baseHoneyHpPerSec = 2.5; // อัตราฟื้นฟูเฉลี่ยเมื่อมีบัฟน้ำผึ้ง (ยืนนิ่ง/เคลื่อนที่)
+            double baseHoneyHpPerSec = 2.5;
             if (HasBuff(player, BuffID.Campfire)) baseHoneyHpPerSec += 0.5;
             if (HasBuff(player, BuffID.HeartLamp)) baseHoneyHpPerSec += 1.0;
             if (HasBuff(player, BuffID.Regeneration)) baseHoneyHpPerSec += 2.0;
@@ -525,7 +519,7 @@ namespace ClassSystemPlugin
 
         private void OnItemDrop(object sender, GetDataHandlers.ItemDropEventArgs args)
         {
-            var player = TShock.Players[args.PlayerId];
+            var player = args.Player;
             if (player == null || !player.Active || !player.IsLoggedIn || player.Account == null) return;
 
             string currentClass = GetPlayerClass(player);
