@@ -1,13 +1,11 @@
 using System;
 using System.Collections.Generic;
 using System.Data;
-using System.Linq;
 using Microsoft.Xna.Framework;
 using Terraria;
 using Terraria.ID;
 using TerrariaApi.Server;
 using TShockAPI;
-using TShockAPI.DB;
 using TShockAPI.Hooks;
 
 namespace ClassSystemPlugin
@@ -24,25 +22,18 @@ namespace ClassSystemPlugin
         private readonly Dictionary<int, string> _playerClasses = new Dictionary<int, string>();
         private readonly Dictionary<int, Vector2> _frozenPositions = new Dictionary<int, Vector2>();
         private readonly Dictionary<int, DateTime> _warnCooldown = new Dictionary<int, DateTime>();
-        private readonly Dictionary<int, DateTime> _regenTick = new Dictionary<int, DateTime>();
-        private readonly Dictionary<int, DateTime> _warriorRegenPenaltyTick = new Dictionary<int, DateTime>();
-        private readonly Dictionary<int, DateTime> _manaRegenTick = new Dictionary<int, DateTime>();
-        private readonly Random _rng = new Random();
 
         private const int MaxLifeCrystalsAllowed = 15;
         private const int BaseStartHp = 100;
         private const int HpPerLifeCrystal = 20;
-        private const bool BlockLifeCrystalUseAboveCap = true;
 
         private const double WarriorMeleeDamageMult = 0.10;
         private const double WarriorMaxHpMult = 0.15;
         private const double WarriorDefenseMult = 0.10;
         private const double WarriorMoveSpeedMult = -0.15;
-        private const double WarriorLifeRegenPenaltyMult = -0.15;
 
         private const double RangerRangedDamageMult = 0.10;
         private const double RangerMoveSpeedMult = 0.30;
-        private const double RangerAmmoSaveChance = 0.15;
         private const int RangerMaxHpFlat = -60;
         private const double RangerDefenseMult = -0.15;
         private const bool RangerArcheryBuff = true;
@@ -50,27 +41,23 @@ namespace ClassSystemPlugin
         private const double MageMagicDamageMult = 0.12;
         private const double MageMoveSpeedMult = 0.15;
         private const int MageMaxManaFlat = 80;
-        private const double MageManaRegenMult = 0.15;
         private const int MageMaxHpFlat = -40;
         private const double MageDefenseMult = -0.10;
 
         private const double SummonerSummonDamageMult = 0.12;
         private const double SummonerWhipDamageMult = -0.15;
         private const int SummonerExtraMinions = 2;
-        private const double SummonerLifeRegenMult = 0.15;
         private const double SummonerMoveSpeedMult = 0.20;
         private const int SummonerMaxHpFlat = -80;
         private const double SummonerDefenseMult = -0.20;
 
-        private const bool RemoveStarterSwordOnSelect = true;
-
-        private readonly Dictionary<string, (int ItemId, int Stack)[]> _classStarterItems =
-            new Dictionary<string, (int ItemId, int Stack)[]>
+        private readonly Dictionary<string, (short ItemId, int Stack)[]> _classStarterItems =
+            new Dictionary<string, (short ItemId, int Stack)[]>
             {
                 ["warrior"] = new[] { (ItemID.CopperBroadsword, 1) },
                 ["ranger"] = new[] { (ItemID.WoodenBow, 1), (ItemID.WoodenArrow, 500) },
                 ["mage"] = new[] { (ItemID.WandofSparking, 1), (ItemID.LesserManaPotion, 15) },
-                ["summoner"] = new[] { (ItemID.FinchStaff, 1), (ItemID.ThornWhip, 1) }
+                ["summoner"] = new[] { (ItemID.SlimeStaff, 1), (ItemID.BlandWhip, 1) }
             };
 
         private readonly List<string> _availableClasses = new List<string>
@@ -127,12 +114,7 @@ namespace ClassSystemPlugin
         private void SetupDatabase()
         {
             _db = TShock.DB;
-            var table = new SqlTable("PlayerClasses",
-                new SqlColumn("AccountID", DbType.Int32) { Primary = true, Unique = true },
-                new SqlColumn("ClassName", DbType.String, 32)
-            );
-            var creator = new SqlTableCreator(_db, new SqliteQueryCreator());
-            creator.EnsureTableStructure(table);
+            _db.Query("CREATE TABLE IF NOT EXISTS PlayerClasses (AccountID INT PRIMARY KEY, ClassName VARCHAR(32))");
         }
 
         private void OnGameInitialize(EventArgs args)
@@ -187,9 +169,6 @@ namespace ClassSystemPlugin
             }
             _frozenPositions.Remove(args.Who);
             _warnCooldown.Remove(args.Who);
-            _regenTick.Remove(args.Who);
-            _warriorRegenPenaltyTick.Remove(args.Who);
-            _manaRegenTick.Remove(args.Who);
         }
 
         private void OnPlayerUpdate(object sender, GetDataHandlers.PlayerUpdateEventArgs args)
@@ -253,27 +232,32 @@ namespace ClassSystemPlugin
 
         private void OnNpcStrike(NpcStrikeEventArgs args)
         {
-            if (args.Player == null || !args.Player.IsLoggedIn || args.Player.Account == null) return;
+            if (args.Player == null) return;
+            var tsPlayer = TShock.Players[args.Player.whoAmi];
+            if (tsPlayer == null || !tsPlayer.IsLoggedIn || tsPlayer.Account == null) return;
 
-            string playerClass = GetPlayerClass(args.Player);
+            string playerClass = GetPlayerClass(tsPlayer);
             if (string.IsNullOrEmpty(playerClass)) return;
 
-            if (playerClass == "warrior" && args.Player.SelectedItem != null && args.Player.SelectedItem.melee)
+            var heldItem = args.Player.HeldItem;
+            if (heldItem == null) return;
+
+            if (playerClass == "warrior" && heldItem.melee)
             {
                 args.Damage = (int)Math.Round(args.Damage * (1.0 + WarriorMeleeDamageMult));
             }
-            else if (playerClass == "ranger" && args.Player.SelectedItem != null && args.Player.SelectedItem.ranged)
+            else if (playerClass == "ranger" && heldItem.ranged)
             {
                 args.Damage = (int)Math.Round(args.Damage * (1.0 + RangerRangedDamageMult));
             }
-            else if (playerClass == "mage" && args.Player.SelectedItem != null && args.Player.SelectedItem.magic)
+            else if (playerClass == "mage" && heldItem.magic)
             {
                 args.Damage = (int)Math.Round(args.Damage * (1.0 + MageMagicDamageMult));
             }
-            else if (playerClass == "summoner" && args.Player.SelectedItem != null && args.Player.SelectedItem.summon)
+            else if (playerClass == "summoner" && heldItem.summon)
             {
                 double mult = 1.0 + SummonerSummonDamageMult;
-                if (args.Player.SelectedItem.useStyle == ItemUseStyleID.Swing && args.Player.SelectedItem.noMelee)
+                if (heldItem.useStyle == ItemUseStyleID.Swing && heldItem.noMelee)
                 {
                     mult += SummonerWhipDamageMult;
                 }
