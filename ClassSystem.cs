@@ -22,7 +22,7 @@ namespace ClassSystemPlugin
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
         public override string Description => "Account-bound class system with underworld lock before login, webbed lock after login until class selection, starter gear, full-inventory cross-class weapon/armor drop & pickup lock (accessories allowed freely), Max HP modifiers per class + Summoning buff (+1 minion) only, quick /c shortcuts, Life Crystal limit, and real-time HP sync.";
-        public override Version Version => new Version(15, 26, 0);
+        public override Version Version => new Version(15, 26, 6);
 
         private SqliteConnection _db;
         private bool _dbReady;
@@ -67,7 +67,7 @@ namespace ClassSystemPlugin
             ["sm"] = "summoner"
         };
 
-        // ชุดเกราะที่แยกสายชัดเจน (ไม่รวมเครื่องประดับเพราะเครื่องประดับใส่อะไรก็ได้)
+        // ชุดเกราะที่แยกสายชัดเจน (กรองแล้ว: เอาชุดที่ไม่มีใน ID ออก)
         private readonly Dictionary<int, string> _restrictedArmors = new Dictionary<int, string>
         {
             // Pre-Hardmode Melee / Warrior
@@ -86,8 +86,6 @@ namespace ClassSystemPlugin
 
             // Pre-Hardmode Ranged / Ranger
             { ItemID.FossilHelm, "ranger" },
-            { ItemID.FossilPlate, "ranger" },
-            { ItemID.FossilGreaves, "ranger" },
             { ItemID.NecroHelmet, "ranger" },
             { ItemID.NecroBreastplate, "ranger" },
             { ItemID.NecroGreaves, "ranger" },
@@ -148,13 +146,10 @@ namespace ClassSystemPlugin
             { ItemID.TitaniumBreastplate, "warrior" },
             { ItemID.TitaniumLeggings, "warrior" },
 
-            // Hardmode Frost / Forbidden / Spider / Hallowed / Chlorophyte
+            // Hardmode Frost / Spider / Hallowed / Chlorophyte
             { ItemID.FrostHelmet, "ranger" },
             { ItemID.FrostBreastplate, "ranger" },
             { ItemID.FrostLeggings, "ranger" },
-            { ItemID.ForbiddenMask, "mage" },
-            { ItemID.ForbiddenLotions, "mage" },
-            { ItemID.ForbiddenPants, "mage" },
             { ItemID.SpiderMask, "summoner" },
             { ItemID.SpiderBreastplate, "summoner" },
             { ItemID.SpiderGreaves, "summoner" },
@@ -301,7 +296,6 @@ namespace ClassSystemPlugin
             {
                 Main.item[droppedIndex].prefix = prefix;
                 Main.item[droppedIndex].playerIndexTheItemIsReservedFor = 255;
-                Main.item[droppedIndex].noGrabDelay = 0;
                 Main.item[droppedIndex].velocity = new Vector2(player.TPlayer.direction * 3f, -2.5f);
 
                 NetMessage.SendData((int)PacketTypes.ItemDrop, -1, -1, null, droppedIndex);
@@ -405,7 +399,6 @@ namespace ClassSystemPlugin
 
             var tPlayer = player.TPlayer;
 
-            // 1. ตรวจช่องเก็บของทั้งหมด (0-58 รวมช่องถือ 0-49, เหรียญ 50-53, กระสุน 54-57, เมาส์ 58)
             for (int i = 0; i < tPlayer.inventory.Length && i < 59; i++)
             {
                 Item item = tPlayer.inventory[i];
@@ -415,7 +408,6 @@ namespace ClassSystemPlugin
                 }
             }
 
-            // 2. ตรวจช่องชุดเกราะหลัก (netSlot 59-61: หัว, เสื้อ, กางเกง) เท่านั้น ไม่บล็อกช่องเครื่องประดับ (62-68)
             for (int i = 0; i < 3 && i < tPlayer.armor.Length; i++)
             {
                 Item armorItem = tPlayer.armor[i];
@@ -425,7 +417,6 @@ namespace ClassSystemPlugin
                 }
             }
 
-            // 3. ตรวจช่องถังขยะ (netSlot 179)
             if (tPlayer.trashItem != null && !tPlayer.trashItem.IsAir && tPlayer.trashItem.type > ItemID.None && !IsItemAllowedForClass(tPlayer.trashItem, currentClass))
             {
                 DropDisallowedItemAndClearSlot(player, 179, tPlayer.trashItem, tPlayer.trashItem.type, tPlayer.trashItem.stack);
@@ -693,20 +684,17 @@ namespace ClassSystemPlugin
         {
             if (item == null || item.IsAir || item.type == ItemID.None) return true;
 
-            // เครื่องประดับใส่อะไรก็ได้
             if (item.accessory) return true;
 
             if (IsCoinOrAmmoOrMisc(item)) return true;
 
             if (IsGatheringTool(item)) return true;
 
-            // ตรวจชุดเกราะเฉพาะสาย
             if (_restrictedArmors.TryGetValue(item.type, out string reqArmorClass))
             {
                 return string.Equals(className, reqArmorClass, StringComparison.OrdinalIgnoreCase);
             }
 
-            // ตรวจอาวุธเฉพาะสาย
             bool isClassWeapon = item.melee || item.ranged || item.magic || item.summon;
             if (!isClassWeapon || item.damage <= 0) return true;
 
