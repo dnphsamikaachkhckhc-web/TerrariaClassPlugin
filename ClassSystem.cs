@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.Data;
+using System.IO;
+using Microsoft.Data.Sqlite;
 using Microsoft.Xna.Framework;
 using Terraria;
 using Terraria.ID;
@@ -16,9 +18,10 @@ namespace ClassSystemPlugin
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
         public override string Description => "Account-bound class system with movement lock before selection, starter weapon loadouts, item restrictions, Life Crystal cap, and custom buffs/nerfs.";
-        public override Version Version => new Version(15, 0, 2);
+        public override Version Version => new Version(15, 0, 3);
 
-        private IDbConnection _db;
+        private SqliteConnection _db;
+        private bool _dbReady;
         private readonly Dictionary<int, string> _playerClasses = new Dictionary<int, string>();
         private readonly Dictionary<int, Vector2> _frozenPositions = new Dictionary<int, Vector2>();
         private readonly Dictionary<int, DateTime> _warnCooldown = new Dictionary<int, DateTime>();
@@ -107,39 +110,50 @@ namespace ClassSystemPlugin
                 PlayerHooks.PlayerPostLogin -= OnPlayerPostLogin;
                 GetDataHandlers.PlayerUpdate -= OnPlayerUpdate;
                 GetDataHandlers.PlayerSlot -= OnPlayerSlot;
+
+                if (_db != null)
+                {
+                    try { _db.Dispose(); } catch { }
+                    _db = null;
+                }
             }
             base.Dispose(disposing);
-        }
-
-        private void EnsureConnectionOpen()
-        {
-            if (_db == null)
-            {
-                _db = TShock.DB;
-            }
-            if (_db != null && _db.State != System.Data.ConnectionState.Open)
-            {
-                _db.Open();
-            }
         }
 
         private void SetupDatabase()
         {
             try
             {
-                _db = TShock.DB;
-                ExecuteNonQuery("CREATE TABLE IF NOT EXISTS PlayerClasses (AccountID INT PRIMARY KEY, ClassName VARCHAR(32))");
+                string saveDir = string.IsNullOrWhiteSpace(TShock.SavePath) ? "tshock" : TShock.SavePath;
+                Directory.CreateDirectory(saveDir);
+                string dbPath = Path.Combine(saveDir, "ClassSystem.sqlite");
+
+                _db = new SqliteConnection($"Data Source={dbPath}");
+                _db.Open();
+
+                ExecuteNonQuery("CREATE TABLE IF NOT EXISTS PlayerClasses (AccountID INTEGER PRIMARY KEY, ClassName TEXT NOT NULL)");
+                _dbReady = true;
             }
             catch (Exception ex)
             {
+                _dbReady = false;
                 TShock.Log.Error($"[ClassSystem] SetupDatabase error: {ex.Message}");
+            }
+        }
+
+        private void EnsureConnectionOpen()
+        {
+            if (_db == null) return;
+            if (_db.State != System.Data.ConnectionState.Open)
+            {
+                _db.Open();
             }
         }
 
         private void ExecuteNonQuery(string sql, params (string Name, object Value)[] parameters)
         {
-            EnsureConnectionOpen();
             if (_db == null) return;
+            EnsureConnectionOpen();
             using (var cmd = _db.CreateCommand())
             {
                 cmd.CommandText = sql;
@@ -156,6 +170,11 @@ namespace ClassSystemPlugin
 
         private void OnGameInitialize(EventArgs args)
         {
+            if (!_dbReady)
+            {
+                SetupDatabase();
+            }
+
             Commands.ChatCommands.Add(new Command("class.use", CmdClass, "class")
             {
                 HelpText = "Select or view your class: /class [classname]"
@@ -445,45 +464,58 @@ namespace ClassSystemPlugin
 
         private string GetClassFromDB(int accountId)
         {
-            EnsureConnectionOpen();
             if (_db == null) return null;
-            using (var cmd = _db.CreateCommand())
+            try
             {
-                cmd.CommandText = "SELECT ClassName FROM PlayerClasses WHERE AccountID = @0";
-                var p = cmd.CreateParameter();
-                p.ParameterName = "@0";
-                p.Value = accountId;
-                cmd.Parameters.Add(p);
-
-                using (var reader = cmd.ExecuteReader())
+                EnsureConnectionOpen();
+                using (var cmd = _db.CreateCommand())
                 {
-                    if (reader.Read() && !reader.IsDBNull(0))
+                    cmd.CommandText = "SELECT ClassName FROM PlayerClasses WHERE AccountID = @0";
+                    var p = cmd.CreateParameter();
+                    p.ParameterName = "@0";
+                    p.Value = accountId;
+                    cmd.Parameters.Add(p);
+
+                    using (var reader = cmd.ExecuteReader())
                     {
-                        return reader.GetString(0);
+                        if (reader.Read() && !reader.IsDBNull(0))
+                        {
+                            return reader.GetString(0);
+                        }
                     }
                 }
+            }
+            catch (Exception ex)
+            {
+                TShock.Log.Error($"[ClassSystem] GetClassFromDB error: {ex.Message}");
             }
             return null;
         }
 
         private void SaveClassToDB(int accountId, string className)
         {
-            string existing = GetClassFromDB(accountId);
-            if (existing == null)
+            try
             {
-                ExecuteNonQuery("INSERT INTO PlayerClasses (AccountID, ClassName) VALUES (@0, @1)",
+                ExecuteNonQuery(
+                    "INSERT INTO PlayerClasses (AccountID, ClassName) VALUES (@0, @1) ON CONFLICT(AccountID) DO UPDATE SET ClassName = excluded.ClassName",
                     ("@0", accountId), ("@1", className));
             }
-            else
+            catch (Exception ex)
             {
-                ExecuteNonQuery("UPDATE PlayerClasses SET ClassName = @1 WHERE AccountID = @0",
-                    ("@0", accountId), ("@1", className));
+                TShock.Log.Error($"[ClassSystem] SaveClassToDB error: {ex.Message}");
             }
         }
 
         private void DeleteClassFromDB(int accountId)
         {
-            ExecuteNonQuery("DELETE FROM PlayerClasses WHERE AccountID = @0", ("@0", accountId));
+            try
+            {
+                ExecuteNonQuery("DELETE FROM PlayerClasses WHERE AccountID = @0", ("@0", accountId));
+            }
+            catch (Exception ex)
+            {
+                TShock.Log.Error($"[ClassSystem] DeleteClassFromDB error: {ex.Message}");
+            }
         }
     }
 }
