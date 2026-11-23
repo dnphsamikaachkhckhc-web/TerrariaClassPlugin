@@ -18,7 +18,7 @@ namespace ClassSystemPlugin
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
         public override string Description => "Account-bound class system with underworld lock before login, webbed lock only after login until class selection, starter gear replacement, strict weapon locks, automatic extra minion maintenance, custom stat modifiers, and real-time HP/Mana sync.";
-        public override Version Version => new Version(15, 10, 1);
+        public override Version Version => new Version(15, 10, 2);
 
         private SqliteConnection _db;
         private bool _dbReady;
@@ -956,4 +956,3 @@ namespace ClassSystemPlugin
         }
     }
 }
-using System;
