@@ -67,10 +67,10 @@ namespace ClassSystemPlugin
         private readonly Dictionary<string, (int ItemId, int Stack)[]> _classStarterItems =
             new Dictionary<string, (int ItemId, int Stack)[]>
             {
-                { "warrior", new[] { (ItemID.CopperBroadsword, 1) } },
-                { "ranger", new[] { (ItemID.WoodenBow, 1), (ItemID.WoodenArrow, 500) } },
-                { "mage", new[] { (ItemID.WandofSparking, 1), (ItemID.LesserManaPotion, 15) } },
-                { "summoner", new[] { (ItemID.FinchStaff, 1), (ItemID.Cobwhip, 1) } }
+                ["warrior"] = new[] { (ItemID.CopperBroadsword, 1) },
+                ["ranger"] = new[] { (ItemID.WoodenBow, 1), (ItemID.WoodenArrow, 500) },
+                ["mage"] = new[] { (ItemID.WandofSparking, 1), (ItemID.LesserManaPotion, 15) },
+                ["summoner"] = new[] { (ItemID.FinchStaff, 1), (ItemID.ThornWhip, 1) }
             };
 
         private readonly List<string> _availableClasses = new List<string>
@@ -128,8 +128,8 @@ namespace ClassSystemPlugin
         {
             _db = TShock.DB;
             var table = new SqlTable("PlayerClasses",
-                new SqlColumn("AccountID", MySqlDbType.Int32) { Primary = true, Unique = true },
-                new SqlColumn("ClassName", MySqlDbType.VarChar, 32)
+                new SqlColumn("AccountID", DbType.Int32) { Primary = true, Unique = true },
+                new SqlColumn("ClassName", DbType.String, 32)
             );
             var creator = new SqlTableCreator(_db, new SqliteQueryCreator());
             creator.EnsureTableStructure(table);
