@@ -17,8 +17,8 @@ namespace ClassSystemPlugin
     {
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
-        public override string Description => "Account-bound class system with underworld lock before login, webbed lock only after login until class selection, starter gear replacement, strict weapon locks, non-conflicting minion stacking, custom stat modifiers, and real-time HP/Mana sync.";
-        public override Version Version => new Version(15, 9, 2);
+        public override string Description => "Account-bound class system with underworld lock before login, webbed lock only after login until class selection, starter gear replacement, strict weapon locks, automatic extra minion maintenance, custom stat modifiers, and real-time HP/Mana sync.";
+        public override Version Version => new Version(15, 10, 0);
 
         private SqliteConnection _db;
         private bool _dbReady;
@@ -28,7 +28,7 @@ namespace ClassSystemPlugin
         private readonly Dictionary<int, DateTime> _slotWarnCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, int> _lastSyncedMaxLife = new Dictionary<int, int>();
         private readonly Dictionary<int, int> _lastSyncedMaxMana = new Dictionary<int, int>();
-        private readonly HashSet<int> _spawnedByPlugin = new HashSet<int>();
+        private readonly Dictionary<int, int> _minionSyncCooldown = new Dictionary<int, int>();
 
         private const int MaxLifeCrystalsAllowed = 15;
         private const int BaseStartHp = 100;
@@ -107,7 +107,7 @@ namespace ClassSystemPlugin
             GetDataHandlers.PlayerUpdate += OnPlayerUpdate;
             GetDataHandlers.PlayerSlot += OnPlayerSlot;
             GetDataHandlers.PlayerDamage += OnPlayerDamage;
-            GetDataHandlers.NewProjectile += OnNewProjectile;
+            GetDataHandlers.KillProjectile += OnKillProjectile;
         }
 
         protected override void Dispose(bool disposing)
@@ -125,7 +125,7 @@ namespace ClassSystemPlugin
                 GetDataHandlers.PlayerUpdate -= OnPlayerUpdate;
                 GetDataHandlers.PlayerSlot -= OnPlayerSlot;
                 GetDataHandlers.PlayerDamage -= OnPlayerDamage;
-                GetDataHandlers.NewProjectile -= OnNewProjectile;
+                GetDataHandlers.KillProjectile -= OnKillProjectile;
 
                 if (_db != null)
                 {
@@ -136,60 +136,88 @@ namespace ClassSystemPlugin
             base.Dispose(disposing);
         }
 
-        private void OnNewProjectile(object sender, GetDataHandlers.NewProjectileEventArgs args)
+        private void OnKillProjectile(object sender, GetDataHandlers.KillProjectileEventArgs args)
         {
             if (args.Index < 0 || args.Index >= Main.maxProjectiles) return;
             var proj = Main.projectile[args.Index];
-            if (proj == null || !proj.active) return;
+            if (proj == null || !proj.active || !proj.minion) return;
 
-            if (_spawnedByPlugin.Remove(args.Index))
-            {
-                return;
-            }
-
-            if (!proj.minion || proj.owner < 0 || proj.owner >= TShock.Players.Length) return;
-
-            var player = TShock.Players[proj.owner];
+            var player = TShock.Players[args.PlayerId];
             if (player == null || !player.Active || !player.IsLoggedIn || player.Account == null) return;
 
             string playerClass = GetPlayerClass(player);
             if (!string.Equals(playerClass, "summoner", StringComparison.OrdinalIgnoreCase)) return;
 
-            // Stack class bonus (+2) on top of player's vanilla maxMinions (potions, Bewitching Table, armor, accessories)
-            int baseMaxMinions = Math.Max(1, player.TPlayer.maxMinions);
-            int maxAllowedMinions = baseMaxMinions + Math.Max(0, SummonerExtraMinions);
+            // Block client auto-despawn of extra minions spawned by the class bonus
+            if (proj.localAI[1] == 999f && !player.TPlayer.dead)
+            {
+                args.Handled = true;
+            }
+        }
 
+        private void MaintainSummonerMinions(TSPlayer player)
+        {
+            if (player == null || player.TPlayer == null || player.TPlayer.dead) return;
+
+            if (_minionSyncCooldown.TryGetValue(player.Index, out int cd) && cd > 0)
+            {
+                _minionSyncCooldown[player.Index] = cd - 1;
+                return;
+            }
+            _minionSyncCooldown[player.Index] = 15;
+
+            Projectile templateMinion = null;
             float usedSlots = 0f;
+
             for (int i = 0; i < Main.maxProjectiles; i++)
             {
                 var p = Main.projectile[i];
                 if (p != null && p.active && p.owner == player.Index && p.minion)
                 {
                     usedSlots += p.minionSlots > 0f ? p.minionSlots : 1f;
+                    if (p.localAI[1] != 999f)
+                    {
+                        templateMinion = p;
+                    }
                 }
             }
 
-            float slotCost = proj.minionSlots > 0f ? proj.minionSlots : 1f;
-            int remainingSlots = (int)Math.Floor((maxAllowedMinions - usedSlots) / slotCost);
-            int toSpawn = Math.Min(Math.Max(0, SummonerExtraMinions), Math.Max(0, remainingSlots));
+            // If player has no active base minion, clean up any plugin-cloned minions
+            if (templateMinion == null)
+            {
+                for (int i = 0; i < Main.maxProjectiles; i++)
+                {
+                    var p = Main.projectile[i];
+                    if (p != null && p.active && p.owner == player.Index && p.minion && p.localAI[1] == 999f)
+                    {
+                        p.Kill();
+                    }
+                }
+                return;
+            }
 
-            for (int n = 0; n < toSpawn; n++)
+            int baseMaxMinions = Math.Max(1, player.TPlayer.maxMinions);
+            int maxAllowedMinions = baseMaxMinions + Math.Max(0, SummonerExtraMinions);
+            float slotCost = templateMinion.minionSlots > 0f ? templateMinion.minionSlots : 1f;
+
+            if (usedSlots + slotCost <= maxAllowedMinions + 0.01f)
             {
                 int idx = Projectile.NewProjectile(
-                    new EntitySource_Parent(proj),
-                    proj.position.X + (n + 1) * 12f,
-                    proj.position.Y,
-                    proj.velocity.X,
-                    proj.velocity.Y,
-                    proj.type,
-                    proj.damage,
-                    proj.knockBack,
+                    new EntitySource_Parent(templateMinion),
+                    templateMinion.position.X + 16f,
+                    templateMinion.position.Y - 8f,
+                    templateMinion.velocity.X,
+                    templateMinion.velocity.Y,
+                    templateMinion.type,
+                    templateMinion.damage,
+                    templateMinion.knockBack,
                     player.Index
                 );
 
                 if (idx >= 0 && idx < Main.maxProjectiles && Main.projectile[idx] != null)
                 {
-                    _spawnedByPlugin.Add(idx);
+                    Main.projectile[idx].localAI[1] = 999f;
+                    Main.projectile[idx].netUpdate = true;
                     NetMessage.SendData((int)PacketTypes.ProjectileNew, -1, -1, null, idx);
                 }
             }
@@ -436,6 +464,7 @@ namespace ClassSystemPlugin
             _slotWarnCooldown.Remove(args.Who);
             _lastSyncedMaxLife.Remove(args.Who);
             _lastSyncedMaxMana.Remove(args.Who);
+            _minionSyncCooldown.Remove(args.Who);
         }
 
         private bool IsGatheringTool(Item item)
@@ -586,6 +615,11 @@ namespace ClassSystemPlugin
 
                 ClearWebBuff(player);
                 ApplyClassStats(player, playerClass);
+
+                if (playerClass == "summoner")
+                {
+                    MaintainSummonerMinions(player);
+                }
 
                 if (playerClass == "ranger" && RangerArcheryBuff)
                 {
