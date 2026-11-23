@@ -29,7 +29,7 @@ namespace ClassSystemPlugin
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
         public override string Description => "Class & starter-choice (/ch 1|2) system with /n (register+login) and /l (login) commands, SlimeStaff for summoner /ch 1, smooth native client movement/jump buffs, custom prompts, server-wide broadcasts, underworld lock, inventory weapon wipe, permanent class/choice buffs & debuffs, Max HP modifiers, cross-class item ejection, Life Crystal cap, and real-time HP sync.";
-        public override Version Version => new Version(16, 5, 0);
+        public override Version Version => new Version(16, 5, 1);
 
         private const string ClassSelectPrompt =
             "Chat by Shokuya :3 Please select your class >w<\n\n" +
@@ -1127,6 +1127,17 @@ namespace ClassSystemPlugin
             });
         }
 
+        private void CompleteCustomLogin(TSPlayer player, UserAccount account, string successMessage)
+        {
+            player.Account = account;
+            player.Group = TShock.Groups.GetGroupByName(account.Group);
+            player.IsLoggedIn = true;
+
+            ClearWebBuff(player);
+            player.SendSuccessMessage(successMessage);
+            PlayerHooks.OnPlayerPostLogin(player);
+        }
+
         private void HandleCustomRegister(TSPlayer player, string password)
         {
             if (player == null) return;
@@ -1168,14 +1179,8 @@ namespace ClassSystemPlugin
                 account.CreateBCryptHash(password);
                 TShock.UserAccounts.AddUserAccount(account);
 
-                player.PlayerAccount = TShock.UserAccounts.GetUserAccountByName(player.Name) ?? account;
-                player.Group = TShock.Utils.GetGroup(player.PlayerAccount.Group);
-                player.IsLoggedIn = true;
-                player.HasBeenSpotted = false;
-
-                ClearWebBuff(player);
-                player.SendSuccessMessage("[ClassSystem] Registered and logged in with /n!");
-                PlayerHooks.OnPlayerPostLogin(player);
+                var created = TShock.UserAccounts.GetUserAccountByName(player.Name) ?? account;
+                CompleteCustomLogin(player, created, "[ClassSystem] Registered and logged in with /n!");
             }
             catch (Exception ex)
             {
@@ -1216,14 +1221,7 @@ namespace ClassSystemPlugin
                 return;
             }
 
-            player.PlayerAccount = account;
-            player.Group = TShock.Utils.GetGroup(account.Group);
-            player.IsLoggedIn = true;
-            player.HasBeenSpotted = false;
-
-            ClearWebBuff(player);
-            player.SendSuccessMessage("[ClassSystem] Logged in with /l!");
-            PlayerHooks.OnPlayerPostLogin(player);
+            CompleteCustomLogin(player, account, "[ClassSystem] Logged in with /l!");
         }
 
         private void OnPlayerCommand(PlayerCommandEventArgs args)
