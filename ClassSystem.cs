@@ -18,7 +18,7 @@ namespace ClassSystemPlugin
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
         public override string Description => "Account-bound class system with underworld lock before login, webbed lock only after login until class selection, starter gear replacement, strict cross-class weapon blocks without deleting items, +1 minion via Summoning buff (2 total minions at start), direct nerf on all whips from 1.0 base, boosted summon damage, gathering tool damage rules, quick /c shortcuts, hard Life Crystal usage block, custom stat modifiers, smooth update loop, and real-time HP/Mana sync.";
-        public override Version Version => new Version(15, 20, 11);
+        public override Version Version => new Version(15, 20, 12);
 
         private SqliteConnection _db;
         private bool _dbReady;
@@ -190,7 +190,7 @@ namespace ClassSystemPlugin
         {
             if (item == null || item.IsAir || item.type == ItemID.None) return false;
 
-            if ((item.summon || item.CountsAsClass(DamageClass.Summon)) && item.useStyle == ItemUseStyleID.Swing && item.noMelee)
+            if (item.summon && item.useStyle == ItemUseStyleID.Swing && item.noMelee)
                 return true;
 
             return item.type == ItemID.BlandWhip ||
@@ -505,24 +505,19 @@ namespace ClassSystemPlugin
                 return string.Equals(className, reqClass, StringComparison.OrdinalIgnoreCase);
             }
 
-            bool isMelee = item.melee || item.CountsAsClass(DamageClass.Melee);
-            bool isRanged = item.ranged || item.CountsAsClass(DamageClass.Ranged);
-            bool isMagic = item.magic || item.CountsAsClass(DamageClass.Magic);
-            bool isSummon = item.summon || item.CountsAsClass(DamageClass.Summon);
-
-            bool isClassWeapon = isMelee || isRanged || isMagic || isSummon;
+            bool isClassWeapon = item.melee || item.ranged || item.magic || item.summon;
             if (!isClassWeapon || item.damage <= 0) return true;
 
             switch (className.ToLowerInvariant())
             {
                 case "warrior":
-                    return isMelee;
+                    return item.melee;
                 case "ranger":
-                    return isRanged;
+                    return item.ranged;
                 case "mage":
-                    return isMagic;
+                    return item.magic;
                 case "summoner":
-                    return isSummon;
+                    return item.summon;
                 default:
                     return false;
             }
@@ -746,15 +741,15 @@ namespace ClassSystemPlugin
             // 5. ตัวคูณดาเมจคลาสอื่นๆ
             if (args.Damage > 0)
             {
-                if (playerClass == "warrior" && (heldItem.melee || heldItem.CountsAsClass(DamageClass.Melee)))
+                if (playerClass == "warrior" && heldItem.melee)
                 {
                     args.Damage = Math.Max(1, (int)Math.Round(args.Damage * (1.0 + WarriorMeleeDamageMult)));
                 }
-                else if (playerClass == "ranger" && (heldItem.ranged || heldItem.CountsAsClass(DamageClass.Ranged)))
+                else if (playerClass == "ranger" && heldItem.ranged)
                 {
                     args.Damage = Math.Max(1, (int)Math.Round(args.Damage * (1.0 + RangerRangedDamageMult)));
                 }
-                else if (playerClass == "mage" && (heldItem.magic || heldItem.CountsAsClass(DamageClass.Magic)))
+                else if (playerClass == "mage" && heldItem.magic)
                 {
                     args.Damage = Math.Max(1, (int)Math.Round(args.Damage * (1.0 + MageMagicDamageMult)));
                 }
