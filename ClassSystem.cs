@@ -114,7 +114,24 @@ namespace ClassSystemPlugin
         private void SetupDatabase()
         {
             _db = TShock.DB;
-            _db.Query("CREATE TABLE IF NOT EXISTS PlayerClasses (AccountID INT PRIMARY KEY, ClassName VARCHAR(32))");
+            ExecuteNonQuery("CREATE TABLE IF NOT EXISTS PlayerClasses (AccountID INT PRIMARY KEY, ClassName VARCHAR(32))");
+        }
+
+        private void ExecuteNonQuery(string sql, params (string Name, object Value)[] parameters)
+        {
+            if (_db == null) return;
+            using (var cmd = _db.CreateCommand())
+            {
+                cmd.CommandText = sql;
+                foreach (var (name, value) in parameters)
+                {
+                    var p = cmd.CreateParameter();
+                    p.ParameterName = name;
+                    p.Value = value ?? DBNull.Value;
+                    cmd.Parameters.Add(p);
+                }
+                cmd.ExecuteNonQuery();
+            }
         }
 
         private void OnGameInitialize(EventArgs args)
@@ -233,7 +250,10 @@ namespace ClassSystemPlugin
         private void OnNpcStrike(NpcStrikeEventArgs args)
         {
             if (args.Player == null) return;
-            var tsPlayer = TShock.Players[args.Player.whoAmi];
+            int playerIndex = Array.IndexOf(Main.player, args.Player);
+            if (playerIndex < 0 || playerIndex >= TShock.Players.Length) return;
+
+            var tsPlayer = TShock.Players[playerIndex];
             if (tsPlayer == null || !tsPlayer.IsLoggedIn || tsPlayer.Account == null) return;
 
             string playerClass = GetPlayerClass(tsPlayer);
@@ -405,11 +425,21 @@ namespace ClassSystemPlugin
 
         private string GetClassFromDB(int accountId)
         {
-            using (var reader = _db.QueryReader("SELECT ClassName FROM PlayerClasses WHERE AccountID = @0", accountId))
+            if (_db == null) return null;
+            using (var cmd = _db.CreateCommand())
             {
-                if (reader.Read())
+                cmd.CommandText = "SELECT ClassName FROM PlayerClasses WHERE AccountID = @0";
+                var p = cmd.CreateParameter();
+                p.ParameterName = "@0";
+                p.Value = accountId;
+                cmd.Parameters.Add(p);
+
+                using (var reader = cmd.ExecuteReader())
                 {
-                    return reader.Get<string>("ClassName");
+                    if (reader.Read() && !reader.IsDBNull(0))
+                    {
+                        return reader.GetString(0);
+                    }
                 }
             }
             return null;
@@ -420,17 +450,19 @@ namespace ClassSystemPlugin
             string existing = GetClassFromDB(accountId);
             if (existing == null)
             {
-                _db.Query("INSERT INTO PlayerClasses (AccountID, ClassName) VALUES (@0, @1)", accountId, className);
+                ExecuteNonQuery("INSERT INTO PlayerClasses (AccountID, ClassName) VALUES (@0, @1)",
+                    ("@0", accountId), ("@1", className));
             }
             else
             {
-                _db.Query("UPDATE PlayerClasses SET ClassName = @1 WHERE AccountID = @0", accountId, className);
+                ExecuteNonQuery("UPDATE PlayerClasses SET ClassName = @1 WHERE AccountID = @0",
+                    ("@0", accountId), ("@1", className));
             }
         }
 
         private void DeleteClassFromDB(int accountId)
         {
-            _db.Query("DELETE FROM PlayerClasses WHERE AccountID = @0", accountId);
+            ExecuteNonQuery("DELETE FROM PlayerClasses WHERE AccountID = @0", ("@0", accountId));
         }
     }
 }
