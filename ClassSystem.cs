@@ -17,55 +17,29 @@ namespace ClassSystemPlugin
     {
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
-        public override string Description => "Account-bound class system with underworld lock before login, webbed lock only after login until class selection, starter gear replacement, strict cross-class weapon blocks without deleting items, +1 minion via Summoning buff (2 total minions at start), direct nerf on all whips from 1.0 base, boosted summon damage, gathering tool damage rules, quick /c shortcuts, hard Life Crystal usage block, custom stat modifiers, smooth update loop, and real-time HP/Mana sync.";
-        public override Version Version => new Version(15, 20, 12);
+        public override string Description => "Account-bound class system with underworld lock before login, webbed lock after login until class selection, starter gear, instant item drop on cross-class usage (ignoring coins/ammo/misc), Max HP modifiers per class + Summoning buff (+1 minion) only (other stat buffs/nerfs removed), quick /c shortcuts, Life Crystal limit, and real-time HP sync.";
+        public override Version Version => new Version(15, 24, 0);
 
         private SqliteConnection _db;
         private bool _dbReady;
         private readonly Dictionary<int, string> _playerClasses = new Dictionary<int, string>();
         private readonly Dictionary<int, Vector2> _frozenPositions = new Dictionary<int, Vector2>();
         private readonly Dictionary<int, DateTime> _warnCooldown = new Dictionary<int, DateTime>();
-        private readonly Dictionary<int, DateTime> _slotWarnCooldown = new Dictionary<int, DateTime>();
+        private readonly Dictionary<int, DateTime> _dropWarnCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, DateTime> _crystalWarnCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, DateTime> _summonBuffCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, int> _lastSyncedMaxLife = new Dictionary<int, int>();
-        private readonly Dictionary<int, int> _lastSyncedMaxMana = new Dictionary<int, int>();
         private DateTime _lastTickSync = DateTime.MinValue;
 
         private const int MaxLifeCrystalsAllowed = 15;
         private const int BaseStartHp = 100;
         private const int HpPerLifeCrystal = 20;
 
-        // Direct nerf on ALL whips from 1.0 base (e.g., -0.25 = -25% damage)
-        private const double WhipNerfMult = -0.25;
-
-        // Warrior stats
-        private const double WarriorMeleeDamageMult = 0.10;
+        // Max HP modifiers per class only
         private const int WarriorMaxHpFlat = 20;
-        private const double WarriorDefenseMult = 0.10;
-        private const double WarriorMoveSpeedMult = -0.15;
-        private const double WarriorLifeRegenMult = -0.20;
-
-        // Ranger stats
-        private const double RangerRangedDamageMult = 0.10;
-        private const double RangerMoveSpeedMult = 0.30;
         private const int RangerMaxHpFlat = -40;
-        private const double RangerDefenseMult = -0.15;
-        private const bool RangerArcheryBuff = true;
-
-        // Mage stats
-        private const double MageMagicDamageMult = 0.12;
-        private const double MageMoveSpeedMult = 0.15;
-        private const int MageMaxManaFlat = 80;
         private const int MageMaxHpFlat = -60;
-        private const double MageDefenseMult = -0.10;
-
-        // Summoner stats (+1 minion from Summoning buff = 2 minions at start; boosted summon damage; -80 Max HP; faster life regen)
-        private const double SummonerSummonDamageMult = 0.12;
-        private const double SummonerMoveSpeedMult = 0.20;
         private const int SummonerMaxHpFlat = -80;
-        private const double SummonerDefenseMult = -0.20;
-        private const double SummonerLifeRegenMult = 0.15;
 
         private readonly Dictionary<string, (short ItemId, int Stack)[]> _classStarterItems =
             new Dictionary<string, (short ItemId, int Stack)[]>
@@ -120,7 +94,6 @@ namespace ClassSystemPlugin
             PlayerHooks.PlayerPostLogin += OnPlayerPostLogin;
             GetDataHandlers.PlayerUpdate += OnPlayerUpdate;
             GetDataHandlers.PlayerSlot += OnPlayerSlot;
-            GetDataHandlers.PlayerDamage += OnPlayerDamage;
         }
 
         protected override void Dispose(bool disposing)
@@ -137,7 +110,6 @@ namespace ClassSystemPlugin
                 PlayerHooks.PlayerPostLogin -= OnPlayerPostLogin;
                 GetDataHandlers.PlayerUpdate -= OnPlayerUpdate;
                 GetDataHandlers.PlayerSlot -= OnPlayerSlot;
-                GetDataHandlers.PlayerDamage -= OnPlayerDamage;
 
                 if (_db != null)
                 {
@@ -162,58 +134,98 @@ namespace ClassSystemPlugin
             return currentBaseLife >= maxAllowedBaseLife;
         }
 
-        private void BlockItemUsage(TSPlayer player, bool cancelProjectiles)
+        private void CancelActivePlayerProjectiles(TSPlayer player)
+        {
+            if (player == null) return;
+            for (int i = 0; i < Main.maxProjectiles; i++)
+            {
+                var proj = Main.projectile[i];
+                if (proj != null && proj.active && proj.owner == player.Index && proj.friendly)
+                {
+                    proj.active = false;
+                    NetMessage.SendData((int)PacketTypes.ProjectileDestroy, -1, -1, null, i, player.Index);
+                }
+            }
+        }
+
+        private void BlockLifeCrystalUsage(TSPlayer player)
         {
             if (player?.TPlayer == null) return;
+            player.TPlayer.controlUseItem = false;
+            player.TPlayer.controlUseTile = false;
+            player.TPlayer.itemAnimation = 0;
+            player.TPlayer.itemAnimationMax = 0;
+            player.TPlayer.itemTime = 0;
+        }
+
+        private void DropDisallowedItemAndClearSlot(TSPlayer player, int slotIndex, Item itemToDrop, int fallbackType, int fallbackStack)
+        {
+            if (player?.TPlayer == null) return;
+
+            int itemType = itemToDrop != null && !itemToDrop.IsAir && itemToDrop.type > ItemID.None
+                ? itemToDrop.type
+                : fallbackType;
+
+            int stack = itemToDrop != null && itemToDrop.stack > 0
+                ? itemToDrop.stack
+                : Math.Max(1, fallbackStack);
+
+            byte prefix = itemToDrop != null ? itemToDrop.prefix : (byte)0;
+            string itemName = itemToDrop != null && !string.IsNullOrWhiteSpace(itemToDrop.Name)
+                ? itemToDrop.Name
+                : Lang.GetItemNameValue(itemType);
 
             player.TPlayer.controlUseItem = false;
             player.TPlayer.controlUseTile = false;
             player.TPlayer.itemAnimation = 0;
             player.TPlayer.itemAnimationMax = 0;
             player.TPlayer.itemTime = 0;
+            CancelActivePlayerProjectiles(player);
 
-            if (cancelProjectiles)
+            if (itemType > ItemID.None)
             {
-                for (int i = 0; i < Main.maxProjectiles; i++)
-                {
-                    var proj = Main.projectile[i];
-                    if (proj != null && proj.active && proj.owner == player.Index && proj.friendly)
-                    {
-                        proj.active = false;
-                        NetMessage.SendData((int)PacketTypes.ProjectileDestroy, -1, -1, null, i, player.Index);
-                    }
-                }
+                Item.NewItem(
+                    player.TPlayer.GetSource_DropAsItem(),
+                    player.TPlayer.position,
+                    player.TPlayer.width,
+                    player.TPlayer.height,
+                    itemType,
+                    stack,
+                    noBroadcast: false,
+                    prefixGiven: prefix,
+                    noGrabDelay: false
+                );
+            }
+
+            if (slotIndex >= 0 && slotIndex < player.TPlayer.inventory.Length)
+            {
+                player.TPlayer.inventory[slotIndex] = new Item();
+                player.TPlayer.inventory[slotIndex].TurnToAir();
+                NetMessage.SendData((int)PacketTypes.PlayerSlot, -1, -1, null, player.Index, slotIndex, 0, 0, 0);
+                NetMessage.SendData((int)PacketTypes.PlayerSlot, player.Index, -1, null, player.Index, slotIndex, 0, 0, 0);
+            }
+
+            if (!_dropWarnCooldown.TryGetValue(player.Index, out DateTime lastWarn) || (DateTime.UtcNow - lastWarn).TotalSeconds >= 2)
+            {
+                _dropWarnCooldown[player.Index] = DateTime.UtcNow;
+                string className = GetPlayerClass(player) ?? "class";
+                player.SendWarningMessage($"[ClassSystem] Dropped '{itemName}' — cannot be used by {className.ToUpper()}.");
             }
         }
 
-        private bool IsWhipItem(Item item)
+        private void DropHeldDisallowedItemIfAny(TSPlayer player, string currentClass)
         {
-            if (item == null || item.IsAir || item.type == ItemID.None) return false;
+            if (player?.TPlayer == null || string.IsNullOrEmpty(currentClass)) return;
 
-            if (item.summon && item.useStyle == ItemUseStyleID.Swing && item.noMelee)
-                return true;
-
-            return item.type == ItemID.BlandWhip ||
-                   item.type == ItemID.ThornWhip ||
-                   item.type == ItemID.BoneWhip ||
-                   item.type == ItemID.CoolWhip ||
-                   item.type == ItemID.SwordWhip ||
-                   item.type == ItemID.MaceWhip ||
-                   item.type == ItemID.ScytheWhip ||
-                   item.type == ItemID.RainbowWhip;
-        }
-
-        private bool HasClassLifeRegen(TSPlayer tsPlayer, string playerClass)
-        {
-            if (tsPlayer?.TPlayer == null) return false;
-
-            double classRegenMult = 0.0;
-            if (string.Equals(playerClass, "warrior", StringComparison.OrdinalIgnoreCase))
-                classRegenMult = WarriorLifeRegenMult;
-            else if (string.Equals(playerClass, "summoner", StringComparison.OrdinalIgnoreCase))
-                classRegenMult = SummonerLifeRegenMult;
-
-            return classRegenMult > 0.0 && tsPlayer.TPlayer.lifeRegen > 0;
+            int selected = player.TPlayer.selectedItem;
+            if (selected >= 0 && selected < player.TPlayer.inventory.Length)
+            {
+                Item held = player.TPlayer.inventory[selected];
+                if (held != null && !held.IsAir && held.type > ItemID.None && !IsItemAllowedForClass(held, currentClass))
+                {
+                    DropDisallowedItemAndClearSlot(player, selected, held, held.type, held.stack);
+                }
+            }
         }
 
         private void EnsureSummonerSummoningBuff(TSPlayer player)
@@ -237,46 +249,6 @@ namespace ClassSystemPlugin
             {
                 _summonBuffCooldown[player.Index] = DateTime.UtcNow;
                 player.SetBuff(BuffID.Summoning, 240, true);
-            }
-        }
-
-        private void OnPlayerDamage(object sender, GetDataHandlers.PlayerDamageEventArgs args)
-        {
-            var player = TShock.Players[args.ID];
-            if (player == null || !player.Active || !player.IsLoggedIn || player.Account == null) return;
-
-            string playerClass = GetPlayerClass(player);
-            if (string.IsNullOrEmpty(playerClass)) return;
-
-            double defenseMult = 0.0;
-            if (playerClass == "warrior") defenseMult = WarriorDefenseMult;
-            else if (playerClass == "ranger") defenseMult = RangerDefenseMult;
-            else if (playerClass == "mage") defenseMult = MageDefenseMult;
-            else if (playerClass == "summoner") defenseMult = SummonerDefenseMult;
-
-            if (Math.Abs(defenseMult) < 0.001) return;
-
-            int baseDef = Math.Max(0, player.TPlayer.statDefense);
-            int adjustedDef = Math.Max(0, (int)Math.Round(baseDef * (1.0 + defenseMult)));
-            int defDiff = adjustedDef - baseDef;
-
-            int hpDelta = (int)Math.Round(defDiff * 0.75);
-            if (hpDelta > 0)
-            {
-                int healBack = Math.Min(hpDelta, Math.Max(0, args.Damage - 1));
-                if (healBack > 0)
-                {
-                    player.TPlayer.statLife = Math.Min(player.TPlayer.statLifeMax2, player.TPlayer.statLife + healBack);
-                    NetMessage.SendData((int)PacketTypes.PlayerHp, -1, -1, null, player.Index);
-                    NetMessage.SendData((int)PacketTypes.PlayerHp, player.Index, -1, null, player.Index);
-                }
-            }
-            else if (hpDelta < 0)
-            {
-                int extraDamage = -hpDelta;
-                player.TPlayer.statLife = Math.Max(1, player.TPlayer.statLife - extraDamage);
-                NetMessage.SendData((int)PacketTypes.PlayerHp, -1, -1, null, player.Index);
-                NetMessage.SendData((int)PacketTypes.PlayerHp, player.Index, -1, null, player.Index);
             }
         }
 
@@ -457,7 +429,6 @@ namespace ClassSystemPlugin
                 _playerClasses[accountId] = savedClass;
                 ClearWebAndTeleportToSpawn(args.Player);
                 _lastSyncedMaxLife.Remove(args.Player.Index);
-                _lastSyncedMaxMana.Remove(args.Player.Index);
                 ApplyClassStats(args.Player, savedClass);
                 if (savedClass == "summoner")
                 {
@@ -481,11 +452,10 @@ namespace ClassSystemPlugin
             }
             _frozenPositions.Remove(args.Who);
             _warnCooldown.Remove(args.Who);
-            _slotWarnCooldown.Remove(args.Who);
+            _dropWarnCooldown.Remove(args.Who);
             _crystalWarnCooldown.Remove(args.Who);
             _summonBuffCooldown.Remove(args.Who);
             _lastSyncedMaxLife.Remove(args.Who);
-            _lastSyncedMaxMana.Remove(args.Who);
         }
 
         private bool IsGatheringTool(Item item)
@@ -494,9 +464,31 @@ namespace ClassSystemPlugin
             return item.pick > 0 || item.axe > 0 || item.hammer > 0;
         }
 
+        private bool IsCoinOrAmmoOrMisc(Item item)
+        {
+            if (item == null || item.IsAir || item.type == ItemID.None) return true;
+
+            if (item.type == ItemID.CopperCoin ||
+                item.type == ItemID.SilverCoin ||
+                item.type == ItemID.GoldCoin ||
+                item.type == ItemID.PlatinumCoin)
+            {
+                return true;
+            }
+
+            if (item.ammo > 0 || item.useStyle == ItemUseStyleID.None)
+            {
+                return true;
+            }
+
+            return false;
+        }
+
         private bool IsItemAllowedForClass(Item item, string className)
         {
             if (item == null || item.IsAir || item.type == ItemID.None) return true;
+
+            if (IsCoinOrAmmoOrMisc(item)) return true;
 
             if (IsGatheringTool(item)) return true;
 
@@ -520,16 +512,6 @@ namespace ClassSystemPlugin
                     return item.summon;
                 default:
                     return false;
-            }
-        }
-
-        private void NotifyBlockedItem(TSPlayer player, string itemName, string className)
-        {
-            if (player == null || string.IsNullOrWhiteSpace(itemName)) return;
-            if (!_slotWarnCooldown.TryGetValue(player.Index, out DateTime lastWarn) || (DateTime.UtcNow - lastWarn).TotalSeconds >= 3)
-            {
-                _slotWarnCooldown[player.Index] = DateTime.UtcNow;
-                player.SendWarningMessage($"[ClassSystem] Blocked '{itemName}' — cannot be used by {className.ToUpper()} (kept in inventory).");
             }
         }
 
@@ -578,13 +560,12 @@ namespace ClassSystemPlugin
 
                     if (held != null && !held.IsAir && held.type == ItemID.LifeCrystal && IsLifeCrystalAtLimit(player))
                     {
-                        BlockItemUsage(player, false);
+                        BlockLifeCrystalUsage(player);
                         NotifyBlockedLifeCrystal(player);
                     }
-                    else if (held != null && !held.IsAir && !IsItemAllowedForClass(held, currentClass))
+                    else if (player.TPlayer.controlUseItem || (held != null && !held.IsAir && !IsItemAllowedForClass(held, currentClass)))
                     {
-                        BlockItemUsage(player, true);
-                        NotifyBlockedItem(player, held.Name, currentClass);
+                        DropHeldDisallowedItemIfAny(player, currentClass);
                     }
                 }
             }
@@ -601,19 +582,22 @@ namespace ClassSystemPlugin
             if (args.Type == ItemID.LifeCrystal && IsLifeCrystalAtLimit(player))
             {
                 args.Handled = true;
-                BlockItemUsage(player, false);
+                BlockLifeCrystalUsage(player);
                 NotifyBlockedLifeCrystal(player);
                 return;
             }
 
             Item testItem = new Item();
             testItem.SetDefaults(args.Type);
+            testItem.stack = Math.Max(1, (int)args.Stack);
 
             if (!IsItemAllowedForClass(testItem, currentClass))
             {
                 args.Handled = true;
-                BlockItemUsage(player, true);
-                NotifyBlockedItem(player, Lang.GetItemNameValue(args.Type), currentClass);
+                Item existing = (args.Slot >= 0 && args.Slot < player.TPlayer.inventory.Length)
+                    ? player.TPlayer.inventory[args.Slot]
+                    : null;
+                DropDisallowedItemAndClearSlot(player, args.Slot, existing, args.Type, args.Stack);
             }
         }
 
@@ -659,19 +643,6 @@ namespace ClassSystemPlugin
                         EnsureSummonerSummoningBuff(player);
                     }
                 }
-
-                if (runPeriodicSync && playerClass == "ranger" && RangerArcheryBuff)
-                {
-                    for (int i = 0; i < Main.maxProjectiles; i++)
-                    {
-                        var proj = Main.projectile[i];
-                        if (proj != null && proj.active && proj.owner == player.Index && proj.ranged && proj.ai[1] == 0f)
-                        {
-                            proj.velocity *= 1.02f;
-                            proj.ai[1] = 1f;
-                        }
-                    }
-                }
             }
         }
 
@@ -689,70 +660,11 @@ namespace ClassSystemPlugin
 
             var heldItem = args.Player.HeldItem;
 
-            // 1. บล็อกอาวุธ/ของไม่ตรงคลาสก่อนทุกอย่าง (ไม่ลบของออกจากตัว)
+            // ดรอปอาวุธ/ของไม่ตรงคลาสทันทีเมื่อใช้โจมตี
             if (heldItem != null && !heldItem.IsAir && !IsItemAllowedForClass(heldItem, playerClass))
             {
                 args.Damage = 0;
-                BlockItemUsage(tsPlayer, true);
-                NotifyBlockedItem(tsPlayer, heldItem.Name, playerClass);
-                return;
-            }
-
-            // 2. เนิฟแส้ทุกกระบอก (คิดจากฐาน 1.0 + WhipNerfMult)
-            if (IsWhipItem(heldItem))
-            {
-                if (args.Damage > 0)
-                {
-                    double whipMult = Math.Max(0.0, 1.0 + WhipNerfMult);
-                    int nerfedDamage = (int)Math.Round(args.Damage * whipMult);
-                    args.Damage = Math.Max(1, nerfedDamage);
-                }
-                return;
-            }
-
-            // 3. กฎเครื่องมือขุด/ตัด/ทุบ
-            if (heldItem != null && IsGatheringTool(heldItem))
-            {
-                if (!HasClassLifeRegen(tsPlayer, playerClass))
-                {
-                    args.Damage = 0;
-                    return;
-                }
-
-                if (string.Equals(playerClass, "summoner", StringComparison.OrdinalIgnoreCase) && args.Damage > 0)
-                {
-                    args.Damage = Math.Max(1, (int)Math.Round(args.Damage * (1.0 + SummonerSummonDamageMult)));
-                }
-                return;
-            }
-
-            // 4. คลาส Summoner (ดาเมจซัมม่อน/การโจมตีที่ไม่ใช่แส้)
-            if (playerClass == "summoner")
-            {
-                if (args.Damage > 0)
-                {
-                    args.Damage = Math.Max(1, (int)Math.Round(args.Damage * (1.0 + SummonerSummonDamageMult)));
-                }
-                return;
-            }
-
-            if (heldItem == null) return;
-
-            // 5. ตัวคูณดาเมจคลาสอื่นๆ
-            if (args.Damage > 0)
-            {
-                if (playerClass == "warrior" && heldItem.melee)
-                {
-                    args.Damage = Math.Max(1, (int)Math.Round(args.Damage * (1.0 + WarriorMeleeDamageMult)));
-                }
-                else if (playerClass == "ranger" && heldItem.ranged)
-                {
-                    args.Damage = Math.Max(1, (int)Math.Round(args.Damage * (1.0 + RangerRangedDamageMult)));
-                }
-                else if (playerClass == "mage" && heldItem.magic)
-                {
-                    args.Damage = Math.Max(1, (int)Math.Round(args.Damage * (1.0 + MageMagicDamageMult)));
-                }
+                DropHeldDisallowedItemIfAny(tsPlayer, playerClass);
             }
         }
 
@@ -845,9 +757,8 @@ namespace ClassSystemPlugin
                 EnsureSummonerSummoningBuff(args.Player);
             }
             _lastSyncedMaxLife.Remove(args.Player.Index);
-            _lastSyncedMaxMana.Remove(args.Player.Index);
             ApplyClassStats(args.Player, chosen);
-            args.Player.SendSuccessMessage($"[ClassSystem] Class selected: {chosen.ToUpper()}! Web cleared, starter gear equipped, and stats synced.");
+            args.Player.SendSuccessMessage($"[ClassSystem] Class selected: {chosen.ToUpper()}! Web cleared, starter gear equipped, and Max HP synced.");
         }
 
         private void CmdSetClass(CommandArgs args)
@@ -878,7 +789,6 @@ namespace ClassSystemPlugin
                 DeleteClassFromDB(target.Account.ID);
                 _playerClasses.Remove(target.Account.ID);
                 _lastSyncedMaxLife.Remove(target.Index);
-                _lastSyncedMaxMana.Remove(target.Index);
                 ApplyUnderworldLock(target, true);
                 target.SendWarningMessage("[ClassSystem] Your class has been reset. You are webbed in the Underworld until you select a class with /c <Me|Rg|Mg|sm> or /class.");
                 args.Player.SendSuccessMessage($"Reset class for {target.Name}.");
@@ -901,7 +811,6 @@ namespace ClassSystemPlugin
                 EnsureSummonerSummoningBuff(target);
             }
             _lastSyncedMaxLife.Remove(target.Index);
-            _lastSyncedMaxMana.Remove(target.Index);
             ApplyClassStats(target, resolvedOption);
             target.SendSuccessMessage($"[ClassSystem] Admin set your class to {resolvedOption.ToUpper()}.");
             args.Player.SendSuccessMessage($"Set {target.Name}'s class to {resolvedOption.ToUpper()}.");
@@ -927,37 +836,22 @@ namespace ClassSystemPlugin
             int currentBaseLife = Math.Min(Math.Max(BaseStartHp, rawBaseLife), maxAllowedBaseLife);
 
             int targetMaxLife = currentBaseLife;
-            int targetMaxMana = tPlayer.statManaMax;
 
             if (className == "warrior")
             {
                 targetMaxLife = Math.Max(40, currentBaseLife + WarriorMaxHpFlat);
-                tPlayer.moveSpeed *= (float)(1.0 + WarriorMoveSpeedMult);
-                if (tPlayer.lifeRegen > 0)
-                {
-                    tPlayer.lifeRegen = (int)Math.Round(tPlayer.lifeRegen * (1.0 + WarriorLifeRegenMult));
-                }
             }
             else if (className == "ranger")
             {
                 targetMaxLife = Math.Max(40, currentBaseLife + RangerMaxHpFlat);
-                tPlayer.moveSpeed *= (float)(1.0 + RangerMoveSpeedMult);
             }
             else if (className == "mage")
             {
                 targetMaxLife = Math.Max(40, currentBaseLife + MageMaxHpFlat);
-                targetMaxMana = tPlayer.statManaMax + MageMaxManaFlat;
-                tPlayer.statManaMax2 = targetMaxMana;
-                tPlayer.moveSpeed *= (float)(1.0 + MageMoveSpeedMult);
             }
             else if (className == "summoner")
             {
                 targetMaxLife = Math.Max(20, currentBaseLife + SummonerMaxHpFlat);
-                tPlayer.moveSpeed *= (float)(1.0 + SummonerMoveSpeedMult);
-                if (tPlayer.lifeRegen > 0)
-                {
-                    tPlayer.lifeRegen = (int)Math.Round(tPlayer.lifeRegen * (1.0 + SummonerLifeRegenMult));
-                }
             }
 
             tPlayer.statLifeMax = targetMaxLife;
@@ -973,13 +867,6 @@ namespace ClassSystemPlugin
                 _lastSyncedMaxLife[player.Index] = targetMaxLife;
                 NetMessage.SendData((int)PacketTypes.PlayerHp, -1, -1, null, player.Index);
                 NetMessage.SendData((int)PacketTypes.PlayerHp, player.Index, -1, null, player.Index);
-            }
-
-            if (className == "mage" && (!_lastSyncedMaxMana.TryGetValue(player.Index, out int lastMaxMana) || lastMaxMana != targetMaxMana))
-            {
-                _lastSyncedMaxMana[player.Index] = targetMaxMana;
-                NetMessage.SendData((int)PacketTypes.PlayerMana, -1, -1, null, player.Index);
-                NetMessage.SendData((int)PacketTypes.PlayerMana, player.Index, -1, null, player.Index);
             }
         }
 
