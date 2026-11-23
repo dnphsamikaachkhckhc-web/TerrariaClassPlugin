@@ -21,8 +21,8 @@ namespace ClassSystemPlugin
     {
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
-        public override string Description => "Account-bound class system with underworld lock before login, webbed lock after login until class selection, starter gear, full-inventory cross-class weapon/armor drop & pickup lock (accessories allowed freely), Max HP modifiers per class + Summoning buff (+1 minion) only, quick /c shortcuts, Life Crystal limit, and real-time HP sync.";
-        public override Version Version => new Version(15, 26, 6);
+        public override string Description => "Account-bound class system with underworld lock before login, webbed lock after login until class selection, starter gear, full-inventory cross-class weapon/armor drop & pickup lock (accessories allowed freely), Max HP modifiers per class + Summoning buff (+1 minion) only, +15% Honey buff life regen for Summoner only, uncleansable 5% Broken Armor reduction for Summoner, quick /c shortcuts, Life Crystal limit, and real-time HP sync.";
+        public override Version Version => new Version(15, 29, 0);
 
         private SqliteConnection _db;
         private bool _dbReady;
@@ -33,11 +33,17 @@ namespace ClassSystemPlugin
         private readonly Dictionary<int, DateTime> _crystalWarnCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, DateTime> _summonBuffCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, int> _lastSyncedMaxLife = new Dictionary<int, int>();
+        private readonly Dictionary<int, double> _honeyRegenAccumulator = new Dictionary<int, double>();
+        private readonly Dictionary<int, int> _preBrokenArmorDefense = new Dictionary<int, int>();
+        private readonly Dictionary<int, DateTime> _brokenArmorExpiresAt = new Dictionary<int, DateTime>();
         private DateTime _lastTickSync = DateTime.MinValue;
+        private DateTime _lastHoneyTick = DateTime.UtcNow;
 
         private const int MaxLifeCrystalsAllowed = 15;
         private const int BaseStartHp = 100;
         private const int HpPerLifeCrystal = 20;
+        private const double HoneyBonusLifeRegenMultiplier = 0.15;
+        private const double SummonerBrokenArmorReduction = 0.05; // ลดเกราะ 5% เฉพาะสาย Summoner
 
         // Max HP modifiers per class only
         private const int WarriorMaxHpFlat = 20;
@@ -67,7 +73,7 @@ namespace ClassSystemPlugin
             ["sm"] = "summoner"
         };
 
-        // ชุดเกราะที่แยกสายชัดเจน (กรองแล้ว: เอาชุดที่ไม่มีใน ID ออก)
+        // ชุดเกราะที่แยกสายชัดเจน (ไม่รวมเครื่องประดับเพราะเครื่องประดับใส่อะไรก็ได้)
         private readonly Dictionary<int, string> _restrictedArmors = new Dictionary<int, string>
         {
             // Pre-Hardmode Melee / Warrior
@@ -241,6 +247,131 @@ namespace ClassSystemPlugin
                 }
             }
             base.Dispose(disposing);
+        }
+
+        private bool HasBuff(TSPlayer player, int buffId, out int remainingTicks)
+        {
+            remainingTicks = 0;
+            if (player?.TPlayer == null) return false;
+            for (int i = 0; i < Player.maxBuffs; i++)
+            {
+                if (player.TPlayer.buffType[i] == buffId && player.TPlayer.buffTime[i] > 0)
+                {
+                    remainingTicks = player.TPlayer.buffTime[i];
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private bool HasBuff(TSPlayer player, int buffId)
+        {
+            return HasBuff(player, buffId, out _);
+        }
+
+        private void ApplySummonerBrokenArmor5Percent(TSPlayer player, string playerClass, DateTime now)
+        {
+            if (player?.TPlayer == null || !player.Active) return;
+
+            var tPlayer = player.TPlayer;
+            bool isSummoner = string.Equals(playerClass, "summoner", StringComparison.OrdinalIgnoreCase);
+
+            if (!isSummoner)
+            {
+                _preBrokenArmorDefense.Remove(player.Index);
+                _brokenArmorExpiresAt.Remove(player.Index);
+                return;
+            }
+
+            if (tPlayer.dead)
+            {
+                _preBrokenArmorDefense.Remove(player.Index);
+                _brokenArmorExpiresAt.Remove(player.Index);
+                return;
+            }
+
+            bool hasBrokenArmor = HasBuff(player, BuffID.BrokenArmor, out int remainingTicks);
+
+            if (hasBrokenArmor)
+            {
+                // อัปเดตเวลาหมดอายุของสถานะเกราะแตก
+                double secLeft = Math.Max(0.1, remainingTicks / 60.0);
+                DateTime newExpiry = now.AddSeconds(secLeft);
+                if (!_brokenArmorExpiresAt.TryGetValue(player.Index, out DateTime existingExpiry) || newExpiry > existingExpiry)
+                {
+                    _brokenArmorExpiresAt[player.Index] = newExpiry;
+                }
+            }
+            else if (_brokenArmorExpiresAt.TryGetValue(player.Index, out DateTime expiry) && now < expiry)
+            {
+                // หากถูกของล้างดีบัฟ/ของกันดีบัฟลบออกก่อนหมดเวลา ให้คืนบัฟเกราะแตกกลับเข้าไปทันที
+                int ticksToRestore = Math.Max(1, (int)Math.Ceiling((expiry - now).TotalSeconds * 60.0));
+                player.SetBuff(BuffID.BrokenArmor, ticksToRestore, true);
+                hasBrokenArmor = true;
+            }
+            else
+            {
+                _preBrokenArmorDefense.Remove(player.Index);
+                _brokenArmorExpiresAt.Remove(player.Index);
+                return;
+            }
+
+            if (!hasBrokenArmor) return;
+
+            int currentDef = Math.Max(0, tPlayer.statDefense);
+            if (!_preBrokenArmorDefense.TryGetValue(player.Index, out int originalDef) || originalDef <= 0)
+            {
+                originalDef = currentDef > 0 ? Math.Max(currentDef, currentDef * 2) : 0;
+                _preBrokenArmorDefense[player.Index] = originalDef;
+            }
+            else if (currentDef > originalDef)
+            {
+                originalDef = currentDef;
+                _preBrokenArmorDefense[player.Index] = originalDef;
+            }
+
+            int reducedAmount = (int)Math.Floor(originalDef * SummonerBrokenArmorReduction);
+            int targetDefense = Math.Max(0, originalDef - reducedAmount);
+            tPlayer.statDefense = targetDefense;
+        }
+
+        private void ApplyHoneyRegenBonus(TSPlayer player, string playerClass, double deltaSeconds)
+        {
+            if (player?.TPlayer == null || !player.Active || player.TPlayer.dead) return;
+
+            if (!string.Equals(playerClass, "summoner", StringComparison.OrdinalIgnoreCase) || !HasBuff(player, BuffID.Honey))
+            {
+                _honeyRegenAccumulator.Remove(player.Index);
+                return;
+            }
+
+            var tPlayer = player.TPlayer;
+            int baseRegen = Math.Max(0, tPlayer.lifeRegen);
+            int bonusRegen = baseRegen > 0
+                ? Math.Max(1, (int)Math.Ceiling(baseRegen * HoneyBonusLifeRegenMultiplier))
+                : 0;
+            tPlayer.lifeRegen += bonusRegen;
+
+            if (tPlayer.statLife > 0 && tPlayer.statLife < tPlayer.statLifeMax2 && deltaSeconds > 0)
+            {
+                double effectiveHpPerSec = Math.Max(0.25, (baseRegen * 0.5) * HoneyBonusLifeRegenMultiplier);
+                _honeyRegenAccumulator.TryGetValue(player.Index, out double acc);
+                acc += effectiveHpPerSec * deltaSeconds;
+
+                int healAmount = (int)Math.Floor(acc);
+                if (healAmount > 0)
+                {
+                    acc -= healAmount;
+                    int newLife = Math.Min(tPlayer.statLifeMax2, tPlayer.statLife + healAmount);
+                    if (newLife > tPlayer.statLife)
+                    {
+                        tPlayer.statLife = newLife;
+                        NetMessage.SendData((int)PacketTypes.PlayerHp, -1, -1, null, player.Index);
+                        NetMessage.SendData((int)PacketTypes.PlayerHp, player.Index, -1, null, player.Index);
+                    }
+                }
+                _honeyRegenAccumulator[player.Index] = acc;
+            }
         }
 
         private int GetMaxAllowedBaseLife()
@@ -652,6 +783,9 @@ namespace ClassSystemPlugin
             _crystalWarnCooldown.Remove(args.Who);
             _summonBuffCooldown.Remove(args.Who);
             _lastSyncedMaxLife.Remove(args.Who);
+            _honeyRegenAccumulator.Remove(args.Who);
+            _preBrokenArmorDefense.Remove(args.Who);
+            _brokenArmorExpiresAt.Remove(args.Who);
         }
 
         private bool IsGatheringTool(Item item)
@@ -804,10 +938,14 @@ namespace ClassSystemPlugin
 
         private void OnGameUpdate(EventArgs args)
         {
-            bool runPeriodicSync = (DateTime.UtcNow - _lastTickSync).TotalMilliseconds >= 100;
+            DateTime now = DateTime.UtcNow;
+            double honeyDeltaSec = Math.Min(1.0, (now - _lastHoneyTick).TotalSeconds);
+            _lastHoneyTick = now;
+
+            bool runPeriodicSync = (now - _lastTickSync).TotalMilliseconds >= 100;
             if (runPeriodicSync)
             {
-                _lastTickSync = DateTime.UtcNow;
+                _lastTickSync = now;
             }
 
             foreach (var player in TShock.Players)
@@ -816,6 +954,9 @@ namespace ClassSystemPlugin
 
                 if (!player.IsLoggedIn || player.Account == null)
                 {
+                    _honeyRegenAccumulator.Remove(player.Index);
+                    _preBrokenArmorDefense.Remove(player.Index);
+                    _brokenArmorExpiresAt.Remove(player.Index);
                     if (runPeriodicSync)
                     {
                         ApplyUnderworldLock(player, false);
@@ -826,6 +967,9 @@ namespace ClassSystemPlugin
                 string playerClass = GetPlayerClass(player);
                 if (string.IsNullOrEmpty(playerClass))
                 {
+                    _honeyRegenAccumulator.Remove(player.Index);
+                    _preBrokenArmorDefense.Remove(player.Index);
+                    _brokenArmorExpiresAt.Remove(player.Index);
                     if (runPeriodicSync)
                     {
                         ApplyUnderworldLock(player, true);
@@ -833,7 +977,9 @@ namespace ClassSystemPlugin
                     continue;
                 }
 
+                ApplyHoneyRegenBonus(player, playerClass, honeyDeltaSec);
                 ApplyClassStats(player, playerClass);
+                ApplySummonerBrokenArmor5Percent(player, playerClass, now);
 
                 if (runPeriodicSync)
                 {
