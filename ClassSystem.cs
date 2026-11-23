@@ -18,7 +18,7 @@ namespace ClassSystemPlugin
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
         public override string Description => "Account-bound class system with underworld lock before login, webbed lock only after login until class selection, starter gear replacement, strict weapon locks, automatic extra minion maintenance, custom stat modifiers, and real-time HP/Mana sync.";
-        public override Version Version => new Version(15, 10, 0);
+        public override Version Version => new Version(15, 10, 1);
 
         private SqliteConnection _db;
         private bool _dbReady;
@@ -107,7 +107,6 @@ namespace ClassSystemPlugin
             GetDataHandlers.PlayerUpdate += OnPlayerUpdate;
             GetDataHandlers.PlayerSlot += OnPlayerSlot;
             GetDataHandlers.PlayerDamage += OnPlayerDamage;
-            GetDataHandlers.KillProjectile += OnKillProjectile;
         }
 
         protected override void Dispose(bool disposing)
@@ -125,7 +124,6 @@ namespace ClassSystemPlugin
                 GetDataHandlers.PlayerUpdate -= OnPlayerUpdate;
                 GetDataHandlers.PlayerSlot -= OnPlayerSlot;
                 GetDataHandlers.PlayerDamage -= OnPlayerDamage;
-                GetDataHandlers.KillProjectile -= OnKillProjectile;
 
                 if (_db != null)
                 {
@@ -134,25 +132,6 @@ namespace ClassSystemPlugin
                 }
             }
             base.Dispose(disposing);
-        }
-
-        private void OnKillProjectile(object sender, GetDataHandlers.KillProjectileEventArgs args)
-        {
-            if (args.Index < 0 || args.Index >= Main.maxProjectiles) return;
-            var proj = Main.projectile[args.Index];
-            if (proj == null || !proj.active || !proj.minion) return;
-
-            var player = TShock.Players[args.PlayerId];
-            if (player == null || !player.Active || !player.IsLoggedIn || player.Account == null) return;
-
-            string playerClass = GetPlayerClass(player);
-            if (!string.Equals(playerClass, "summoner", StringComparison.OrdinalIgnoreCase)) return;
-
-            // Block client auto-despawn of extra minions spawned by the class bonus
-            if (proj.localAI[1] == 999f && !player.TPlayer.dead)
-            {
-                args.Handled = true;
-            }
         }
 
         private void MaintainSummonerMinions(TSPlayer player)
@@ -182,7 +161,6 @@ namespace ClassSystemPlugin
                 }
             }
 
-            // If player has no active base minion, clean up any plugin-cloned minions
             if (templateMinion == null)
             {
                 for (int i = 0; i < Main.maxProjectiles; i++)
@@ -978,3 +956,4 @@ namespace ClassSystemPlugin
         }
     }
 }
+using System;
