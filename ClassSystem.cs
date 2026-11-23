@@ -18,7 +18,7 @@ namespace ClassSystemPlugin
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
         public override string Description => "Account-bound class system with underworld lock before login, webbed lock only after login until class selection, starter gear replacement, hard usage blocks without deleting items, +1 minion via Summoning buff (2 total minions at start), direct nerf on all whips from 1.0 base, boosted summon damage, gathering tool damage rules, quick /c shortcuts, hard Life Crystal usage block, custom stat modifiers, smooth update loop, and real-time HP/Mana sync.";
-        public override Version Version => new Version(15, 20, 8);
+        public override Version Version => new Version(15, 20, 9);
 
         private SqliteConnection _db;
         private bool _dbReady;
@@ -677,7 +677,7 @@ namespace ClassSystemPlugin
 
         private void OnNpcStrike(NpcStrikeEventArgs args)
         {
-            if (args.Player == null) return;
+            if (args.Player == null || args.Npc == null) return;
             int playerIndex = Array.IndexOf(Main.player, args.Player);
             if (playerIndex < 0 || playerIndex >= TShock.Players.Length) return;
 
@@ -689,38 +689,47 @@ namespace ClassSystemPlugin
 
             var heldItem = args.Player.HeldItem;
 
-            // เนิฟแส้ทุกกระบอกทันที (คิดจากฐาน 1.0 + WhipNerfMult) โดยไม่ยิงแพ็กเก็ตเพิ่มตอนตีปกติ
+            // 1. เนิฟแส้ทุกกระบอก (คิดจากฐาน 1.0 + WhipNerfMult)
             if (IsWhipItem(heldItem))
             {
-                double whipMult = Math.Max(0.0, 1.0 + WhipNerfMult);
-                int nerfedDamage = (int)Math.Floor(args.Damage * whipMult);
-                args.Damage = args.Damage > 1 ? Math.Max(1, nerfedDamage) : Math.Max(0, nerfedDamage);
+                if (args.Damage > 0)
+                {
+                    double whipMult = Math.Max(0.0, 1.0 + WhipNerfMult);
+                    int nerfedDamage = (int)Math.Round(args.Damage * whipMult);
+                    args.Damage = Math.Max(1, nerfedDamage);
+                }
                 return;
             }
 
+            // 2. กฎเครื่องมือขุด/ตัด/ทุบ
             if (heldItem != null && IsGatheringTool(heldItem))
             {
-                if (HasClassLifeRegen(tsPlayer, playerClass))
+                if (!HasClassLifeRegen(tsPlayer, playerClass))
                 {
-                    if (string.Equals(playerClass, "summoner", StringComparison.OrdinalIgnoreCase))
-                    {
-                        args.Damage = Math.Max(1, (int)Math.Round(args.Damage * (1.0 + SummonerSummonDamageMult)));
-                    }
+                    args.Damage = 0;
                     return;
                 }
 
-                args.Damage = 0;
+                if (string.Equals(playerClass, "summoner", StringComparison.OrdinalIgnoreCase) && args.Damage > 0)
+                {
+                    args.Damage = Math.Max(1, (int)Math.Round(args.Damage * (1.0 + SummonerSummonDamageMult)));
+                }
                 return;
             }
 
+            // 3. คลาส Summoner (ดาเมจซัมม่อน/การโจมตีที่ไม่ใช่แส้)
             if (playerClass == "summoner")
             {
-                args.Damage = Math.Max(1, (int)Math.Round(args.Damage * (1.0 + SummonerSummonDamageMult)));
+                if (args.Damage > 0)
+                {
+                    args.Damage = Math.Max(1, (int)Math.Round(args.Damage * (1.0 + SummonerSummonDamageMult)));
+                }
                 return;
             }
 
             if (heldItem == null) return;
 
+            // 4. บล็อกอาวุธ/ของไม่ตรงคลาส (ไม่ลบของออกจากตัว)
             if (!IsItemAllowedForClass(heldItem, playerClass))
             {
                 args.Damage = 0;
@@ -729,17 +738,21 @@ namespace ClassSystemPlugin
                 return;
             }
 
-            if (playerClass == "warrior" && heldItem.melee)
+            // 5. ตัวคูณดาเมจคลาสอื่นๆ
+            if (args.Damage > 0)
             {
-                args.Damage = (int)Math.Round(args.Damage * (1.0 + WarriorMeleeDamageMult));
-            }
-            else if (playerClass == "ranger" && heldItem.ranged)
-            {
-                args.Damage = (int)Math.Round(args.Damage * (1.0 + RangerRangedDamageMult));
-            }
-            else if (playerClass == "mage" && heldItem.magic)
-            {
-                args.Damage = (int)Math.Round(args.Damage * (1.0 + MageMagicDamageMult));
+                if (playerClass == "warrior" && heldItem.melee)
+                {
+                    args.Damage = Math.Max(1, (int)Math.Round(args.Damage * (1.0 + WarriorMeleeDamageMult)));
+                }
+                else if (playerClass == "ranger" && heldItem.ranged)
+                {
+                    args.Damage = Math.Max(1, (int)Math.Round(args.Damage * (1.0 + RangerRangedDamageMult)));
+                }
+                else if (playerClass == "mage" && heldItem.magic)
+                {
+                    args.Damage = Math.Max(1, (int)Math.Round(args.Damage * (1.0 + MageMagicDamageMult)));
+                }
             }
         }
 
