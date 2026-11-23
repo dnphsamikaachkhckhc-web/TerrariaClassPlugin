@@ -28,7 +28,7 @@ namespace ClassSystemPlugin
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
         public override string Description => "Class & starter-choice (/ch 1|2) system with custom class-selection and per-class starter-weapon prompts, server-wide broadcasts during selection phases, underworld lock before login, webbed lock in underworld until completed, inventory weapon wipe on /ch selection, permanent class/choice buffs & debuffs, Max HP modifiers, cross-class item ejection, Life Crystal cap, and real-time HP sync.";
-        public override Version Version => new Version(16, 3, 0);
+        public override Version Version => new Version(16, 3, 1);
 
         private const string ClassSelectPrompt =
             "Chat by Shokuya :3 Please select your class >w<\n\n" +
@@ -490,7 +490,7 @@ namespace ClassSystemPlugin
             {
                 float moveDeltaX = tPlayer.velocity.X * delta;
                 tPlayer.position.X += moveDeltaX;
-                NetMessage.SendData((int)PacketTypes.PlayerControls, -1, -1, null, player.Index);
+                NetMessage.SendData((int)PacketTypes.PlayerUpdate, -1, -1, null, player.Index);
             }
         }
 
@@ -1551,8 +1551,8 @@ namespace ClassSystemPlugin
             }
             else if (c == "summoner")
             {
-                if (choice == 1) return new[] { (ItemID.Cattiva, 1) };
-                if (choice == 2) return new[] { (ItemID.LeatherWhip, 1) };
+                if (choice == 1) return new[] { (ItemID.SlimeStaff, 1) };
+                if (choice == 2) return new[] { (ItemID.ThornWhip, 1) };
             }
             return Array.Empty<(short, int)>();
         }
