@@ -16,7 +16,7 @@ namespace ClassSystemPlugin
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
         public override string Description => "Account-bound class system with movement lock before selection, starter weapon loadouts, item restrictions, Life Crystal cap, and custom buffs/nerfs.";
-        public override Version Version => new Version(15, 0, 0);
+        public override Version Version => new Version(15, 0, 1);
 
         private IDbConnection _db;
         private readonly Dictionary<int, string> _playerClasses = new Dictionary<int, string>();
@@ -111,14 +111,34 @@ namespace ClassSystemPlugin
             base.Dispose(disposing);
         }
 
+        private void EnsureConnectionOpen()
+        {
+            if (_db == null)
+            {
+                _db = TShock.DB;
+            }
+            if (_db != null && _db.State != ConnectionState.Open)
+            {
+                _db.Open();
+            }
+        }
+
         private void SetupDatabase()
         {
-            _db = TShock.DB;
-            ExecuteNonQuery("CREATE TABLE IF NOT EXISTS PlayerClasses (AccountID INT PRIMARY KEY, ClassName VARCHAR(32))");
+            try
+            {
+                _db = TShock.DB;
+                ExecuteNonQuery("CREATE TABLE IF NOT EXISTS PlayerClasses (AccountID INT PRIMARY KEY, ClassName VARCHAR(32))");
+            }
+            catch (Exception ex)
+            {
+                TShock.Log.Error($"[ClassSystem] SetupDatabase error: {ex.Message}");
+            }
         }
 
         private void ExecuteNonQuery(string sql, params (string Name, object Value)[] parameters)
         {
+            EnsureConnectionOpen();
             if (_db == null) return;
             using (var cmd = _db.CreateCommand())
             {
@@ -425,6 +445,7 @@ namespace ClassSystemPlugin
 
         private string GetClassFromDB(int accountId)
         {
+            EnsureConnectionOpen();
             if (_db == null) return null;
             using (var cmd = _db.CreateCommand())
             {
