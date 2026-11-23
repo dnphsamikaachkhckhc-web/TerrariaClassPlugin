@@ -17,7 +17,7 @@ namespace ClassSystemPlugin
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
         public override string Description => "Account-bound class system with underworld lock before login/class selection, starter weapon loadouts, item restrictions, Life Crystal cap, and custom buffs/nerfs.";
-        public override Version Version => new Version(15, 3, 1);
+        public override Version Version => new Version(15, 3, 2);
 
         private SqliteConnection _db;
         private bool _dbReady;
@@ -316,7 +316,7 @@ namespace ClassSystemPlugin
                 {
                     args.Handled = true;
                     player.TPlayer.inventory[args.Slot] = new Item();
-                    NetMessage.SendData(PacketTypes.PlayerSlot, -1, -1, null, player.Index, args.Slot, 0, 0, 0);
+                    NetMessage.SendData((int)PacketTypes.PlayerSlot, -1, -1, null, player.Index, args.Slot, 0, 0, 0);
 
                     if (!_slotWarnCooldown.TryGetValue(player.Index, out DateTime lastWarn) || (DateTime.UtcNow - lastWarn).TotalSeconds >= 3)
                     {
@@ -413,8 +413,8 @@ namespace ClassSystemPlugin
 
                 if (placedSlot >= 0)
                 {
-                    NetMessage.SendData(PacketTypes.PlayerSlot, -1, -1, null, player.Index, placedSlot, item.prefix, 0, 0);
-                    NetMessage.SendData(PacketTypes.PlayerSlot, player.Index, -1, null, player.Index, placedSlot, item.prefix, 0, 0);
+                    NetMessage.SendData((int)PacketTypes.PlayerSlot, -1, -1, null, player.Index, placedSlot, item.prefix, 0, 0);
+                    NetMessage.SendData((int)PacketTypes.PlayerSlot, player.Index, -1, null, player.Index, placedSlot, item.prefix, 0, 0);
                 }
                 else
                 {
@@ -567,7 +567,7 @@ namespace ClassSystemPlugin
             if (!_lastSyncedMaxLife.TryGetValue(player.Index, out int lastMaxLife) || lastMaxLife != tPlayer.statLifeMax2)
             {
                 _lastSyncedMaxLife[player.Index] = tPlayer.statLifeMax2;
-                NetMessage.SendData(PacketTypes.PlayerHp, -1, -1, null, player.Index);
+                NetMessage.SendData((int)PacketTypes.PlayerHp, -1, -1, null, player.Index);
             }
         }
 
