@@ -17,8 +17,8 @@ namespace ClassSystemPlugin
     {
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
-        public override string Description => "Account-bound class system with underworld lock before login, webbed lock only after login until class selection, starter gear replacement, strict weapon locks, automatic extra minion maintenance, custom stat modifiers, and real-time HP/Mana sync.";
-        public override Version Version => new Version(15, 10, 2);
+        public override string Description => "Account-bound class system with underworld lock before login, webbed lock only after login until class selection, starter gear replacement, strict weapon locks, +1 minion via Summoning buff (2 total minions at start), reduced whip damage from 1.0 base, boosted summon damage, gathering tool damage rules, quick /c shortcuts, custom stat modifiers, and real-time HP/Mana sync.";
+        public override Version Version => new Version(15, 20, 0);
 
         private SqliteConnection _db;
         private bool _dbReady;
@@ -28,7 +28,6 @@ namespace ClassSystemPlugin
         private readonly Dictionary<int, DateTime> _slotWarnCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, int> _lastSyncedMaxLife = new Dictionary<int, int>();
         private readonly Dictionary<int, int> _lastSyncedMaxMana = new Dictionary<int, int>();
-        private readonly Dictionary<int, int> _minionSyncCooldown = new Dictionary<int, int>();
 
         private const int MaxLifeCrystalsAllowed = 15;
         private const int BaseStartHp = 100;
@@ -55,10 +54,9 @@ namespace ClassSystemPlugin
         private const int MageMaxHpFlat = -60;
         private const double MageDefenseMult = -0.10;
 
-        // Summoner stats
+        // Summoner stats (+1 minion from Summoning buff = 2 minions at start; boosted summon damage; reduced whip damage from 1.0 base; -80 Max HP; faster life regen)
         private const double SummonerSummonDamageMult = 0.12;
-        private const double SummonerWhipDamageMult = -0.15;
-        private const int SummonerExtraMinions = 2;
+        private const double SummonerWhipDamageMult = -0.25;
         private const double SummonerMoveSpeedMult = 0.20;
         private const int SummonerMaxHpFlat = -80;
         private const double SummonerDefenseMult = -0.20;
@@ -78,6 +76,14 @@ namespace ClassSystemPlugin
             "warrior", "ranger", "mage", "summoner"
         };
 
+        private readonly Dictionary<string, string> _classShortcuts = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["me"] = "warrior",
+            ["rg"] = "ranger",
+            ["mg"] = "mage",
+            ["sm"] = "summoner"
+        };
+
         private readonly Dictionary<int, string> _restrictedArmorsAndAccessories = new Dictionary<int, string>
         {
             { ItemID.WarriorEmblem, "warrior" },
@@ -87,7 +93,10 @@ namespace ClassSystemPlugin
             { ItemID.FeralClaws, "warrior" },
             { ItemID.MagicQuiver, "ranger" },
             { ItemID.ManaFlower, "mage" },
-            { ItemID.PygmyNecklace, "summoner" }
+            { ItemID.PygmyNecklace, "summoner" },
+            { ItemID.NecromanticScroll, "summoner" },
+            { ItemID.PapyrusScarab, "summoner" },
+            { ItemID.HerculesBeetle, "summoner" }
         };
 
         public ClassSystem(Main game) : base(game) { }
@@ -134,70 +143,54 @@ namespace ClassSystemPlugin
             base.Dispose(disposing);
         }
 
-        private void MaintainSummonerMinions(TSPlayer player)
+        private bool IsWhipItem(Item item)
         {
-            if (player == null || player.TPlayer == null || player.TPlayer.dead) return;
+            if (item == null || item.IsAir || item.type == ItemID.None) return false;
 
-            if (_minionSyncCooldown.TryGetValue(player.Index, out int cd) && cd > 0)
+            if (item.summon && item.useStyle == ItemUseStyleID.Swing && item.noMelee)
+                return true;
+
+            return item.type == ItemID.BlandWhip ||
+                   item.type == ItemID.ThornWhip ||
+                   item.type == ItemID.BoneWhip ||
+                   item.type == ItemID.Firecracker ||
+                   item.type == ItemID.CoolWhip ||
+                   item.type == ItemID.SwordWhip ||
+                   item.type == ItemID.MaceWhip ||
+                   item.type == ItemID.ScytheWhip ||
+                   item.type == ItemID.RainbowWhip;
+        }
+
+        private bool HasClassLifeRegen(TSPlayer tsPlayer, string playerClass)
+        {
+            if (tsPlayer?.TPlayer == null) return false;
+
+            double classRegenMult = 0.0;
+            if (string.Equals(playerClass, "warrior", StringComparison.OrdinalIgnoreCase))
+                classRegenMult = WarriorLifeRegenMult;
+            else if (string.Equals(playerClass, "summoner", StringComparison.OrdinalIgnoreCase))
+                classRegenMult = SummonerLifeRegenMult;
+
+            return classRegenMult > 0.0 && tsPlayer.TPlayer.lifeRegen > 0;
+        }
+
+        private void EnsureSummonerSummoningBuff(TSPlayer player)
+        {
+            if (player == null || player.TPlayer == null || !player.Active) return;
+
+            bool hasBuff = false;
+            for (int i = 0; i < Player.maxBuffs; i++)
             {
-                _minionSyncCooldown[player.Index] = cd - 1;
-                return;
-            }
-            _minionSyncCooldown[player.Index] = 15;
-
-            Projectile templateMinion = null;
-            float usedSlots = 0f;
-
-            for (int i = 0; i < Main.maxProjectiles; i++)
-            {
-                var p = Main.projectile[i];
-                if (p != null && p.active && p.owner == player.Index && p.minion)
+                if (player.TPlayer.buffType[i] == BuffID.Summoning && player.TPlayer.buffTime[i] > 60)
                 {
-                    usedSlots += p.minionSlots > 0f ? p.minionSlots : 1f;
-                    if (p.localAI[1] != 999f)
-                    {
-                        templateMinion = p;
-                    }
+                    hasBuff = true;
+                    break;
                 }
             }
 
-            if (templateMinion == null)
+            if (!hasBuff)
             {
-                for (int i = 0; i < Main.maxProjectiles; i++)
-                {
-                    var p = Main.projectile[i];
-                    if (p != null && p.active && p.owner == player.Index && p.minion && p.localAI[1] == 999f)
-                    {
-                        p.Kill();
-                    }
-                }
-                return;
-            }
-
-            int baseMaxMinions = Math.Max(1, player.TPlayer.maxMinions);
-            int maxAllowedMinions = baseMaxMinions + Math.Max(0, SummonerExtraMinions);
-            float slotCost = templateMinion.minionSlots > 0f ? templateMinion.minionSlots : 1f;
-
-            if (usedSlots + slotCost <= maxAllowedMinions + 0.01f)
-            {
-                int idx = Projectile.NewProjectile(
-                    new EntitySource_Parent(templateMinion),
-                    templateMinion.position.X + 16f,
-                    templateMinion.position.Y - 8f,
-                    templateMinion.velocity.X,
-                    templateMinion.velocity.Y,
-                    templateMinion.type,
-                    templateMinion.damage,
-                    templateMinion.knockBack,
-                    player.Index
-                );
-
-                if (idx >= 0 && idx < Main.maxProjectiles && Main.projectile[idx] != null)
-                {
-                    Main.projectile[idx].localAI[1] = 999f;
-                    Main.projectile[idx].netUpdate = true;
-                    NetMessage.SendData((int)PacketTypes.ProjectileNew, -1, -1, null, idx);
-                }
+                player.SetBuff(BuffID.Summoning, 180, true);
             }
         }
 
@@ -372,9 +365,9 @@ namespace ClassSystemPlugin
                 SetupDatabase();
             }
 
-            Commands.ChatCommands.Add(new Command("", CmdClass, "class")
+            Commands.ChatCommands.Add(new Command("", CmdClass, "class", "c")
             {
-                HelpText = "Select or view your class: /class [classname]"
+                HelpText = "Select or view your class: /class [classname] or /c <Me|Rg|Mg|sm>"
             });
 
             Commands.ChatCommands.Add(new Command("class.admin", CmdSetClass, "setclass")
@@ -400,7 +393,7 @@ namespace ClassSystemPlugin
             {
                 ClearWebBuff(player);
                 ApplyUnderworldLock(player, false);
-                player.SendWarningMessage("[ClassSystem] Welcome to the Underworld! Log in with /login and pick a class with /class <warrior|ranger|mage|summoner>.");
+                player.SendWarningMessage("[ClassSystem] Welcome to the Underworld! Log in with /login and pick a class with /c <Me|Rg|Mg|sm> or /class <warrior|ranger|mage|summoner>.");
             }
         }
 
@@ -421,12 +414,16 @@ namespace ClassSystemPlugin
                 _lastSyncedMaxLife.Remove(args.Player.Index);
                 _lastSyncedMaxMana.Remove(args.Player.Index);
                 ApplyClassStats(args.Player, savedClass);
+                if (savedClass == "summoner")
+                {
+                    EnsureSummonerSummoningBuff(args.Player);
+                }
                 args.Player.SendSuccessMessage($"[ClassSystem] Welcome back! Your class is: {savedClass.ToUpper()}");
             }
             else
             {
                 ApplyUnderworldLock(args.Player, true);
-                args.Player.SendWarningMessage("[ClassSystem] You are webbed in the Underworld until you select a class using /class <warrior|ranger|mage|summoner>.");
+                args.Player.SendWarningMessage("[ClassSystem] You are webbed in the Underworld until you select a class using /c <Me|Rg|Mg|sm> or /class <warrior|ranger|mage|summoner>.");
             }
         }
 
@@ -442,7 +439,6 @@ namespace ClassSystemPlugin
             _slotWarnCooldown.Remove(args.Who);
             _lastSyncedMaxLife.Remove(args.Who);
             _lastSyncedMaxMana.Remove(args.Who);
-            _minionSyncCooldown.Remove(args.Who);
         }
 
         private bool IsGatheringTool(Item item)
@@ -530,7 +526,7 @@ namespace ClassSystemPlugin
                     if (!_warnCooldown.TryGetValue(player.Index, out DateTime lastWarn) || (DateTime.UtcNow - lastWarn).TotalSeconds >= 4)
                     {
                         _warnCooldown[player.Index] = DateTime.UtcNow;
-                        player.SendWarningMessage("[ClassSystem] Select a class using /class <warrior|ranger|mage|summoner> to break the web and leave the Underworld.");
+                        player.SendWarningMessage("[ClassSystem] Select a class using /c <Me|Rg|Mg|sm> or /class <warrior|ranger|mage|summoner> to break the web and leave the Underworld.");
                     }
                 }
                 else
@@ -596,7 +592,7 @@ namespace ClassSystemPlugin
 
                 if (playerClass == "summoner")
                 {
-                    MaintainSummonerMinions(player);
+                    EnsureSummonerSummoningBuff(player);
                 }
 
                 if (playerClass == "ranger" && RangerArcheryBuff)
@@ -629,28 +625,30 @@ namespace ClassSystemPlugin
 
             if (heldItem != null && IsGatheringTool(heldItem))
             {
-                if (string.Equals(playerClass, "warrior", StringComparison.OrdinalIgnoreCase))
+                if (HasClassLifeRegen(tsPlayer, playerClass))
                 {
-                    if (heldItem.melee)
+                    if (string.Equals(playerClass, "summoner", StringComparison.OrdinalIgnoreCase))
                     {
-                        args.Damage = (int)Math.Round(args.Damage * (1.0 + WarriorMeleeDamageMult));
+                        double mult = IsWhipItem(heldItem)
+                            ? Math.Max(0.05, 1.0 + SummonerWhipDamageMult)
+                            : (1.0 + SummonerSummonDamageMult);
+                        args.Damage = Math.Max(1, (int)Math.Round(args.Damage * mult));
                     }
+                    return;
                 }
-                else
-                {
-                    args.Damage = 0;
-                }
+
+                args.Damage = 0;
                 return;
             }
 
             if (playerClass == "summoner")
             {
-                double mult = 1.0 + SummonerSummonDamageMult;
-                if (heldItem != null && heldItem.summon && heldItem.useStyle == ItemUseStyleID.Swing && heldItem.noMelee)
-                {
-                    mult += SummonerWhipDamageMult;
-                }
-                args.Damage = (int)Math.Round(args.Damage * mult);
+                bool isWhipAttack = IsWhipItem(heldItem);
+                double mult = isWhipAttack
+                    ? Math.Max(0.05, 1.0 + SummonerWhipDamageMult)
+                    : (1.0 + SummonerSummonDamageMult);
+
+                args.Damage = Math.Max(1, (int)Math.Round(args.Damage * mult));
                 return;
             }
 
@@ -731,6 +729,21 @@ namespace ClassSystemPlugin
             EnforceInventoryRestrictions(player, className);
         }
 
+        private string ResolveClassName(string input)
+        {
+            if (string.IsNullOrWhiteSpace(input)) return null;
+            string trimmed = input.Trim().ToLowerInvariant();
+            if (_classShortcuts.TryGetValue(trimmed, out string mapped))
+            {
+                return mapped;
+            }
+            if (_availableClasses.Contains(trimmed))
+            {
+                return trimmed;
+            }
+            return null;
+        }
+
         private void CmdClass(CommandArgs args)
         {
             if (!args.Player.IsLoggedIn || args.Player.Account == null)
@@ -742,15 +755,17 @@ namespace ClassSystemPlugin
             string currentClass = GetPlayerClass(args.Player);
             if (args.Parameters.Count == 0)
             {
-                string info = string.IsNullOrEmpty(currentClass) ? "None (use /class <warrior|ranger|mage|summoner>)" : currentClass.ToUpper();
+                string info = string.IsNullOrEmpty(currentClass)
+                    ? "None (use /c <Me|Rg|Mg|sm> or /class <warrior|ranger|mage|summoner>)"
+                    : currentClass.ToUpper();
                 args.Player.SendInfoMessage($"[ClassSystem] Current class: {info}");
                 return;
             }
 
-            string chosen = args.Parameters[0].ToLowerInvariant();
-            if (!_availableClasses.Contains(chosen))
+            string chosen = ResolveClassName(args.Parameters[0]);
+            if (string.IsNullOrEmpty(chosen))
             {
-                args.Player.SendErrorMessage("[ClassSystem] Invalid class. Available: warrior, ranger, mage, summoner");
+                args.Player.SendErrorMessage("[ClassSystem] Invalid class. Use /c <Me|Rg|Mg|sm> or /class <warrior|ranger|mage|summoner>");
                 return;
             }
 
@@ -765,10 +780,14 @@ namespace ClassSystemPlugin
 
             ClearWebAndTeleportToSpawn(args.Player);
             GiveStarterItems(args.Player, chosen);
+            if (chosen == "summoner")
+            {
+                EnsureSummonerSummoningBuff(args.Player);
+            }
             _lastSyncedMaxLife.Remove(args.Player.Index);
             _lastSyncedMaxMana.Remove(args.Player.Index);
             ApplyClassStats(args.Player, chosen);
-            args.Player.SendSuccessMessage($"[ClassSystem] Class selected: {chosen.ToUpper()}! Web cleared, starter weapons replaced, and stats synced.");
+            args.Player.SendSuccessMessage($"[ClassSystem] Class selected: {chosen.ToUpper()}! Web cleared, starter gear equipped, and stats synced.");
         }
 
         private void CmdSetClass(CommandArgs args)
@@ -801,26 +820,31 @@ namespace ClassSystemPlugin
                 _lastSyncedMaxLife.Remove(target.Index);
                 _lastSyncedMaxMana.Remove(target.Index);
                 ApplyUnderworldLock(target, true);
-                target.SendWarningMessage("[ClassSystem] Your class has been reset. You are webbed in the Underworld until you select a class with /class.");
+                target.SendWarningMessage("[ClassSystem] Your class has been reset. You are webbed in the Underworld until you select a class with /c <Me|Rg|Mg|sm> or /class.");
                 args.Player.SendSuccessMessage($"Reset class for {target.Name}.");
                 return;
             }
 
-            if (!_availableClasses.Contains(option))
+            string resolvedOption = ResolveClassName(option);
+            if (string.IsNullOrEmpty(resolvedOption))
             {
-                args.Player.SendErrorMessage("Invalid class. Use warrior, ranger, mage, summoner, or none.");
+                args.Player.SendErrorMessage("Invalid class. Use Me/warrior, Rg/ranger, Mg/mage, sm/summoner, or none.");
                 return;
             }
 
-            SaveClassToDB(target.Account.ID, option);
-            _playerClasses[target.Account.ID] = option;
+            SaveClassToDB(target.Account.ID, resolvedOption);
+            _playerClasses[target.Account.ID] = resolvedOption;
             ClearWebAndTeleportToSpawn(target);
-            GiveStarterItems(target, option);
+            GiveStarterItems(target, resolvedOption);
+            if (resolvedOption == "summoner")
+            {
+                EnsureSummonerSummoningBuff(target);
+            }
             _lastSyncedMaxLife.Remove(target.Index);
             _lastSyncedMaxMana.Remove(target.Index);
-            ApplyClassStats(target, option);
-            target.SendSuccessMessage($"[ClassSystem] Admin set your class to {option.ToUpper()}.");
-            args.Player.SendSuccessMessage($"Set {target.Name}'s class to {option.ToUpper()}.");
+            ApplyClassStats(target, resolvedOption);
+            target.SendSuccessMessage($"[ClassSystem] Admin set your class to {resolvedOption.ToUpper()}.");
+            args.Player.SendSuccessMessage($"Set {target.Name}'s class to {resolvedOption.ToUpper()}.");
         }
 
         private string GetPlayerClass(TSPlayer player)
