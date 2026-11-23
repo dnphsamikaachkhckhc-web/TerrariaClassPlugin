@@ -4,6 +4,7 @@ using System.IO;
 using Microsoft.Data.Sqlite;
 using Microsoft.Xna.Framework;
 using Terraria;
+using Terraria.DataStructures;
 using Terraria.ID;
 using TerrariaApi.Server;
 using TShockAPI;
@@ -16,8 +17,8 @@ namespace ClassSystemPlugin
     {
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
-        public override string Description => "Account-bound class system with underworld lock before login, webbed lock only after login until class selection, starter gear replacement, strict weapon locks, tool damage only for Warrior, and real-time Max HP sync.";
-        public override Version Version => new Version(15, 6, 4);
+        public override string Description => "Account-bound class system with underworld lock before login, webbed lock only after login until class selection, starter gear replacement, strict weapon locks, non-conflicting minion stacking, custom stat modifiers, and real-time HP/Mana sync.";
+        public override Version Version => new Version(15, 9, 0);
 
         private SqliteConnection _db;
         private bool _dbReady;
@@ -26,6 +27,8 @@ namespace ClassSystemPlugin
         private readonly Dictionary<int, DateTime> _warnCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, DateTime> _slotWarnCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, int> _lastSyncedMaxLife = new Dictionary<int, int>();
+        private readonly Dictionary<int, int> _lastSyncedMaxMana = new Dictionary<int, int>();
+        private readonly HashSet<int> _spawnedByPlugin = new HashSet<int>();
 
         private const int MaxLifeCrystalsAllowed = 15;
         private const int BaseStartHp = 100;
@@ -33,9 +36,10 @@ namespace ClassSystemPlugin
 
         // Warrior stats
         private const double WarriorMeleeDamageMult = 0.10;
-        private const double WarriorMaxHpMult = 0.15;
+        private const int WarriorMaxHpFlat = 20;
         private const double WarriorDefenseMult = 0.10;
         private const double WarriorMoveSpeedMult = -0.15;
+        private const double WarriorLifeRegenMult = -0.20;
 
         // Ranger stats
         private const double RangerRangedDamageMult = 0.10;
@@ -48,7 +52,7 @@ namespace ClassSystemPlugin
         private const double MageMagicDamageMult = 0.12;
         private const double MageMoveSpeedMult = 0.15;
         private const int MageMaxManaFlat = 80;
-        private const int MageMaxHpFlat = -30;
+        private const int MageMaxHpFlat = -60;
         private const double MageDefenseMult = -0.10;
 
         // Summoner stats
@@ -56,8 +60,9 @@ namespace ClassSystemPlugin
         private const double SummonerWhipDamageMult = -0.15;
         private const int SummonerExtraMinions = 2;
         private const double SummonerMoveSpeedMult = 0.20;
-        private const int SummonerMaxHpFlat = -40;
+        private const int SummonerMaxHpFlat = -80;
         private const double SummonerDefenseMult = -0.20;
+        private const double SummonerLifeRegenMult = 0.15;
 
         private readonly Dictionary<string, (short ItemId, int Stack)[]> _classStarterItems =
             new Dictionary<string, (short ItemId, int Stack)[]>
@@ -96,11 +101,13 @@ namespace ClassSystemPlugin
             ServerApi.Hooks.NetGreetPlayer.Register(this, OnGreetPlayer);
             ServerApi.Hooks.ServerLeave.Register(this, OnServerLeave);
             ServerApi.Hooks.NpcStrike.Register(this, OnNpcStrike);
+            ServerApi.Hooks.ProjectileNew.Register(this, OnProjectileNew);
 
             PlayerHooks.PlayerCommand += OnPlayerCommand;
             PlayerHooks.PlayerPostLogin += OnPlayerPostLogin;
             GetDataHandlers.PlayerUpdate += OnPlayerUpdate;
             GetDataHandlers.PlayerSlot += OnPlayerSlot;
+            GetDataHandlers.PlayerDamage += OnPlayerDamage;
         }
 
         protected override void Dispose(bool disposing)
@@ -112,11 +119,13 @@ namespace ClassSystemPlugin
                 ServerApi.Hooks.NetGreetPlayer.Deregister(this, OnGreetPlayer);
                 ServerApi.Hooks.ServerLeave.Deregister(this, OnServerLeave);
                 ServerApi.Hooks.NpcStrike.Deregister(this, OnNpcStrike);
+                ServerApi.Hooks.ProjectileNew.Deregister(this, OnProjectileNew);
 
                 PlayerHooks.PlayerCommand -= OnPlayerCommand;
                 PlayerHooks.PlayerPostLogin -= OnPlayerPostLogin;
                 GetDataHandlers.PlayerUpdate -= OnPlayerUpdate;
                 GetDataHandlers.PlayerSlot -= OnPlayerSlot;
+                GetDataHandlers.PlayerDamage -= OnPlayerDamage;
 
                 if (_db != null)
                 {
@@ -125,6 +134,107 @@ namespace ClassSystemPlugin
                 }
             }
             base.Dispose(disposing);
+        }
+
+        private void OnProjectileNew(ProjectileNewEventArgs args)
+        {
+            var proj = args.Projectile;
+            if (proj == null || !proj.active) return;
+
+            if (_spawnedByPlugin.Remove(proj.identity))
+            {
+                return;
+            }
+
+            if (!proj.minion || proj.owner < 0 || proj.owner >= TShock.Players.Length) return;
+
+            var player = TShock.Players[proj.owner];
+            if (player == null || !player.Active || !player.IsLoggedIn || player.Account == null) return;
+
+            string playerClass = GetPlayerClass(player);
+            if (!string.Equals(playerClass, "summoner", StringComparison.OrdinalIgnoreCase)) return;
+
+            // Stack class bonus (+2) on top of player's vanilla maxMinions (potions, Bewitching Table, armor, accessories)
+            int baseMaxMinions = Math.Max(1, player.TPlayer.maxMinions);
+            int maxAllowedMinions = baseMaxMinions + Math.Max(0, SummonerExtraMinions);
+
+            float usedSlots = 0f;
+            for (int i = 0; i < Main.maxProjectiles; i++)
+            {
+                var p = Main.projectile[i];
+                if (p != null && p.active && p.owner == player.Index && p.minion)
+                {
+                    usedSlots += p.minionSlots > 0f ? p.minionSlots : 1f;
+                }
+            }
+
+            float slotCost = proj.minionSlots > 0f ? proj.minionSlots : 1f;
+            int remainingSlots = (int)Math.Floor((maxAllowedMinions - usedSlots) / slotCost);
+            int toSpawn = Math.Min(Math.Max(0, SummonerExtraMinions), Math.Max(0, remainingSlots));
+
+            for (int n = 0; n < toSpawn; n++)
+            {
+                int idx = Projectile.NewProjectile(
+                    new EntitySource_Parent(proj),
+                    proj.position.X + (n + 1) * 12f,
+                    proj.position.Y,
+                    proj.velocity.X,
+                    proj.velocity.Y,
+                    proj.type,
+                    proj.damage,
+                    proj.knockBack,
+                    player.Index
+                );
+
+                if (idx >= 0 && idx < Main.maxProjectiles && Main.projectile[idx] != null)
+                {
+                    _spawnedByPlugin.Add(Main.projectile[idx].identity);
+                    NetMessage.SendData((int)PacketTypes.ProjectileNew, -1, -1, null, idx);
+                }
+            }
+        }
+
+        private void OnPlayerDamage(object sender, GetDataHandlers.PlayerDamageEventArgs args)
+        {
+            var player = TShock.Players[args.ID];
+            if (player == null || !player.Active || !player.IsLoggedIn || player.Account == null) return;
+
+            string playerClass = GetPlayerClass(player);
+            if (string.IsNullOrEmpty(playerClass)) return;
+
+            double defenseMult = 0.0;
+            if (playerClass == "warrior") defenseMult = WarriorDefenseMult;
+            else if (playerClass == "ranger") defenseMult = RangerDefenseMult;
+            else if (playerClass == "mage") defenseMult = MageDefenseMult;
+            else if (playerClass == "summoner") defenseMult = SummonerDefenseMult;
+
+            if (Math.Abs(defenseMult) < 0.001) return;
+
+            int baseDef = Math.Max(0, player.TPlayer.statDefense);
+            int adjustedDef = Math.Max(0, (int)Math.Round(baseDef * (1.0 + defenseMult)));
+            int defDiff = adjustedDef - baseDef;
+
+            // Classic/Expert/Master damage reduction factor (~0.75 average)
+            int hpDelta = (int)Math.Round(defDiff * 0.75);
+            if (hpDelta > 0)
+            {
+                // Warrior takes reduced damage
+                int healBack = Math.Min(hpDelta, Math.Max(0, args.Damage - 1));
+                if (healBack > 0)
+                {
+                    player.TPlayer.statLife = Math.Min(player.TPlayer.statLifeMax2, player.TPlayer.statLife + healBack);
+                    NetMessage.SendData((int)PacketTypes.PlayerHp, -1, -1, null, player.Index);
+                    NetMessage.SendData((int)PacketTypes.PlayerHp, player.Index, -1, null, player.Index);
+                }
+            }
+            else if (hpDelta < 0)
+            {
+                // Ranger/Mage/Summoner take extra damage matching their defense penalty
+                int extraDamage = -hpDelta;
+                player.TPlayer.statLife = Math.Max(1, player.TPlayer.statLife - extraDamage);
+                NetMessage.SendData((int)PacketTypes.PlayerHp, -1, -1, null, player.Index);
+                NetMessage.SendData((int)PacketTypes.PlayerHp, player.Index, -1, null, player.Index);
+            }
         }
 
         private Vector2 GetSurfaceSpawnPosition()
@@ -305,6 +415,7 @@ namespace ClassSystemPlugin
                 ClearWebAndTeleportToSpawn(args.Player);
                 EnforceInventoryRestrictions(args.Player, savedClass);
                 _lastSyncedMaxLife.Remove(args.Player.Index);
+                _lastSyncedMaxMana.Remove(args.Player.Index);
                 ApplyClassStats(args.Player, savedClass);
                 args.Player.SendSuccessMessage($"[ClassSystem] Welcome back! Your class is: {savedClass.ToUpper()}");
             }
@@ -326,6 +437,7 @@ namespace ClassSystemPlugin
             _warnCooldown.Remove(args.Who);
             _slotWarnCooldown.Remove(args.Who);
             _lastSyncedMaxLife.Remove(args.Who);
+            _lastSyncedMaxMana.Remove(args.Who);
         }
 
         private bool IsGatheringTool(Item item)
@@ -504,9 +616,8 @@ namespace ClassSystemPlugin
             if (string.IsNullOrEmpty(playerClass)) return;
 
             var heldItem = args.Player.HeldItem;
-            if (heldItem == null) return;
 
-            if (IsGatheringTool(heldItem))
+            if (heldItem != null && IsGatheringTool(heldItem))
             {
                 if (string.Equals(playerClass, "warrior", StringComparison.OrdinalIgnoreCase))
                 {
@@ -521,6 +632,19 @@ namespace ClassSystemPlugin
                 }
                 return;
             }
+
+            if (playerClass == "summoner")
+            {
+                double mult = 1.0 + SummonerSummonDamageMult;
+                if (heldItem != null && heldItem.summon && heldItem.useStyle == ItemUseStyleID.Swing && heldItem.noMelee)
+                {
+                    mult += SummonerWhipDamageMult;
+                }
+                args.Damage = (int)Math.Round(args.Damage * mult);
+                return;
+            }
+
+            if (heldItem == null) return;
 
             if (!IsItemAllowedInInventory(heldItem, playerClass))
             {
@@ -540,15 +664,6 @@ namespace ClassSystemPlugin
             else if (playerClass == "mage" && heldItem.magic)
             {
                 args.Damage = (int)Math.Round(args.Damage * (1.0 + MageMagicDamageMult));
-            }
-            else if (playerClass == "summoner" && heldItem.summon)
-            {
-                double mult = 1.0 + SummonerSummonDamageMult;
-                if (heldItem.useStyle == ItemUseStyleID.Swing && heldItem.noMelee)
-                {
-                    mult += SummonerWhipDamageMult;
-                }
-                args.Damage = (int)Math.Round(args.Damage * mult);
             }
         }
 
@@ -641,6 +756,7 @@ namespace ClassSystemPlugin
             ClearWebAndTeleportToSpawn(args.Player);
             GiveStarterItems(args.Player, chosen);
             _lastSyncedMaxLife.Remove(args.Player.Index);
+            _lastSyncedMaxMana.Remove(args.Player.Index);
             ApplyClassStats(args.Player, chosen);
             args.Player.SendSuccessMessage($"[ClassSystem] Class selected: {chosen.ToUpper()}! Web cleared, starter weapons replaced, and stats synced.");
         }
@@ -673,6 +789,7 @@ namespace ClassSystemPlugin
                 DeleteClassFromDB(target.Account.ID);
                 _playerClasses.Remove(target.Account.ID);
                 _lastSyncedMaxLife.Remove(target.Index);
+                _lastSyncedMaxMana.Remove(target.Index);
                 ApplyUnderworldLock(target, true);
                 target.SendWarningMessage("[ClassSystem] Your class has been reset. You are webbed in the Underworld until you select a class with /class.");
                 args.Player.SendSuccessMessage($"Reset class for {target.Name}.");
@@ -690,6 +807,7 @@ namespace ClassSystemPlugin
             ClearWebAndTeleportToSpawn(target);
             GiveStarterItems(target, option);
             _lastSyncedMaxLife.Remove(target.Index);
+            _lastSyncedMaxMana.Remove(target.Index);
             ApplyClassStats(target, option);
             target.SendSuccessMessage($"[ClassSystem] Admin set your class to {option.ToUpper()}.");
             args.Player.SendSuccessMessage($"Set {target.Name}'s class to {option.ToUpper()}.");
@@ -715,32 +833,37 @@ namespace ClassSystemPlugin
             int currentBaseLife = Math.Min(Math.Max(BaseStartHp, tPlayer.statLifeMax), baseCapLife);
 
             int targetMaxLife = currentBaseLife;
+            int targetMaxMana = tPlayer.statManaMax;
 
             if (className == "warrior")
             {
-                targetMaxLife = (int)Math.Round(currentBaseLife * (1.0 + WarriorMaxHpMult));
-                tPlayer.statDefense = (int)Math.Round(tPlayer.statDefense * (1.0 + WarriorDefenseMult));
+                targetMaxLife = Math.Max(40, currentBaseLife + WarriorMaxHpFlat);
                 tPlayer.moveSpeed *= (float)(1.0 + WarriorMoveSpeedMult);
+                if (tPlayer.lifeRegen > 0)
+                {
+                    tPlayer.lifeRegen = (int)Math.Round(tPlayer.lifeRegen * (1.0 + WarriorLifeRegenMult));
+                }
             }
             else if (className == "ranger")
             {
                 targetMaxLife = Math.Max(40, currentBaseLife + RangerMaxHpFlat);
-                tPlayer.statDefense = (int)Math.Round(tPlayer.statDefense * (1.0 + RangerDefenseMult));
                 tPlayer.moveSpeed *= (float)(1.0 + RangerMoveSpeedMult);
             }
             else if (className == "mage")
             {
                 targetMaxLife = Math.Max(40, currentBaseLife + MageMaxHpFlat);
-                tPlayer.statManaMax2 += MageMaxManaFlat;
-                tPlayer.statDefense = (int)Math.Round(tPlayer.statDefense * (1.0 + MageDefenseMult));
+                targetMaxMana = tPlayer.statManaMax + MageMaxManaFlat;
+                tPlayer.statManaMax2 = targetMaxMana;
                 tPlayer.moveSpeed *= (float)(1.0 + MageMoveSpeedMult);
             }
             else if (className == "summoner")
             {
                 targetMaxLife = Math.Max(40, currentBaseLife + SummonerMaxHpFlat);
-                tPlayer.maxMinions += SummonerExtraMinions;
-                tPlayer.statDefense = (int)Math.Round(tPlayer.statDefense * (1.0 + SummonerDefenseMult));
                 tPlayer.moveSpeed *= (float)(1.0 + SummonerMoveSpeedMult);
+                if (tPlayer.lifeRegen > 0)
+                {
+                    tPlayer.lifeRegen = (int)Math.Round(tPlayer.lifeRegen * (1.0 + SummonerLifeRegenMult));
+                }
             }
 
             tPlayer.statLifeMax = targetMaxLife;
@@ -756,6 +879,13 @@ namespace ClassSystemPlugin
                 _lastSyncedMaxLife[player.Index] = targetMaxLife;
                 NetMessage.SendData((int)PacketTypes.PlayerHp, -1, -1, null, player.Index);
                 NetMessage.SendData((int)PacketTypes.PlayerHp, player.Index, -1, null, player.Index);
+            }
+
+            if (className == "mage" && (!_lastSyncedMaxMana.TryGetValue(player.Index, out int lastMaxMana) || lastMaxMana != targetMaxMana))
+            {
+                _lastSyncedMaxMana[player.Index] = targetMaxMana;
+                NetMessage.SendData((int)PacketTypes.PlayerMana, -1, -1, null, player.Index);
+                NetMessage.SendData((int)PacketTypes.PlayerMana, player.Index, -1, null, player.Index);
             }
         }
 
