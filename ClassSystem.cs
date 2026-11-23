@@ -17,7 +17,7 @@ namespace ClassSystemPlugin
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
         public override string Description => "Account-bound class system with underworld lock before login, webbed lock only after login until class selection, starter gear replacement, strict weapon locks, tool damage only for Warrior, and real-time Max HP sync.";
-        public override Version Version => new Version(15, 6, 2);
+        public override Version Version => new Version(15, 6, 3);
 
         private SqliteConnection _db;
         private bool _dbReady;
@@ -96,8 +96,8 @@ namespace ClassSystemPlugin
             ServerApi.Hooks.NetGreetPlayer.Register(this, OnGreetPlayer);
             ServerApi.Hooks.ServerLeave.Register(this, OnServerLeave);
             ServerApi.Hooks.NpcStrike.Register(this, OnNpcStrike);
+            ServerApi.Hooks.ServerCommand.Register(this, OnServerCommand);
 
-            PlayerHooks.PlayerLogin += OnPlayerLogin;
             PlayerHooks.PlayerPostLogin += OnPlayerPostLogin;
             GetDataHandlers.PlayerUpdate += OnPlayerUpdate;
             GetDataHandlers.PlayerSlot += OnPlayerSlot;
@@ -112,8 +112,8 @@ namespace ClassSystemPlugin
                 ServerApi.Hooks.NetGreetPlayer.Deregister(this, OnGreetPlayer);
                 ServerApi.Hooks.ServerLeave.Deregister(this, OnServerLeave);
                 ServerApi.Hooks.NpcStrike.Deregister(this, OnNpcStrike);
+                ServerApi.Hooks.ServerCommand.Deregister(this, OnServerCommand);
 
-                PlayerHooks.PlayerLogin -= OnPlayerLogin;
                 PlayerHooks.PlayerPostLogin -= OnPlayerPostLogin;
                 GetDataHandlers.PlayerUpdate -= OnPlayerUpdate;
                 GetDataHandlers.PlayerSlot -= OnPlayerSlot;
@@ -174,7 +174,6 @@ namespace ClassSystemPlugin
                 player.Teleport(hellPos.X, hellPos.Y);
             }
 
-            // Never apply Webbed before login so /login and /register always work
             if (!player.IsLoggedIn)
             {
                 ClearWebBuff(player);
@@ -270,6 +269,20 @@ namespace ClassSystemPlugin
             });
         }
 
+        private void OnServerCommand(CommandEventArgs args)
+        {
+            if (string.IsNullOrWhiteSpace(args.Command)) return;
+            string cmdLower = args.Command.Trim().ToLowerInvariant();
+            if (cmdLower.StartsWith("/login") || cmdLower.StartsWith("/register"))
+            {
+                var player = TShock.Players[args.Player?.Index ?? -1];
+                if (player != null && player.Active)
+                {
+                    ClearWebBuff(player);
+                }
+            }
+        }
+
         private void OnGreetPlayer(GreetPlayerEventArgs args)
         {
             var player = TShock.Players[args.Who];
@@ -278,14 +291,6 @@ namespace ClassSystemPlugin
                 ClearWebBuff(player);
                 ApplyUnderworldLock(player, false);
                 player.SendWarningMessage("[ClassSystem] Welcome to the Underworld! Log in with /login and pick a class with /class <warrior|ranger|mage|summoner>.");
-            }
-        }
-
-        private void OnPlayerLogin(PlayerLoginEventArgs args)
-        {
-            if (args.Player != null)
-            {
-                ClearWebBuff(args.Player);
             }
         }
 
