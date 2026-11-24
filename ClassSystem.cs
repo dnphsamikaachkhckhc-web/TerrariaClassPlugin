@@ -20,7 +20,6 @@ namespace ClassSystemPlugin
     {
         public string ClassName { get; set; }
         public int StarterChoice { get; set; } // 0 = ยังไม่เลือกไอเทม, 1 = /ch 1, 2 = /ch 2
-        public int BaseLife { get; set; } = 100; // เลือดพื้นฐานก่อนบวก/ลบโบนัสสาย (เริ่มต้น 100, เพิ่มทีละ 20 จาก Life Crystal สูงสุด 400)
     }
 
     [ApiVersion(2, 1)]
@@ -28,8 +27,8 @@ namespace ClassSystemPlugin
     {
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
-        public override string Description => "Class & starter-choice (/ch 1|2) system with persistent SQLite BaseLife across relogs, strict 15 Life Crystal cap & refund on excess use, proper death/respawn state tracking, cross-class item ejection away from the player, and zero-flicker permanent buffs/debuffs.";
-        public override Version Version => new Version(17, 26, 0);
+        public override string Description => "Class & starter-choice (/ch 1|2) system with SQLite persistence, proper death/respawn state tracking, cross-class item ejection away from the player, and zero-flicker permanent buffs/debuffs (no Max HP modification).";
+        public override Version Version => new Version(18, 0, 0);
 
         private const string ClassSelectPrompt =
             "Chat by Shokuya :3 Please select your class >w<\n\n" +
@@ -49,15 +48,9 @@ namespace ClassSystemPlugin
         private readonly Dictionary<int, DateTime> _dropWarnCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, DateTime> _craftWarnCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<long, DateTime> _itemTypeEjectCooldown = new Dictionary<long, DateTime>();
-        private readonly Dictionary<int, DateTime> _crystalWarnCooldown = new Dictionary<int, DateTime>();
-        private readonly Dictionary<int, DateTime> _crystalUseCooldown = new Dictionary<int, DateTime>();
-        private readonly Dictionary<int, int> _lastLifeCrystalSlot = new Dictionary<int, int>();
         private readonly Dictionary<int, DateTime> _buffRefreshCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, DateTime> _lockedBuffRestoreCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, DateTime> _legacyBuffPurgeCooldown = new Dictionary<int, DateTime>();
-        private readonly Dictionary<int, int> _lastSyncedMaxLife = new Dictionary<int, int>();
-        private readonly Dictionary<int, int> _playerBaseLife = new Dictionary<int, int>();
-        private readonly Dictionary<int, DateTime> _loginLifeLockUntil = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, double> _honeyRegenAccumulator = new Dictionary<int, double>();
         private readonly Dictionary<int, HashSet<int>> _blockedWorldItemsByPlayer = new Dictionary<int, HashSet<int>>();
         private readonly Dictionary<int, DateTime> _playerDeadUntil = new Dictionary<int, DateTime>();
@@ -65,10 +58,6 @@ namespace ClassSystemPlugin
         private Vector2? _cachedSafeUnderworldPos = null;
         private DateTime _lastTickSync = DateTime.MinValue;
         private DateTime _lastHoneyTick = DateTime.UtcNow;
-
-        private const int MaxLifeCrystalsAllowed = 15;
-        private const int BaseStartHp = 100;
-        private const int HpPerLifeCrystal = 20;
 
         // ระยะเวลาบัฟ 15 นาที (54000 ticks) เพื่อให้นิ่งสนิทไม่เกิดการรีเฟรชถี่
         private const int PermanentBuffDurationTicks = 54000;
@@ -272,23 +261,6 @@ namespace ClassSystemPlugin
             base.Dispose(disposing);
         }
 
-        private bool IsInLoginLifeLock(TSPlayer player)
-        {
-            if (player == null) return false;
-            if (_loginLifeLockUntil.TryGetValue(player.Index, out DateTime until))
-            {
-                if (DateTime.UtcNow < until) return true;
-                _loginLifeLockUntil.Remove(player.Index);
-            }
-            return false;
-        }
-
-        private void ArmLoginLifeLock(TSPlayer player, double seconds = 5.0)
-        {
-            if (player == null) return;
-            _loginLifeLockUntil[player.Index] = DateTime.UtcNow.AddSeconds(seconds);
-        }
-
         private bool IsPlayerDeadState(TSPlayer player)
         {
             if (player?.TPlayer == null) return true;
@@ -311,7 +283,6 @@ namespace ClassSystemPlugin
             player.TPlayer.statLife = 0;
             _playerDeadUntil[player.Index] = DateTime.UtcNow.AddSeconds(lockSeconds);
             _honeyRegenAccumulator.Remove(player.Index);
-            _lastSyncedMaxLife.Remove(player.Index);
         }
 
         private void ClearPlayerDeadState(TSPlayer player)
@@ -319,7 +290,6 @@ namespace ClassSystemPlugin
             if (player == null) return;
             _playerDeadUntil.Remove(player.Index);
             _honeyRegenAccumulator.Remove(player.Index);
-            _lastSyncedMaxLife.Remove(player.Index);
         }
 
         private void OnPlayerKillMe(object sender, GetDataHandlers.KillMeEventArgs args)
@@ -349,27 +319,13 @@ namespace ClassSystemPlugin
                 var dbState = GetStateFromDB(player.Account.ID);
                 if (dbState != null && !string.IsNullOrEmpty(dbState.ClassName))
                 {
-                    int persistedBase = NormalizeBaseLifeValue(dbState.BaseLife);
-                    dbState.BaseLife = persistedBase;
                     _playerStates[player.Account.ID] = dbState;
-                    _playerBaseLife[player.Index] = persistedBase;
-                    _lastSyncedMaxLife.Remove(player.Index);
-                    ArmLoginLifeLock(player, 5.0);
-
                     if (dbState.StarterChoice > 0)
                     {
                         if (player.TPlayer != null)
                         {
                             player.TPlayer.dead = false;
-                            int targetMaxLife = Math.Max(20, persistedBase + GetMaxHpDelta(dbState));
-                            player.TPlayer.statLifeMax = targetMaxLife;
-                            player.TPlayer.statLifeMax2 = targetMaxLife;
-                            if (player.TPlayer.statLife <= 0 || player.TPlayer.statLife > targetMaxLife)
-                            {
-                                player.TPlayer.statLife = targetMaxLife;
-                            }
                         }
-                        ForceSyncLifeToClient(player, dbState);
                         EnsurePermanentClassBuffs(player, dbState, true);
                     }
                 }
@@ -467,37 +423,6 @@ namespace ClassSystemPlugin
                 _serverBroadcastCooldown[player.Index] = DateTime.UtcNow;
                 TShock.Utils.Broadcast(message, Color.Gold);
             }
-        }
-
-        private int GetMaxHpDelta(PlayerClassState state)
-        {
-            if (state == null || string.IsNullOrEmpty(state.ClassName)) return 0;
-            string c = state.ClassName.ToLowerInvariant();
-            int ch = state.StarterChoice;
-
-            if (c == "warrior")
-            {
-                if (ch == 1) return 60;
-                if (ch == 2) return -40;
-                return 0;
-            }
-            if (c == "ranger")
-            {
-                if (ch == 1 || ch == 2) return -40;
-                return 0;
-            }
-            if (c == "mage")
-            {
-                if (ch == 1 || ch == 2) return -40;
-                return 0;
-            }
-            if (c == "summoner")
-            {
-                if (ch == 1) return -80;
-                if (ch == 2) return -40;
-                return 0;
-            }
-            return 0;
         }
 
         private double GetBrokenArmorReduction(PlayerClassState state)
@@ -785,86 +710,6 @@ namespace ClassSystemPlugin
             return false;
         }
 
-        private void RefundBlockedLifeCrystal(TSPlayer player)
-        {
-            if (player?.TPlayer == null) return;
-            var tPlayer = player.TPlayer;
-
-            int refundSlot = -1;
-
-            if (tPlayer.inventory.Length > 58 &&
-                tPlayer.inventory[58] != null &&
-                !tPlayer.inventory[58].IsAir &&
-                tPlayer.inventory[58].type == ItemID.LifeCrystal &&
-                tPlayer.inventory[58].stack < tPlayer.inventory[58].maxStack)
-            {
-                refundSlot = 58;
-            }
-            else if (tPlayer.selectedItem >= 0 && tPlayer.selectedItem < 50 &&
-                     tPlayer.inventory[tPlayer.selectedItem] != null &&
-                     !tPlayer.inventory[tPlayer.selectedItem].IsAir &&
-                     tPlayer.inventory[tPlayer.selectedItem].type == ItemID.LifeCrystal &&
-                     tPlayer.inventory[tPlayer.selectedItem].stack < tPlayer.inventory[tPlayer.selectedItem].maxStack)
-            {
-                refundSlot = tPlayer.selectedItem;
-            }
-            else if (_lastLifeCrystalSlot.TryGetValue(player.Index, out int lastSlot) &&
-                     lastSlot >= 0 && lastSlot < 59)
-            {
-                var sItem = tPlayer.inventory[lastSlot];
-                if (sItem == null || sItem.IsAir || sItem.type == ItemID.None ||
-                    (sItem.type == ItemID.LifeCrystal && sItem.stack < sItem.maxStack))
-                {
-                    refundSlot = lastSlot;
-                }
-            }
-
-            if (refundSlot < 0)
-            {
-                for (int i = 0; i < 59 && i < tPlayer.inventory.Length; i++)
-                {
-                    var inv = tPlayer.inventory[i];
-                    if (inv != null && !inv.IsAir && inv.type == ItemID.LifeCrystal && inv.stack < inv.maxStack)
-                    {
-                        refundSlot = i;
-                        break;
-                    }
-                }
-            }
-
-            if (refundSlot < 0)
-            {
-                for (int i = 0; i < 50; i++)
-                {
-                    var inv = tPlayer.inventory[i];
-                    if (inv == null || inv.IsAir || inv.type == ItemID.None)
-                    {
-                        refundSlot = i;
-                        break;
-                    }
-                }
-            }
-
-            if (refundSlot >= 0 && refundSlot < tPlayer.inventory.Length)
-            {
-                var targetItem = tPlayer.inventory[refundSlot];
-                if (targetItem == null || targetItem.IsAir || targetItem.type != ItemID.LifeCrystal)
-                {
-                    targetItem = new Item();
-                    targetItem.SetDefaults(ItemID.LifeCrystal);
-                    targetItem.stack = 1;
-                    tPlayer.inventory[refundSlot] = targetItem;
-                }
-                else
-                {
-                    targetItem.stack = Math.Min(targetItem.maxStack, targetItem.stack + 1);
-                }
-
-                NetMessage.SendData((int)PacketTypes.PlayerSlot, -1, -1, null, player.Index, refundSlot, targetItem.prefix, 0, 0);
-                NetMessage.SendData((int)PacketTypes.PlayerSlot, player.Index, -1, null, player.Index, refundSlot, targetItem.prefix, 0, 0);
-            }
-        }
-
         private void OnNetGetData(GetDataEventArgs args)
         {
             if (args == null || args.Handled) return;
@@ -966,168 +811,7 @@ namespace ClassSystemPlugin
                         }
                     }
                 }
-                return;
             }
-
-            if (args.MsgID != PacketTypes.PlayerHp) return;
-
-            try
-            {
-                if (args.Msg?.reader == null) return;
-
-                byte pktPlayerId = args.Msg.reader.ReadByte();
-                short statLife = args.Msg.reader.ReadInt16();
-                short statLifeMax = args.Msg.reader.ReadInt16();
-
-                if (statLife <= 0)
-                {
-                    MarkPlayerDead(player, 25.0);
-                    return;
-                }
-
-                if (IsPlayerDeadState(player))
-                {
-                    return;
-                }
-
-                int maxAllowedBaseLife = GetMaxAllowedBaseLife();
-                int incomingMax = statLifeMax > 0 ? statLifeMax : BaseStartHp;
-
-                if (!player.IsLoggedIn || player.Account == null)
-                {
-                    if (player.TPlayer != null)
-                    {
-                        player.TPlayer.statLife = statLife;
-                    }
-                    int rawBase = Math.Min(Math.Max(BaseStartHp, incomingMax), maxAllowedBaseLife);
-                    _playerBaseLife[player.Index] = rawBase;
-                    return;
-                }
-
-                var state = GetPlayerState(player);
-                int hpDelta = GetMaxHpDelta(state);
-
-                // ยึดค่า BaseLife จากฐานข้อมูลเสมอในช่วงแรกหลังล็อกอินหรือเกิดใหม่
-                if (IsInLoginLifeLock(player))
-                {
-                    var freshDb = GetStateFromDB(player.Account.ID);
-                    int lockedBase = freshDb != null ? NormalizeBaseLifeValue(freshDb.BaseLife) : GetTrackedBaseLife(player);
-                    _playerBaseLife[player.Index] = lockedBase;
-                    if (state != null) state.BaseLife = lockedBase;
-                    int lockedTargetMax = Math.Max(20, lockedBase + hpDelta);
-
-                    if (incomingMax != lockedTargetMax)
-                    {
-                        args.Handled = true;
-                        if (player.TPlayer != null)
-                        {
-                            player.TPlayer.statLife = Math.Min(lockedTargetMax, Math.Max(1, (int)statLife));
-                            player.TPlayer.statLifeMax = lockedTargetMax;
-                            player.TPlayer.statLifeMax2 = lockedTargetMax;
-                        }
-                        ForceSyncLifeToClient(player, state ?? freshDb);
-                        return;
-                    }
-                }
-
-                if (state == null || string.IsNullOrEmpty(state.ClassName) || state.StarterChoice <= 0)
-                {
-                    if (player.TPlayer != null)
-                    {
-                        player.TPlayer.statLife = statLife;
-                    }
-                    int rawBase = Math.Min(Math.Max(BaseStartHp, incomingMax), maxAllowedBaseLife);
-                    _playerBaseLife[player.Index] = rawBase;
-                    if (state != null)
-                    {
-                        state.BaseLife = rawBase;
-                        if (!string.IsNullOrEmpty(state.ClassName))
-                        {
-                            SaveStateToDB(player.Account.ID, state);
-                        }
-                    }
-                    return;
-                }
-
-                int currentBase = GetTrackedBaseLife(player);
-                int expectedTargetMax = Math.Max(20, currentBase + hpDelta);
-
-                // หากผู้เล่นครบ 15 ก้อนแล้ว (currentBase >= maxAllowedBaseLife) และพยายามใช้ Life Crystal เพิ่ม
-                if (currentBase >= maxAllowedBaseLife && (incomingMax > expectedTargetMax || (int)statLife > expectedTargetMax))
-                {
-                    args.Handled = true;
-                    BlockLifeCrystalUsage(player);
-                    RefundBlockedLifeCrystal(player);
-                    NotifyBlockedLifeCrystal(player);
-
-                    _playerBaseLife[player.Index] = maxAllowedBaseLife;
-                    state.BaseLife = maxAllowedBaseLife;
-                    SaveStateToDB(player.Account.ID, state);
-
-                    if (player.TPlayer != null)
-                    {
-                        player.TPlayer.statLife = Math.Min(expectedTargetMax, Math.Max(1, (int)statLife));
-                        player.TPlayer.statLifeMax = expectedTargetMax;
-                        player.TPlayer.statLifeMax2 = expectedTargetMax;
-                    }
-
-                    ForceSyncLifeToClient(player, state);
-                    return;
-                }
-
-                bool baseChanged = false;
-                if (incomingMax > expectedTargetMax)
-                {
-                    int rawNewBase = Math.Min(maxAllowedBaseLife, incomingMax - hpDelta);
-                    int normalizedNewBase = NormalizeBaseLifeValue(rawNewBase);
-                    if (normalizedNewBase > currentBase)
-                    {
-                        currentBase = normalizedNewBase;
-                        baseChanged = true;
-                    }
-                    else if (IsLifeCrystalAtLimit(player))
-                    {
-                        args.Handled = true;
-                        BlockLifeCrystalUsage(player);
-                        RefundBlockedLifeCrystal(player);
-                        NotifyBlockedLifeCrystal(player);
-                        ForceSyncLifeToClient(player, state);
-                        return;
-                    }
-                }
-
-                if (baseChanged)
-                {
-                    int newTargetMax = Math.Max(20, currentBase + hpDelta);
-                    _crystalUseCooldown[player.Index] = DateTime.UtcNow;
-                    _playerBaseLife[player.Index] = currentBase;
-                    state.BaseLife = currentBase;
-                    SaveStateToDB(player.Account.ID, state);
-
-                    if (player.TPlayer != null)
-                    {
-                        player.TPlayer.statLife = Math.Min(newTargetMax, Math.Max(1, (int)statLife));
-                        player.TPlayer.statLifeMax = newTargetMax;
-                        player.TPlayer.statLifeMax2 = newTargetMax;
-                    }
-
-                    args.Handled = true;
-                    ForceSyncLifeToClient(player, state);
-                    return;
-                }
-
-                if (player.TPlayer != null)
-                {
-                    player.TPlayer.statLife = Math.Min(expectedTargetMax, (int)statLife);
-                }
-
-                if (incomingMax != expectedTargetMax)
-                {
-                    args.Handled = true;
-                    ForceSyncLifeToClient(player, state);
-                }
-            }
-            catch { }
         }
 
         private void OnPlayerDamage(object sender, GetDataHandlers.PlayerDamageEventArgs args)
@@ -1356,52 +1040,6 @@ namespace ClassSystemPlugin
             }
         }
 
-        private int GetMaxAllowedBaseLife()
-        {
-            int crystals = Math.Max(0, MaxLifeCrystalsAllowed);
-            return BaseStartHp + (crystals * HpPerLifeCrystal);
-        }
-
-        private int NormalizeBaseLifeValue(int rawBase)
-        {
-            int maxAllowed = GetMaxAllowedBaseLife();
-            if (rawBase <= BaseStartHp) return BaseStartHp;
-            if (rawBase >= maxAllowed) return maxAllowed;
-            int offset = rawBase - BaseStartHp;
-            int steps = offset / HpPerLifeCrystal;
-            return BaseStartHp + (steps * HpPerLifeCrystal);
-        }
-
-        private int GetTrackedBaseLife(TSPlayer player)
-        {
-            int maxAllowedBaseLife = GetMaxAllowedBaseLife();
-            if (player != null && player.IsLoggedIn && player.Account != null)
-            {
-                var state = GetPlayerState(player);
-                if (state != null && state.BaseLife >= BaseStartHp)
-                {
-                    int fromState = NormalizeBaseLifeValue(state.BaseLife);
-                    _playerBaseLife[player.Index] = fromState;
-                    return fromState;
-                }
-            }
-
-            if (player != null && _playerBaseLife.TryGetValue(player.Index, out int tracked))
-            {
-                return Math.Min(Math.Max(BaseStartHp, tracked), maxAllowedBaseLife);
-            }
-
-            _playerBaseLife[player?.Index ?? 0] = BaseStartHp;
-            return BaseStartHp;
-        }
-
-        private bool IsLifeCrystalAtLimit(TSPlayer player)
-        {
-            if (player?.TPlayer == null) return false;
-            int maxAllowedBaseLife = GetMaxAllowedBaseLife();
-            return GetTrackedBaseLife(player) >= maxAllowedBaseLife;
-        }
-
         private void CancelActivePlayerProjectiles(TSPlayer player)
         {
             if (player == null) return;
@@ -1414,16 +1052,6 @@ namespace ClassSystemPlugin
                     NetMessage.SendData((int)PacketTypes.ProjectileDestroy, -1, -1, null, i, player.Index);
                 }
             }
-        }
-
-        private void BlockLifeCrystalUsage(TSPlayer player)
-        {
-            if (player?.TPlayer == null) return;
-            player.TPlayer.controlUseItem = false;
-            player.TPlayer.controlUseTile = false;
-            player.TPlayer.itemAnimation = 0;
-            player.TPlayer.itemAnimationMax = 0;
-            player.TPlayer.itemTime = 0;
         }
 
         private int SpawnDroppedItemAwayFromPlayer(TSPlayer player, int itemType, int stack, byte prefix)
@@ -1909,7 +1537,7 @@ namespace ClassSystemPlugin
                 _db = new SqliteConnection($"Data Source={dbPath}");
                 _db.Open();
 
-                ExecuteNonQuery("CREATE TABLE IF NOT EXISTS PlayerClasses (AccountID INTEGER PRIMARY KEY, ClassName TEXT NOT NULL, StarterChoice INTEGER NOT NULL DEFAULT 0, BaseLife INTEGER NOT NULL DEFAULT 100)");
+                ExecuteNonQuery("CREATE TABLE IF NOT EXISTS PlayerClasses (AccountID INTEGER PRIMARY KEY, ClassName TEXT NOT NULL, StarterChoice INTEGER NOT NULL DEFAULT 0)");
                 EnsureColumnsExist();
                 _dbReady = true;
             }
@@ -1927,7 +1555,6 @@ namespace ClassSystemPlugin
             {
                 EnsureConnectionOpen();
                 bool hasChoiceCol = false;
-                bool hasBaseLifeCol = false;
                 using (var cmd = _db.CreateCommand())
                 {
                     cmd.CommandText = "PRAGMA table_info(PlayerClasses)";
@@ -1940,8 +1567,6 @@ namespace ClassSystemPlugin
                                 string colName = reader.GetString(1);
                                 if (string.Equals(colName, "StarterChoice", StringComparison.OrdinalIgnoreCase))
                                     hasChoiceCol = true;
-                                else if (string.Equals(colName, "BaseLife", StringComparison.OrdinalIgnoreCase))
-                                    hasBaseLifeCol = true;
                             }
                         }
                     }
@@ -1949,10 +1574,6 @@ namespace ClassSystemPlugin
                 if (!hasChoiceCol)
                 {
                     ExecuteNonQuery("ALTER TABLE PlayerClasses ADD COLUMN StarterChoice INTEGER NOT NULL DEFAULT 0");
-                }
-                if (!hasBaseLifeCol)
-                {
-                    ExecuteNonQuery("ALTER TABLE PlayerClasses ADD COLUMN BaseLife INTEGER NOT NULL DEFAULT 100");
                 }
             }
             catch { }
@@ -2036,7 +1657,6 @@ namespace ClassSystemPlugin
             if (args.Player?.Account == null) return;
 
             ClearWebBuff(args.Player);
-            ArmLoginLifeLock(args.Player, 5.0);
 
             int accountId = args.Player.Account.ID;
             var savedState = GetStateFromDB(accountId);
@@ -2044,11 +1664,7 @@ namespace ClassSystemPlugin
 
             if (savedState != null && !string.IsNullOrEmpty(savedState.ClassName))
             {
-                int normalizedBase = NormalizeBaseLifeValue(savedState.BaseLife);
-                savedState.BaseLife = normalizedBase;
                 _playerStates[accountId] = savedState;
-                _playerBaseLife[args.Player.Index] = normalizedBase;
-                _lastSyncedMaxLife.Remove(args.Player.Index);
 
                 if (savedState.StarterChoice > 0)
                 {
@@ -2057,7 +1673,6 @@ namespace ClassSystemPlugin
                     EnforceAllowedInventory(args.Player, savedState.ClassName);
                     if (!IsPlayerDeadState(args.Player))
                     {
-                        ForceSyncLifeToClient(args.Player, savedState);
                         EnsurePermanentClassBuffs(args.Player, savedState, true);
                     }
                     args.Player.SendSuccessMessage($"[ClassSystem] Welcome back! Class: {savedState.ClassName.ToUpper()} (Pack /ch {savedState.StarterChoice})");
@@ -2076,8 +1691,6 @@ namespace ClassSystemPlugin
             }
             else
             {
-                int initialBase = NormalizeBaseLifeValue(args.Player.TPlayer?.statLifeMax ?? BaseStartHp);
-                _playerBaseLife[args.Player.Index] = initialBase;
                 ApplyUnderworldLock(args.Player, true);
                 args.Player.SendWarningMessage(ClassSelectPrompt);
                 BroadcastSelectionPhase(
@@ -2095,7 +1708,6 @@ namespace ClassSystemPlugin
             {
                 if (_playerStates.TryGetValue(player.Account.ID, out var st) && !string.IsNullOrEmpty(st.ClassName))
                 {
-                    st.BaseLife = NormalizeBaseLifeValue(st.BaseLife);
                     SaveStateToDB(player.Account.ID, st);
                 }
                 _playerStates.Remove(player.Account.ID);
@@ -2107,15 +1719,9 @@ namespace ClassSystemPlugin
             _lastBroadcastPhase.Remove(args.Who);
             _dropWarnCooldown.Remove(args.Who);
             _craftWarnCooldown.Remove(args.Who);
-            _crystalWarnCooldown.Remove(args.Who);
-            _crystalUseCooldown.Remove(args.Who);
-            _lastLifeCrystalSlot.Remove(args.Who);
             _buffRefreshCooldown.Remove(args.Who);
             _lockedBuffRestoreCooldown.Remove(args.Who);
             _legacyBuffPurgeCooldown.Remove(args.Who);
-            _lastSyncedMaxLife.Remove(args.Who);
-            _playerBaseLife.Remove(args.Who);
-            _loginLifeLockUntil.Remove(args.Who);
             _honeyRegenAccumulator.Remove(args.Who);
             _blockedWorldItemsByPlayer.Remove(args.Who);
             _playerDeadUntil.Remove(args.Who);
@@ -2193,16 +1799,6 @@ namespace ClassSystemPlugin
             }
         }
 
-        private void NotifyBlockedLifeCrystal(TSPlayer player)
-        {
-            if (player == null) return;
-            if (!_crystalWarnCooldown.TryGetValue(player.Index, out DateTime lastCrystalWarn) || (DateTime.UtcNow - lastCrystalWarn).TotalSeconds >= 3)
-            {
-                _crystalWarnCooldown[player.Index] = DateTime.UtcNow;
-                player.SendWarningMessage($"[ClassSystem] Life Crystal usage blocked — limit is {MaxLifeCrystalsAllowed} crystals ({GetMaxAllowedBaseLife()} base HP). Item kept in inventory.");
-            }
-        }
-
         private void OnPlayerUpdate(object sender, GetDataHandlers.PlayerUpdateEventArgs args)
         {
             var player = TShock.Players[args.PlayerId];
@@ -2263,25 +1859,6 @@ namespace ClassSystemPlugin
 
                     MaintainBlockedWorldItems(player);
 
-                    Item held = player.TPlayer.HeldItem;
-                    Item cursor = (player.TPlayer.inventory.Length > 58) ? player.TPlayer.inventory[58] : null;
-                    bool holdingCrystal = (held != null && !held.IsAir && held.type == ItemID.LifeCrystal) ||
-                                          (cursor != null && !cursor.IsAir && cursor.type == ItemID.LifeCrystal);
-
-                    if (holdingCrystal && IsLifeCrystalAtLimit(player))
-                    {
-                        if (cursor != null && !cursor.IsAir && cursor.type == ItemID.LifeCrystal)
-                            _lastLifeCrystalSlot[player.Index] = 58;
-                        else if (player.TPlayer.selectedItem >= 0 && player.TPlayer.selectedItem < 50)
-                            _lastLifeCrystalSlot[player.Index] = player.TPlayer.selectedItem;
-
-                        BlockLifeCrystalUsage(player);
-                        if (args.Control.IsUsingItem)
-                        {
-                            NotifyBlockedLifeCrystal(player);
-                        }
-                    }
-
                     if (HasAnyDisallowedItemInInventory(player, state.ClassName))
                     {
                         player.TPlayer.controlUseItem = false;
@@ -2301,11 +1878,6 @@ namespace ClassSystemPlugin
 
             var state = GetPlayerState(player);
             if (state == null || string.IsNullOrEmpty(state.ClassName)) return;
-
-            if (args.Type == ItemID.LifeCrystal && args.Stack > 0 && args.Slot >= 0 && args.Slot < 59)
-            {
-                _lastLifeCrystalSlot[player.Index] = args.Slot;
-            }
 
             if (args.Type > ItemID.None && args.Stack > 0)
             {
@@ -2403,7 +1975,6 @@ namespace ClassSystemPlugin
                 }
 
                 ApplyHoneyRegenBonus(player, state, honeyDeltaSec);
-                ApplyClassStats(player, state);
                 ApplyBrokenArmorDefenseEffect(player, state);
 
                 if (runPeriodicSync)
@@ -2560,20 +2131,14 @@ namespace ClassSystemPlugin
                 return;
             }
 
-            int baseLife = _playerBaseLife.TryGetValue(args.Player.Index, out int tracked)
-                ? NormalizeBaseLifeValue(tracked)
-                : NormalizeBaseLifeValue(args.Player.TPlayer?.statLifeMax ?? BaseStartHp);
-
             var newState = new PlayerClassState
             {
                 ClassName = chosen,
-                StarterChoice = 0,
-                BaseLife = baseLife
+                StarterChoice = 0
             };
 
             SaveStateToDB(args.Player.Account.ID, newState);
             _playerStates[args.Player.Account.ID] = newState;
-            _playerBaseLife[args.Player.Index] = baseLife;
 
             string choicePrompt = GetStarterChoicePrompt(chosen);
             ApplyUnderworldLock(args.Player, true);
@@ -2608,21 +2173,16 @@ namespace ClassSystemPlugin
                 return;
             }
 
-            int baseLife = NormalizeBaseLifeValue(state.BaseLife);
             state.StarterChoice = choice;
-            state.BaseLife = baseLife;
 
             SaveStateToDB(args.Player.Account.ID, state);
             _playerStates[args.Player.Account.ID] = state;
-            _playerBaseLife[args.Player.Index] = baseLife;
 
             RemoveAllWeaponsFromInventory(args.Player);
             EnforceAllowedInventory(args.Player, state.ClassName);
             GiveStarterItems(args.Player, state.ClassName, choice);
             ClearWebAndTeleportToSpawn(args.Player);
             CleanDisallowedSpeedBuffs(args.Player, state, true);
-
-            ForceSyncLifeToClient(args.Player, state);
             EnsurePermanentClassBuffs(args.Player, state, true);
 
             args.Player.SendSuccessMessage($"[ClassSystem] Starter pack /ch {choice} selected for {state.ClassName.ToUpper()}! Weapons cleared, starter gear granted, buffs active, GodMode disabled, and released from the Underworld.");
@@ -2651,29 +2211,13 @@ namespace ClassSystemPlugin
                 return;
             }
 
-            var prevState = GetPlayerState(target);
-            int preservedBaseLife = prevState != null
-                ? NormalizeBaseLifeValue(prevState.BaseLife)
-                : (_playerBaseLife.TryGetValue(target.Index, out int tracked) ? NormalizeBaseLifeValue(tracked) : BaseStartHp);
-
             string option = args.Parameters[1].ToLowerInvariant();
             if (option == "none" || option == "reset")
             {
                 DeleteStateFromDB(target.Account.ID);
                 _playerStates.Remove(target.Account.ID);
-                _lastSyncedMaxLife.Remove(target.Index);
-                _playerBaseLife[target.Index] = preservedBaseLife;
                 _lastBroadcastPhase.Remove(target.Index);
                 ClearPlayerDeadState(target);
-
-                target.TPlayer.statLifeMax = preservedBaseLife;
-                target.TPlayer.statLifeMax2 = preservedBaseLife;
-                if (target.TPlayer.statLife > preservedBaseLife)
-                {
-                    target.TPlayer.statLife = preservedBaseLife;
-                }
-                NetMessage.SendData((int)PacketTypes.PlayerHp, -1, -1, null, target.Index);
-                NetMessage.SendData((int)PacketTypes.PlayerHp, target.Index, -1, null, target.Index);
 
                 CleanDisallowedSpeedBuffs(target, null, true);
                 ApplyUnderworldLock(target, true);
@@ -2693,24 +2237,12 @@ namespace ClassSystemPlugin
             var newState = new PlayerClassState
             {
                 ClassName = resolvedOption,
-                StarterChoice = 0,
-                BaseLife = preservedBaseLife
+                StarterChoice = 0
             };
             SaveStateToDB(target.Account.ID, newState);
             _playerStates[target.Account.ID] = newState;
-            _lastSyncedMaxLife.Remove(target.Index);
-            _playerBaseLife[target.Index] = preservedBaseLife;
             _lastBroadcastPhase.Remove(target.Index);
             ClearPlayerDeadState(target);
-
-            target.TPlayer.statLifeMax = preservedBaseLife;
-            target.TPlayer.statLifeMax2 = preservedBaseLife;
-            if (target.TPlayer.statLife > preservedBaseLife)
-            {
-                target.TPlayer.statLife = preservedBaseLife;
-            }
-            NetMessage.SendData((int)PacketTypes.PlayerHp, -1, -1, null, target.Index);
-            NetMessage.SendData((int)PacketTypes.PlayerHp, target.Index, -1, null, target.Index);
 
             CleanDisallowedSpeedBuffs(target, newState, true);
             string choicePrompt = GetStarterChoicePrompt(resolvedOption);
@@ -2732,57 +2264,6 @@ namespace ClassSystemPlugin
             return fromDb;
         }
 
-        private void ForceSyncLifeToClient(TSPlayer player, PlayerClassState state)
-        {
-            if (player?.TPlayer == null || !player.Active || IsPlayerDeadState(player)) return;
-
-            var tPlayer = player.TPlayer;
-            int currentBaseLife = GetTrackedBaseLife(player);
-            int hpDelta = GetMaxHpDelta(state);
-            int targetMaxLife = Math.Max(20, currentBaseLife + hpDelta);
-
-            tPlayer.statLifeMax = targetMaxLife;
-            tPlayer.statLifeMax2 = targetMaxLife;
-
-            if (tPlayer.statLife > targetMaxLife)
-            {
-                tPlayer.statLife = targetMaxLife;
-            }
-            else if (tPlayer.statLife <= 0)
-            {
-                tPlayer.statLife = Math.Min(targetMaxLife, 100);
-            }
-
-            _lastSyncedMaxLife[player.Index] = targetMaxLife;
-            NetMessage.SendData((int)PacketTypes.PlayerHp, -1, -1, null, player.Index);
-            NetMessage.SendData((int)PacketTypes.PlayerHp, player.Index, -1, null, player.Index);
-        }
-
-        private void ApplyClassStats(TSPlayer player, PlayerClassState state)
-        {
-            if (IsPlayerDeadState(player)) return;
-
-            var tPlayer = player.TPlayer;
-            int currentBaseLife = GetTrackedBaseLife(player);
-            int hpDelta = GetMaxHpDelta(state);
-            int targetMaxLife = Math.Max(20, currentBaseLife + hpDelta);
-
-            tPlayer.statLifeMax = targetMaxLife;
-            tPlayer.statLifeMax2 = targetMaxLife;
-
-            if (tPlayer.statLife > targetMaxLife)
-            {
-                tPlayer.statLife = targetMaxLife;
-            }
-
-            if (!_lastSyncedMaxLife.TryGetValue(player.Index, out int lastMaxLife) || lastMaxLife != targetMaxLife)
-            {
-                _lastSyncedMaxLife[player.Index] = targetMaxLife;
-                NetMessage.SendData((int)PacketTypes.PlayerHp, -1, -1, null, player.Index);
-                NetMessage.SendData((int)PacketTypes.PlayerHp, player.Index, -1, null, player.Index);
-            }
-        }
-
         private PlayerClassState GetStateFromDB(int accountId)
         {
             if (_db == null) return null;
@@ -2791,7 +2272,7 @@ namespace ClassSystemPlugin
                 EnsureConnectionOpen();
                 using (var cmd = _db.CreateCommand())
                 {
-                    cmd.CommandText = "SELECT ClassName, StarterChoice, BaseLife FROM PlayerClasses WHERE AccountID = @0";
+                    cmd.CommandText = "SELECT ClassName, StarterChoice FROM PlayerClasses WHERE AccountID = @0";
                     var p = cmd.CreateParameter();
                     p.ParameterName = "@0";
                     p.Value = accountId;
@@ -2803,12 +2284,10 @@ namespace ClassSystemPlugin
                         {
                             string cName = reader.GetString(0);
                             int choice = !reader.IsDBNull(1) ? reader.GetInt32(1) : 0;
-                            int baseLife = !reader.IsDBNull(2) ? reader.GetInt32(2) : BaseStartHp;
                             return new PlayerClassState
                             {
                                 ClassName = cName,
-                                StarterChoice = choice,
-                                BaseLife = NormalizeBaseLifeValue(baseLife)
+                                StarterChoice = choice
                             };
                         }
                     }
@@ -2826,10 +2305,9 @@ namespace ClassSystemPlugin
             if (state == null || string.IsNullOrEmpty(state.ClassName)) return;
             try
             {
-                int normalizedBase = NormalizeBaseLifeValue(state.BaseLife);
                 ExecuteNonQuery(
-                    "INSERT INTO PlayerClasses (AccountID, ClassName, StarterChoice, BaseLife) VALUES (@0, @1, @2, @3) ON CONFLICT(AccountID) DO UPDATE SET ClassName = excluded.ClassName, StarterChoice = excluded.StarterChoice, BaseLife = excluded.BaseLife",
-                    ("@0", accountId), ("@1", state.ClassName), ("@2", state.StarterChoice), ("@3", normalizedBase));
+                    "INSERT INTO PlayerClasses (AccountID, ClassName, StarterChoice) VALUES (@0, @1, @2) ON CONFLICT(AccountID) DO UPDATE SET ClassName = excluded.ClassName, StarterChoice = excluded.StarterChoice",
+                    ("@0", accountId), ("@1", state.ClassName), ("@2", state.StarterChoice));
             }
             catch (Exception ex)
             {
