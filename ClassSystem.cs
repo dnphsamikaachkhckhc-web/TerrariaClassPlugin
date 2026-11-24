@@ -27,8 +27,8 @@ namespace ClassSystemPlugin
     {
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
-        public override string Description => "Class & starter-choice (/ch 1|2) system with flicker-free permanent buffs/debuffs, +60 Max HP and unremovable Bleeding, Weak, and Endurance buffs for Melee /ch 1, permanent Swiftness buff for all classes/choices except Melee (warrior), natural Slow/debuff preservation across all classes, zero-rubberband movement, solid-ground Underworld spawn detection, zero-damage lock against NPCs & GodMode invulnerability while logging in/choosing class/starter pack, cross-class crafting/cursor/inventory ejection, NetGetData PlayerHp packet handling, incremental Life Crystal tracking, SlimeStaff for summoner /ch 1, and permanent class/choice buffs & debuffs.";
-        public override Version Version => new Version(17, 11, 0);
+        public override string Description => "Class & starter-choice (/ch 1|2) system with zero-flicker permanent buffs/debuffs, +60 Max HP and unremovable Bleeding, Weak, and Endurance buffs for Melee /ch 1, permanent Swiftness buff for all classes/choices except Melee (warrior), natural Slow/debuff preservation across all classes, zero-rubberband movement, solid-ground Underworld spawn detection, zero-damage lock against NPCs & GodMode invulnerability while logging in/choosing class/starter pack, cross-class crafting/cursor/inventory ejection, NetGetData PlayerHp packet handling, incremental Life Crystal tracking, SlimeStaff for summoner /ch 1, and permanent class/choice buffs & debuffs.";
+        public override Version Version => new Version(17, 12, 0);
 
         private const string ClassSelectPrompt =
             "Chat by Shokuya :3 Please select your class >w<\n\n" +
@@ -50,6 +50,7 @@ namespace ClassSystemPlugin
         private readonly Dictionary<int, DateTime> _slotEjectCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, DateTime> _crystalWarnCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, DateTime> _buffRefreshCooldown = new Dictionary<int, DateTime>();
+        private readonly Dictionary<int, DateTime> _lockedBuffRestoreCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, DateTime> _legacyBuffPurgeCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, int> _lastSyncedMaxLife = new Dictionary<int, int>();
         private readonly Dictionary<int, int> _playerBaseLife = new Dictionary<int, int>();
@@ -64,9 +65,8 @@ namespace ClassSystemPlugin
         private const int BaseStartHp = 100;
         private const int HpPerLifeCrystal = 20;
 
-        // ระยะเวลาบัฟ 10 นาที (36000 ticks) และเติมใหม่เมื่อต่ำกว่า 5 นาที (18000 ticks) เพื่อป้องกันไอคอนบัฟกระพริบ
-        private const int PermanentBuffDurationTicks = 36000;
-        private const int PermanentBuffRefreshThresholdTicks = 18000;
+        // ระยะเวลาบัฟ 15 นาที (54000 ticks) เพื่อให้นิ่งสนิทไม่เกิดการรีเฟรชถี่
+        private const int PermanentBuffDurationTicks = 54000;
 
         private readonly List<string> _availableClasses = new List<string>
         {
@@ -494,43 +494,24 @@ namespace ClassSystemPlugin
             return list.ToArray();
         }
 
-        // บังคับคงบัฟที่ห้ามล้างออกแบบนิ่ง ไม่ส่งแพ็กเก็ตซ้ำซ้อนจนไอคอนกระพริบ
-        private void EnforceUnremovableBuffs(TSPlayer player, PlayerClassState state, bool forceSync = false)
+        // คืนเฉพาะบัฟที่หายไปจริง ๆ ด้วย PlayerAddBuff ทีละตัว ไม่ส่ง PlayerBuff ยกแผงเพื่อไม่ให้แถบบัฟทั้งหมดกระพริบ
+        private void RestoreMissingLockedBuffs(TSPlayer player, PlayerClassState state, ICollection<int> missingBuffIds, bool bypassCooldown = false)
         {
             if (player?.TPlayer == null || !player.Active || player.TPlayer.dead) return;
+            if (missingBuffIds == null || missingBuffIds.Count == 0) return;
 
-            int[] lockedBuffs = GetLockedBuffsForState(state);
-            if (lockedBuffs.Length == 0) return;
-
-            bool needsSync = forceSync;
-            foreach (int lockId in lockedBuffs)
+            if (!bypassCooldown &&
+                _lockedBuffRestoreCooldown.TryGetValue(player.Index, out DateTime lastRestore) &&
+                (DateTime.UtcNow - lastRestore).TotalMilliseconds < 400)
             {
-                bool activeNow = false;
-                for (int i = 0; i < Player.maxBuffs; i++)
-                {
-                    if (player.TPlayer.buffType[i] == lockId)
-                    {
-                        if (player.TPlayer.buffTime[i] <= PermanentBuffRefreshThresholdTicks)
-                        {
-                            player.TPlayer.buffTime[i] = PermanentBuffDurationTicks;
-                            needsSync = true;
-                        }
-                        activeNow = true;
-                        break;
-                    }
-                }
-
-                if (!activeNow)
-                {
-                    player.SetBuff(lockId, PermanentBuffDurationTicks, true);
-                    needsSync = true;
-                }
+                return;
             }
 
-            if (needsSync)
+            _lockedBuffRestoreCooldown[player.Index] = DateTime.UtcNow;
+
+            foreach (int buffId in missingBuffIds)
             {
-                NetMessage.SendData((int)PacketTypes.PlayerBuff, -1, -1, null, player.Index);
-                NetMessage.SendData((int)PacketTypes.PlayerBuff, player.Index, -1, null, player.Index);
+                player.SetBuff(buffId, PermanentBuffDurationTicks, true);
             }
         }
 
@@ -561,49 +542,48 @@ namespace ClassSystemPlugin
             if (forceImmediate || foundDisallowedOnServer)
             {
                 _legacyBuffPurgeCooldown[player.Index] = DateTime.UtcNow;
-
                 NetMessage.SendData((int)PacketTypes.PlayerAddBuff, player.Index, -1, null, player.Index, BuffID.Swiftness, 0);
-                NetMessage.SendData((int)PacketTypes.PlayerBuff, -1, -1, null, player.Index);
-                NetMessage.SendData((int)PacketTypes.PlayerBuff, player.Index, -1, null, player.Index);
             }
         }
 
-        private void EnsurePermanentClassBuffs(TSPlayer player, PlayerClassState state)
+        private void EnsurePermanentClassBuffs(TSPlayer player, PlayerClassState state, bool forceInitial = false)
         {
             if (player == null || player.TPlayer == null || !player.Active || player.TPlayer.dead) return;
             if (state == null || string.IsNullOrEmpty(state.ClassName) || state.StarterChoice <= 0) return;
 
-            EnforceUnremovableBuffs(player, state, false);
-
-            if (_buffRefreshCooldown.TryGetValue(player.Index, out DateTime lastCd) && (DateTime.UtcNow - lastCd).TotalMilliseconds < 2500)
+            if (!forceInitial &&
+                _buffRefreshCooldown.TryGetValue(player.Index, out DateTime lastCd) &&
+                (DateTime.UtcNow - lastCd).TotalSeconds < 3.0)
+            {
                 return;
+            }
+
+            _buffRefreshCooldown[player.Index] = DateTime.UtcNow;
 
             int[] requiredBuffs = GetPermanentBuffsForState(state, player.TPlayer);
             if (requiredBuffs.Length == 0) return;
 
-            bool appliedAny = false;
             foreach (int buffId in requiredBuffs)
             {
-                bool found = false;
+                bool exists = false;
                 for (int i = 0; i < Player.maxBuffs; i++)
                 {
-                    if (player.TPlayer.buffType[i] == buffId && player.TPlayer.buffTime[i] > PermanentBuffRefreshThresholdTicks)
+                    if (player.TPlayer.buffType[i] == buffId)
                     {
-                        found = true;
+                        exists = true;
+                        // อัปเดตเวลาเฉพาะตอนที่ใกล้หมดจริง ๆ (เหลือน้อยกว่า 1 นาที = 3600 ticks)
+                        if (player.TPlayer.buffTime[i] > 0 && player.TPlayer.buffTime[i] < 3600)
+                        {
+                            player.SetBuff(buffId, PermanentBuffDurationTicks, true);
+                        }
                         break;
                     }
                 }
 
-                if (!found)
+                if (!exists)
                 {
                     player.SetBuff(buffId, PermanentBuffDurationTicks, true);
-                    appliedAny = true;
                 }
-            }
-
-            if (appliedAny)
-            {
-                _buffRefreshCooldown[player.Index] = DateTime.UtcNow;
             }
         }
 
@@ -703,8 +683,8 @@ namespace ClassSystemPlugin
             var player = TShock.Players[args.Msg.whoAmI];
             if (player == null || !player.Active) return;
 
-            // ป้องกันการส่งแพ็กเก็ตบัฟ (เช่น ล้างบัฟหรือกดยาแก้บัฟ) ที่พยายามลบ Bleeding, Weak, หรือ Endurance ของ warrior /ch 1
-            // โดยจะยิงซิงก์กลับเฉพาะเมื่อบัฟที่ถูกล็อกหายไปจริง ๆ เพื่อไม่ให้เกิดอาการไอคอนกระพริบ
+            // ดักตรวจแพ็กเก็ตบัฟจาก Client เฉพาะเมื่อมีการพยายามลบบัฟที่ห้ามล้างออก (เช่น Bleeding, Weak, Endurance ของ warrior /ch 1)
+            // จะไม่แทรกแซงแพ็กเก็ตปกติเพื่อป้องกันแถบบัฟกระพริบ
             if (args.MsgID == PacketTypes.PlayerAddBuff || args.MsgID == PacketTypes.PlayerBuff)
             {
                 if (player.IsLoggedIn && player.Account != null)
@@ -726,7 +706,7 @@ namespace ClassSystemPlugin
                                 if (targetId == player.Index && Array.IndexOf(lockedBuffs, (int)buffType) >= 0 && buffTime <= 0)
                                 {
                                     args.Handled = true;
-                                    EnforceUnremovableBuffs(player, state, true);
+                                    RestoreMissingLockedBuffs(player, state, new[] { (int)buffType }, true);
                                     return;
                                 }
                             }
@@ -748,21 +728,18 @@ namespace ClassSystemPlugin
                                     }
                                     args.Msg.reader.BaseStream.Position = pos;
 
-                                    bool missingLocked = false;
+                                    var missing = new List<int>();
                                     foreach (int lockId in lockedBuffs)
                                     {
                                         if (!incomingBuffs.Contains(lockId))
                                         {
-                                            missingLocked = true;
-                                            break;
+                                            missing.Add(lockId);
                                         }
                                     }
 
-                                    if (missingLocked)
+                                    if (missing.Count > 0)
                                     {
-                                        args.Handled = true;
-                                        EnforceUnremovableBuffs(player, state, true);
-                                        return;
+                                        RestoreMissingLockedBuffs(player, state, missing, false);
                                     }
                                 }
                                 else
@@ -1396,8 +1373,6 @@ namespace ClassSystemPlugin
             if (removed)
             {
                 NetMessage.SendData((int)PacketTypes.PlayerAddBuff, player.Index, -1, null, player.Index, BuffID.Webbed, 0);
-                NetMessage.SendData((int)PacketTypes.PlayerBuff, -1, -1, null, player.Index);
-                NetMessage.SendData((int)PacketTypes.PlayerBuff, player.Index, -1, null, player.Index);
             }
         }
 
@@ -1595,7 +1570,7 @@ namespace ClassSystemPlugin
                     CleanDisallowedSpeedBuffs(args.Player, savedState, true);
                     EnforceAllowedInventory(args.Player, savedState.ClassName);
                     ApplyClassStats(args.Player, savedState);
-                    EnsurePermanentClassBuffs(args.Player, savedState);
+                    EnsurePermanentClassBuffs(args.Player, savedState, true);
                     args.Player.SendSuccessMessage($"[ClassSystem] Welcome back! Class: {savedState.ClassName.ToUpper()} (Pack /ch {savedState.StarterChoice})");
                 }
                 else
@@ -1638,6 +1613,7 @@ namespace ClassSystemPlugin
             _craftWarnCooldown.Remove(args.Who);
             _crystalWarnCooldown.Remove(args.Who);
             _buffRefreshCooldown.Remove(args.Who);
+            _lockedBuffRestoreCooldown.Remove(args.Who);
             _legacyBuffPurgeCooldown.Remove(args.Who);
             _lastSyncedMaxLife.Remove(args.Who);
             _playerBaseLife.Remove(args.Who);
@@ -1779,7 +1755,6 @@ namespace ClassSystemPlugin
                 {
                     SetUnderworldGodMode(player, false);
                     _frozenPositions.Remove(player.Index);
-                    EnforceUnremovableBuffs(player, state, false);
 
                     CleanupInactiveBlockedWorldItems(player.Index);
                     Item held = player.TPlayer.HeldItem;
@@ -1906,7 +1881,6 @@ namespace ClassSystemPlugin
                 }
 
                 SetUnderworldGodMode(player, false);
-                EnforceUnremovableBuffs(player, state, false);
                 ApplyHoneyRegenBonus(player, state, honeyDeltaSec);
                 ApplyClassStats(player, state);
                 ApplyBrokenArmorDefenseEffect(player, state);
@@ -1922,7 +1896,7 @@ namespace ClassSystemPlugin
                     CleanDisallowedSpeedBuffs(player, state, false);
                     CleanupInactiveBlockedWorldItems(player.Index);
                     EnforceAllowedInventory(player, state.ClassName);
-                    EnsurePermanentClassBuffs(player, state);
+                    EnsurePermanentClassBuffs(player, state, false);
                 }
             }
         }
@@ -2129,8 +2103,7 @@ namespace ClassSystemPlugin
 
             _lastSyncedMaxLife.Remove(args.Player.Index);
             ApplyClassStats(args.Player, state);
-            EnsurePermanentClassBuffs(args.Player, state);
-            EnforceUnremovableBuffs(args.Player, state, true);
+            EnsurePermanentClassBuffs(args.Player, state, true);
 
             args.Player.SendSuccessMessage($"[ClassSystem] Starter pack /ch {choice} selected for {state.ClassName.ToUpper()}! Weapons cleared, starter gear granted, buffs active, GodMode disabled, and released from the Underworld.");
             TShock.Utils.Broadcast($"[ClassSystem] {args.Player.Name} picked starter pack /ch {choice} for {state.ClassName.ToUpper()} and joined the surface!", Color.LightGreen);
