@@ -28,8 +28,8 @@ namespace ClassSystemPlugin
     {
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
-        public override string Description => "Class & starter-choice (/ch 1|2) system with proper death/respawn state tracking (fixing the instant-revive bug on fall/fatal damage), synced 160 HP for Melee /ch 1, cross-class item ejection away from the player, persistent SQLite BaseLife tracking, and zero-flicker permanent buffs/debuffs.";
-        public override Version Version => new Version(17, 23, 0);
+        public override string Description => "Class & starter-choice (/ch 1|2) system with strict 15 Life Crystal cap & automatic crystal refund on excess use, proper death/respawn state tracking, synced HP stats, cross-class item ejection away from the player, persistent SQLite BaseLife tracking, and zero-flicker permanent buffs/debuffs.";
+        public override Version Version => new Version(17, 24, 0);
 
         private const string ClassSelectPrompt =
             "Chat by Shokuya :3 Please select your class >w<\n\n" +
@@ -51,6 +51,7 @@ namespace ClassSystemPlugin
         private readonly Dictionary<long, DateTime> _itemTypeEjectCooldown = new Dictionary<long, DateTime>();
         private readonly Dictionary<int, DateTime> _crystalWarnCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, DateTime> _crystalUseCooldown = new Dictionary<int, DateTime>();
+        private readonly Dictionary<int, int> _lastLifeCrystalSlot = new Dictionary<int, int>();
         private readonly Dictionary<int, DateTime> _buffRefreshCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, DateTime> _lockedBuffRestoreCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, DateTime> _legacyBuffPurgeCooldown = new Dictionary<int, DateTime>();
@@ -756,81 +757,88 @@ namespace ClassSystemPlugin
             return false;
         }
 
-        private bool TryConsumeLifeCrystalManually(TSPlayer player, PlayerClassState state)
+        // คืน Life Crystal 1 ก้อนกลับเข้ากระเป๋า/เคอร์เซอร์ของ Client เมื่อกดใช้เกินลิมิต 15 ก้อน
+        private void RefundBlockedLifeCrystal(TSPlayer player)
         {
-            if (player?.TPlayer == null || !player.Active || IsPlayerDeadState(player)) return false;
-            if (state == null || string.IsNullOrEmpty(state.ClassName) || state.StarterChoice <= 0) return false;
-
-            int currentBase = GetTrackedBaseLife(player);
-            int maxAllowedBase = GetMaxAllowedBaseLife();
-            if (currentBase >= maxAllowedBase) return false;
-
-            if (_crystalUseCooldown.TryGetValue(player.Index, out DateTime lastUse) &&
-                (DateTime.UtcNow - lastUse).TotalMilliseconds < 500)
-            {
-                return false;
-            }
-
+            if (player?.TPlayer == null) return;
             var tPlayer = player.TPlayer;
-            int crystalSlot = -1;
 
-            if (tPlayer.selectedItem >= 0 && tPlayer.selectedItem < 50 &&
-                tPlayer.inventory[tPlayer.selectedItem] != null &&
-                !tPlayer.inventory[tPlayer.selectedItem].IsAir &&
-                tPlayer.inventory[tPlayer.selectedItem].type == ItemID.LifeCrystal &&
-                tPlayer.inventory[tPlayer.selectedItem].stack > 0)
+            int refundSlot = -1;
+
+            // 1. ตรวจสอบช่องเคอร์เซอร์ (58) หรือช่องที่ถืออยู่ก่อน
+            if (tPlayer.inventory.Length > 58 &&
+                tPlayer.inventory[58] != null &&
+                !tPlayer.inventory[58].IsAir &&
+                tPlayer.inventory[58].type == ItemID.LifeCrystal &&
+                tPlayer.inventory[58].stack < tPlayer.inventory[58].maxStack)
             {
-                crystalSlot = tPlayer.selectedItem;
+                refundSlot = 58;
             }
-            else
+            else if (tPlayer.selectedItem >= 0 && tPlayer.selectedItem < 50 &&
+                     tPlayer.inventory[tPlayer.selectedItem] != null &&
+                     !tPlayer.inventory[tPlayer.selectedItem].IsAir &&
+                     tPlayer.inventory[tPlayer.selectedItem].type == ItemID.LifeCrystal &&
+                     tPlayer.inventory[tPlayer.selectedItem].stack < tPlayer.inventory[tPlayer.selectedItem].maxStack)
             {
-                for (int i = 0; i < 50; i++)
+                refundSlot = tPlayer.selectedItem;
+            }
+            else if (_lastLifeCrystalSlot.TryGetValue(player.Index, out int lastSlot) &&
+                     lastSlot >= 0 && lastSlot < 59)
+            {
+                var sItem = tPlayer.inventory[lastSlot];
+                if (sItem == null || sItem.IsAir || sItem.type == ItemID.None ||
+                    (sItem.type == ItemID.LifeCrystal && sItem.stack < sItem.maxStack))
+                {
+                    refundSlot = lastSlot;
+                }
+            }
+
+            // 2. หากยังไม่เจอ ให้หาช่องที่มี Life Crystal อยู่แล้ว
+            if (refundSlot < 0)
+            {
+                for (int i = 0; i < 59 && i < tPlayer.inventory.Length; i++)
                 {
                     var inv = tPlayer.inventory[i];
-                    if (inv != null && !inv.IsAir && inv.type == ItemID.LifeCrystal && inv.stack > 0)
+                    if (inv != null && !inv.IsAir && inv.type == ItemID.LifeCrystal && inv.stack < inv.maxStack)
                     {
-                        crystalSlot = i;
+                        refundSlot = i;
                         break;
                     }
                 }
             }
 
-            if (crystalSlot < 0) return false;
-
-            _crystalUseCooldown[player.Index] = DateTime.UtcNow;
-
-            Item crystalItem = tPlayer.inventory[crystalSlot];
-            crystalItem.stack -= 1;
-            if (crystalItem.stack <= 0)
+            // 3. หากไม่มีกองเหลือเลย (เช่น กดใช้ก้อนสุดท้ายในกอง) ให้หาช่องว่างคืนให้ 1 ก้อน
+            if (refundSlot < 0)
             {
-                crystalItem.TurnToAir();
+                for (int i = 0; i < 50; i++)
+                {
+                    var inv = tPlayer.inventory[i];
+                    if (inv == null || inv.IsAir || inv.type == ItemID.None)
+                    {
+                        refundSlot = i;
+                        break;
+                    }
+                }
             }
 
-            NetMessage.SendData((int)PacketTypes.PlayerSlot, -1, -1, null, player.Index, crystalSlot, crystalItem.prefix, 0, 0);
-            NetMessage.SendData((int)PacketTypes.PlayerSlot, player.Index, -1, null, player.Index, crystalSlot, crystalItem.prefix, 0, 0);
-
-            int newBase = Math.Min(maxAllowedBase, currentBase + HpPerLifeCrystal);
-            _playerBaseLife[player.Index] = newBase;
-            state.BaseLife = newBase;
-            if (player.Account != null)
+            if (refundSlot >= 0 && refundSlot < tPlayer.inventory.Length)
             {
-                SaveStateToDB(player.Account.ID, state);
+                var targetItem = tPlayer.inventory[refundSlot];
+                if (targetItem == null || targetItem.IsAir || targetItem.type != ItemID.LifeCrystal)
+                {
+                    targetItem = new Item();
+                    targetItem.SetDefaults(ItemID.LifeCrystal);
+                    targetItem.stack = 1;
+                    tPlayer.inventory[refundSlot] = targetItem;
+                }
+                else
+                {
+                    targetItem.stack = Math.Min(targetItem.maxStack, targetItem.stack + 1);
+                }
+
+                NetMessage.SendData((int)PacketTypes.PlayerSlot, -1, -1, null, player.Index, refundSlot, targetItem.prefix, 0, 0);
+                NetMessage.SendData((int)PacketTypes.PlayerSlot, player.Index, -1, null, player.Index, refundSlot, targetItem.prefix, 0, 0);
             }
-
-            int hpDelta = GetMaxHpDelta(state);
-            int targetMaxLife = Math.Max(20, newBase + hpDelta);
-
-            tPlayer.statLifeMax = targetMaxLife;
-            tPlayer.statLifeMax2 = targetMaxLife;
-            tPlayer.statLife = Math.Min(targetMaxLife, tPlayer.statLife + HpPerLifeCrystal);
-
-            _lastSyncedMaxLife[player.Index] = targetMaxLife;
-            NetMessage.SendData((int)PacketTypes.PlayerHp, -1, -1, null, player.Index);
-            NetMessage.SendData((int)PacketTypes.PlayerHp, player.Index, -1, null, player.Index);
-
-            int usedCount = (newBase - BaseStartHp) / HpPerLifeCrystal;
-            player.SendSuccessMessage($"[ClassSystem] Life Crystal used ({usedCount}/{MaxLifeCrystalsAllowed})! Max HP is now {targetMaxLife}.");
-            return true;
         }
 
         private void OnNetGetData(GetDataEventArgs args)
@@ -947,22 +955,15 @@ namespace ClassSystemPlugin
                 short statLife = args.Msg.reader.ReadInt16();
                 short statLifeMax = args.Msg.reader.ReadInt16();
 
-                // หาก Client แจ้งว่าเลือด <= 0 (กำลังจะตายหรือตายแล้ว) ให้บันทึกสถานะตายทันทีและห้ามซิงก์เลือดบวกกลับไปทับ
                 if (statLife <= 0)
                 {
                     MarkPlayerDead(player, 25.0);
                     return;
                 }
 
-                // ถ้าผู้เล่นยังติดสถานะตายอยู่ ห้ามซิงก์เลือดทับจนกว่าแพ็กเก็ต PlayerSpawn จะเข้ามา
                 if (IsPlayerDeadState(player))
                 {
                     return;
-                }
-
-                if (player.TPlayer != null)
-                {
-                    player.TPlayer.statLife = statLife;
                 }
 
                 int maxAllowedBaseLife = GetMaxAllowedBaseLife();
@@ -973,6 +974,10 @@ namespace ClassSystemPlugin
 
                 if (state == null || string.IsNullOrEmpty(state.ClassName) || state.StarterChoice <= 0)
                 {
+                    if (player.TPlayer != null)
+                    {
+                        player.TPlayer.statLife = statLife;
+                    }
                     int rawBase = Math.Min(Math.Max(BaseStartHp, incomingMax), maxAllowedBaseLife);
                     _playerBaseLife[player.Index] = rawBase;
                     return;
@@ -990,6 +995,10 @@ namespace ClassSystemPlugin
 
                 if (baseChanged)
                 {
+                    if (player.TPlayer != null)
+                    {
+                        player.TPlayer.statLife = Math.Min(Math.Max(20, currentBase + hpDelta), statLife);
+                    }
                     _crystalUseCooldown[player.Index] = DateTime.UtcNow;
                     _playerBaseLife[player.Index] = currentBase;
                     state.BaseLife = currentBase;
@@ -998,6 +1007,35 @@ namespace ClassSystemPlugin
                         SaveStateToDB(player.Account.ID, state);
                     }
                     expectedTargetMax = Math.Max(20, currentBase + hpDelta);
+                }
+
+                // กรณีผู้เล่นใช้ Life Crystal เกินลิมิต 15 ก้อน (incomingMax > expectedTargetMax ทั้งที่ currentBase เต็ม 400 แล้ว)
+                if (incomingMax > expectedTargetMax && IsLifeCrystalAtLimit(player))
+                {
+                    args.Handled = true;
+                    BlockLifeCrystalUsage(player);
+                    RefundBlockedLifeCrystal(player);
+                    NotifyBlockedLifeCrystal(player);
+
+                    if (player.TPlayer != null)
+                    {
+                        // หักเลือด 20 ที่เด้งจากการกินหัวใจเถื่อนออกด้วย
+                        int revertedLife = Math.Max(1, Math.Min(expectedTargetMax, statLife - HpPerLifeCrystal));
+                        player.TPlayer.statLife = revertedLife;
+                        player.TPlayer.statLifeMax = expectedTargetMax;
+                        player.TPlayer.statLifeMax2 = expectedTargetMax;
+                    }
+
+                    _lastSyncedMaxLife.Remove(player.Index);
+                    ApplyClassStats(player, state);
+                    NetMessage.SendData((int)PacketTypes.PlayerHp, -1, -1, null, player.Index);
+                    NetMessage.SendData((int)PacketTypes.PlayerHp, player.Index, -1, null, player.Index);
+                    return;
+                }
+
+                if (player.TPlayer != null)
+                {
+                    player.TPlayer.statLife = Math.Min(expectedTargetMax, statLife);
                 }
 
                 if (incomingMax != expectedTargetMax || baseChanged)
@@ -1044,7 +1082,6 @@ namespace ClassSystemPlugin
                 int maxRefund = Math.Max(0, args.Damage - 1);
                 int actualRefund = Math.Min(damageRefund, maxRefund);
 
-                // คืนเลือดเฉพาะกรณีที่ผู้เล่นยังไม่ตายและเลือดหลังหักดาเมจสุทธิยังมากกว่า 0
                 int predictedRemainingLife = player.TPlayer.statLife - args.Damage;
                 if (actualRefund > 0 && predictedRemainingLife > 0 && player.TPlayer.statLife > 0 && !player.TPlayer.dead)
                 {
@@ -1984,6 +2021,7 @@ namespace ClassSystemPlugin
             _craftWarnCooldown.Remove(args.Who);
             _crystalWarnCooldown.Remove(args.Who);
             _crystalUseCooldown.Remove(args.Who);
+            _lastLifeCrystalSlot.Remove(args.Who);
             _buffRefreshCooldown.Remove(args.Who);
             _lockedBuffRestoreCooldown.Remove(args.Who);
             _legacyBuffPurgeCooldown.Remove(args.Who);
@@ -2135,18 +2173,23 @@ namespace ClassSystemPlugin
                     }
 
                     MaintainBlockedWorldItems(player);
-                    Item held = player.TPlayer.HeldItem;
 
-                    if (held != null && !held.IsAir && held.type == ItemID.LifeCrystal)
+                    Item held = player.TPlayer.HeldItem;
+                    Item cursor = (player.TPlayer.inventory.Length > 58) ? player.TPlayer.inventory[58] : null;
+                    bool holdingCrystal = (held != null && !held.IsAir && held.type == ItemID.LifeCrystal) ||
+                                          (cursor != null && !cursor.IsAir && cursor.type == ItemID.LifeCrystal);
+
+                    if (holdingCrystal && IsLifeCrystalAtLimit(player))
                     {
-                        if (IsLifeCrystalAtLimit(player))
+                        if (cursor != null && !cursor.IsAir && cursor.type == ItemID.LifeCrystal)
+                            _lastLifeCrystalSlot[player.Index] = 58;
+                        else if (player.TPlayer.selectedItem >= 0 && player.TPlayer.selectedItem < 50)
+                            _lastLifeCrystalSlot[player.Index] = player.TPlayer.selectedItem;
+
+                        BlockLifeCrystalUsage(player);
+                        if (args.Control.IsUsingItem)
                         {
-                            BlockLifeCrystalUsage(player);
                             NotifyBlockedLifeCrystal(player);
-                        }
-                        else if (args.Control.IsUsingItem)
-                        {
-                            TryConsumeLifeCrystalManually(player, state);
                         }
                     }
 
@@ -2170,12 +2213,10 @@ namespace ClassSystemPlugin
             var state = GetPlayerState(player);
             if (state == null || string.IsNullOrEmpty(state.ClassName)) return;
 
-            if (args.Type == ItemID.LifeCrystal && IsLifeCrystalAtLimit(player))
+            // จดจำช่องที่มี Life Crystal เพื่อใช้คืนไอเทมหากกดใช้เกิน 15 ก้อน
+            if (args.Type == ItemID.LifeCrystal && args.Stack > 0 && args.Slot >= 0 && args.Slot < 59)
             {
-                args.Handled = true;
-                BlockLifeCrystalUsage(player);
-                NotifyBlockedLifeCrystal(player);
-                return;
+                _lastLifeCrystalSlot[player.Index] = args.Slot;
             }
 
             if (args.Type > ItemID.None && args.Stack > 0)
@@ -2267,7 +2308,6 @@ namespace ClassSystemPlugin
 
                 SetUnderworldGodMode(player, false);
 
-                // หากผู้เล่นตายอยู่ ข้ามการฮีล การอัปเดตเลือด และการเสกบัฟจนกว่าจะเกิดใหม่
                 if (IsPlayerDeadState(player))
                 {
                     _honeyRegenAccumulator.Remove(player.Index);
