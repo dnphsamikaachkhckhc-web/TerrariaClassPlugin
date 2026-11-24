@@ -27,8 +27,8 @@ namespace ClassSystemPlugin
     {
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
-        public override string Description => "Class & starter-choice (/ch 1|2) system with SlimeStaff for summoner /ch 1, smooth native client movement/jump buffs, custom prompts, server-wide broadcasts, underworld lock, inventory weapon wipe, permanent class/choice buffs & debuffs, Max HP modifiers, cross-class item ejection, Life Crystal cap, and real-time HP sync.";
-        public override Version Version => new Version(16, 6, 0);
+        public override string Description => "Class & starter-choice (/ch 1|2) system with strict 100 base HP initialization so Warrior /ch 1 starts at 120 HP instead of 420 HP, incremental Life Crystal tracking up to 15 crystals, strict instant inventory/held-item cross-class ejection, SlimeStaff for summoner /ch 1, smooth native client movement/jump buffs, custom prompts, server-wide broadcasts, underworld lock, inventory weapon wipe, and permanent class/choice buffs & debuffs.";
+        public override Version Version => new Version(17, 0, 0);
 
         private const string ClassSelectPrompt =
             "Chat by Shokuya :3 Please select your class >w<\n\n" +
@@ -50,6 +50,7 @@ namespace ClassSystemPlugin
         private readonly Dictionary<int, DateTime> _crystalWarnCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, DateTime> _buffRefreshCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, int> _lastSyncedMaxLife = new Dictionary<int, int>();
+        private readonly Dictionary<int, int> _playerBaseLife = new Dictionary<int, int>();
         private readonly Dictionary<int, double> _honeyRegenAccumulator = new Dictionary<int, double>();
         private readonly Dictionary<int, HashSet<int>> _blockedWorldItemsByPlayer = new Dictionary<int, HashSet<int>>();
         private DateTime _lastTickSync = DateTime.MinValue;
@@ -224,6 +225,7 @@ namespace ClassSystemPlugin
             GetDataHandlers.PlayerSlot += OnPlayerSlot;
             GetDataHandlers.ItemDrop += OnItemDrop;
             GetDataHandlers.PlayerDamage += OnPlayerDamage;
+            GetDataHandlers.PlayerHp += OnPlayerHp;
         }
 
         protected override void Dispose(bool disposing)
@@ -242,6 +244,7 @@ namespace ClassSystemPlugin
                 GetDataHandlers.PlayerSlot -= OnPlayerSlot;
                 GetDataHandlers.ItemDrop -= OnItemDrop;
                 GetDataHandlers.PlayerDamage -= OnPlayerDamage;
+                GetDataHandlers.PlayerHp -= OnPlayerHp;
 
                 if (_db != null)
                 {
@@ -538,6 +541,49 @@ namespace ClassSystemPlugin
             return false;
         }
 
+        private void OnPlayerHp(object sender, GetDataHandlers.PlayerHpEventArgs args)
+        {
+            var player = args.Player;
+            if (player == null || !player.Active) return;
+
+            int maxAllowedBaseLife = GetMaxAllowedBaseLife();
+            int incomingMax = args.Max > 0 ? args.Max : BaseStartHp;
+
+            var state = (player.IsLoggedIn && player.Account != null) ? GetPlayerState(player) : null;
+            int hpDelta = GetMaxHpDelta(state);
+
+            // ถ้าผู้เล่นยังไม่ได้เลือกคลาสหรือยังไม่ได้เลือก /ch ให้ยึดตามเลือดฐานจริงของตัวละคร (จำกัดไม่เกิน 400)
+            if (state == null || string.IsNullOrEmpty(state.ClassName) || state.StarterChoice <= 0)
+            {
+                int rawBase = Math.Min(Math.Max(BaseStartHp, incomingMax), maxAllowedBaseLife);
+                _playerBaseLife[player.Index] = rawBase;
+                return;
+            }
+
+            // ถ้าเลือกคลาสและ /ch แล้ว อนุญาตให้ฐานเพิ่มขึ้นได้ทีละ +20 จากการกิน Life Crystal เท่านั้น
+            int currentBase = GetTrackedBaseLife(player);
+            if (incomingMax == currentBase + hpDelta + HpPerLifeCrystal && currentBase + HpPerLifeCrystal <= maxAllowedBaseLife)
+            {
+                // ผู้เล่นเพิ่งกิน Life Crystal สำเร็จ (+20 จากฐานเดิม)
+                currentBase += HpPerLifeCrystal;
+                _playerBaseLife[player.Index] = currentBase;
+            }
+            else if (incomingMax <= maxAllowedBaseLife && incomingMax > currentBase && (incomingMax - currentBase) == HpPerLifeCrystal)
+            {
+                currentBase = incomingMax;
+                _playerBaseLife[player.Index] = currentBase;
+            }
+
+            // บังคับซิงค์กลับให้ตรงกับฐานจริง + hpDelta เสมอ ป้องกันไคลเอนต์ส่งค่าผิด/เด้ง 420
+            int expectedTargetMax = Math.Max(20, currentBase + hpDelta);
+            if (incomingMax != expectedTargetMax)
+            {
+                args.Handled = true;
+                _lastSyncedMaxLife.Remove(player.Index);
+                ApplyClassStats(player, state);
+            }
+        }
+
         private void OnPlayerDamage(object sender, GetDataHandlers.PlayerDamageEventArgs args)
         {
             var player = TShock.Players[args.ID];
@@ -726,12 +772,30 @@ namespace ClassSystemPlugin
             return BaseStartHp + (crystals * HpPerLifeCrystal);
         }
 
+        private int GetTrackedBaseLife(TSPlayer player)
+        {
+            int maxAllowedBaseLife = GetMaxAllowedBaseLife();
+            if (player != null && _playerBaseLife.TryGetValue(player.Index, out int tracked))
+            {
+                return Math.Min(Math.Max(BaseStartHp, tracked), maxAllowedBaseLife);
+            }
+
+            // ถ้ายังไม่มีประวัติฐานของ player นี้ ให้ดึงจาก TPlayer แต่ถ้าเป็นค่าเริ่มต้น/เพี้ยนให้เริ่มที่ 100
+            int currentStatMax = player?.TPlayer?.statLifeMax > 0 ? player.TPlayer.statLifeMax : BaseStartHp;
+            int clampedStatMax = Math.Min(Math.Max(BaseStartHp, currentStatMax), maxAllowedBaseLife);
+
+            if (player != null)
+            {
+                _playerBaseLife[player.Index] = clampedStatMax;
+            }
+            return clampedStatMax;
+        }
+
         private bool IsLifeCrystalAtLimit(TSPlayer player)
         {
             if (player?.TPlayer == null) return false;
             int maxAllowedBaseLife = GetMaxAllowedBaseLife();
-            int currentBaseLife = Math.Max(BaseStartHp, player.TPlayer.statLifeMax);
-            return currentBaseLife >= maxAllowedBaseLife;
+            return GetTrackedBaseLife(player) >= maxAllowedBaseLife;
         }
 
         private void CancelActivePlayerProjectiles(TSPlayer player)
@@ -799,7 +863,7 @@ namespace ClassSystemPlugin
         private bool CanEjectSlotNow(int playerIndex, int netSlotIndex)
         {
             int key = (playerIndex * 1000) + Math.Max(0, netSlotIndex);
-            if (_slotEjectCooldown.TryGetValue(key, out DateTime lastTime) && (DateTime.UtcNow - lastTime).TotalMilliseconds < 350)
+            if (_slotEjectCooldown.TryGetValue(key, out DateTime lastTime) && (DateTime.UtcNow - lastTime).TotalMilliseconds < 120)
             {
                 return false;
             }
@@ -852,6 +916,11 @@ namespace ClassSystemPlugin
             {
                 tPlayer.inventory[netSlotIndex] = new Item();
                 tPlayer.inventory[netSlotIndex].TurnToAir();
+                if (netSlotIndex == 58)
+                {
+                    Main.mouseItem = new Item();
+                    Main.mouseItem.TurnToAir();
+                }
             }
             else if (netSlotIndex >= 59 && netSlotIndex < 79)
             {
@@ -915,6 +984,29 @@ namespace ClassSystemPlugin
             if (item == null || item.IsAir || item.type <= ItemID.None) return false;
             if (item.pick > 0 || item.axe > 0 || item.hammer > 0) return false;
             return item.damage > 0 && (item.melee || item.ranged || item.magic || item.summon);
+        }
+
+        private bool HasAnyDisallowedItemInInventory(TSPlayer player, string currentClass)
+        {
+            if (player?.TPlayer == null || string.IsNullOrEmpty(currentClass)) return false;
+            var tPlayer = player.TPlayer;
+
+            if (tPlayer.HeldItem != null && !tPlayer.HeldItem.IsAir && tPlayer.HeldItem.type > ItemID.None &&
+                !IsItemAllowedForClass(tPlayer.HeldItem, currentClass))
+            {
+                return true;
+            }
+
+            for (int i = 0; i < tPlayer.inventory.Length && i < 59; i++)
+            {
+                Item item = tPlayer.inventory[i];
+                if (item != null && !item.IsAir && item.type > ItemID.None && !IsItemAllowedForClass(item, currentClass))
+                {
+                    return true;
+                }
+            }
+
+            return false;
         }
 
         private void EnforceAllowedInventory(TSPlayer player, string currentClass)
@@ -1208,6 +1300,7 @@ namespace ClassSystemPlugin
             _crystalWarnCooldown.Remove(args.Who);
             _buffRefreshCooldown.Remove(args.Who);
             _lastSyncedMaxLife.Remove(args.Who);
+            _playerBaseLife.Remove(args.Who);
             _honeyRegenAccumulator.Remove(args.Who);
             _blockedWorldItemsByPlayer.Remove(args.Who);
 
@@ -1353,8 +1446,13 @@ namespace ClassSystemPlugin
                         BlockLifeCrystalUsage(player);
                         NotifyBlockedLifeCrystal(player);
                     }
-                    else
+
+                    if (HasAnyDisallowedItemInInventory(player, state.ClassName))
                     {
+                        player.TPlayer.controlUseItem = false;
+                        player.TPlayer.itemAnimation = 0;
+                        player.TPlayer.itemTime = 0;
+                        CancelActivePlayerProjectiles(player);
                         EnforceAllowedInventory(player, state.ClassName);
                     }
                 }
@@ -1387,6 +1485,10 @@ namespace ClassSystemPlugin
                 if (!IsItemAllowedForClass(testItem, state.ClassName))
                 {
                     args.Handled = true;
+                    player.TPlayer.controlUseItem = false;
+                    player.TPlayer.itemAnimation = 0;
+                    player.TPlayer.itemTime = 0;
+                    CancelActivePlayerProjectiles(player);
                     EjectDisallowedItemSafely(player, args.Slot, testItem, args.Type, args.Stack, (byte)args.Prefix);
                 }
             }
@@ -1454,6 +1556,11 @@ namespace ClassSystemPlugin
                 ApplyClassStats(player, state);
                 ApplyBrokenArmorDefenseEffect(player, state);
 
+                if (HasAnyDisallowedItemInInventory(player, state.ClassName))
+                {
+                    EnforceAllowedInventory(player, state.ClassName);
+                }
+
                 if (runPeriodicSync)
                 {
                     ClearWebBuff(player);
@@ -1478,7 +1585,8 @@ namespace ClassSystemPlugin
 
             var heldItem = args.Player.HeldItem;
 
-            if (heldItem != null && !heldItem.IsAir && !IsItemAllowedForClass(heldItem, state.ClassName))
+            if ((heldItem != null && !heldItem.IsAir && !IsItemAllowedForClass(heldItem, state.ClassName)) ||
+                HasAnyDisallowedItemInInventory(tsPlayer, state.ClassName))
             {
                 args.Damage = 0;
                 EnforceAllowedInventory(tsPlayer, state.ClassName);
@@ -1643,6 +1751,16 @@ namespace ClassSystemPlugin
             EnforceAllowedInventory(args.Player, state.ClassName);
             GiveStarterItems(args.Player, state.ClassName, choice);
             ClearWebAndTeleportToSpawn(args.Player);
+
+            // ถ้าฐานยังไม่ถูกบันทึกไว้ใน _playerBaseLife หรือเกินเพดาน ให้ตั้งฐานเริ่มต้นที่ 100 (หรือค่าที่ตัวละครมีจริงไม่เกิน 400)
+            if (!_playerBaseLife.ContainsKey(args.Player.Index))
+            {
+                int initialBase = args.Player.TPlayer.statLifeMax > 0
+                    ? Math.Min(Math.Max(BaseStartHp, args.Player.TPlayer.statLifeMax), GetMaxAllowedBaseLife())
+                    : BaseStartHp;
+                _playerBaseLife[args.Player.Index] = initialBase;
+            }
+
             _lastSyncedMaxLife.Remove(args.Player.Index);
             ApplyClassStats(args.Player, state);
             EnsurePermanentClassBuffs(args.Player, state);
@@ -1679,6 +1797,7 @@ namespace ClassSystemPlugin
                 DeleteStateFromDB(target.Account.ID);
                 _playerStates.Remove(target.Account.ID);
                 _lastSyncedMaxLife.Remove(target.Index);
+                _playerBaseLife.Remove(target.Index);
                 _lastBroadcastPhase.Remove(target.Index);
                 ApplyUnderworldLock(target, true);
                 target.SendWarningMessage(ClassSelectPrompt);
@@ -1702,6 +1821,7 @@ namespace ClassSystemPlugin
             SaveStateToDB(target.Account.ID, newState);
             _playerStates[target.Account.ID] = newState;
             _lastSyncedMaxLife.Remove(target.Index);
+            _playerBaseLife.Remove(target.Index);
             _lastBroadcastPhase.Remove(target.Index);
             string choicePrompt = GetStarterChoicePrompt(resolvedOption);
             ApplyUnderworldLock(target, true);
@@ -1725,13 +1845,12 @@ namespace ClassSystemPlugin
         private void ApplyClassStats(TSPlayer player, PlayerClassState state)
         {
             var tPlayer = player.TPlayer;
-            int maxAllowedBaseLife = GetMaxAllowedBaseLife();
-            int rawBaseLife = tPlayer.statLifeMax > 0 ? tPlayer.statLifeMax : BaseStartHp;
-            int currentBaseLife = Math.Min(Math.Max(BaseStartHp, rawBaseLife), maxAllowedBaseLife);
-
+            int currentBaseLife = GetTrackedBaseLife(player);
             int hpDelta = GetMaxHpDelta(state);
             int targetMaxLife = Math.Max(20, currentBaseLife + hpDelta);
 
+            // สำคัญ: ใน Terraria/TShock เวลาส่ง PacketTypes.PlayerHp ฝั่งไคลเอนต์จะอ่านค่าจาก tPlayer.statLifeMax
+            // ดังนั้นต้องตั้งทั้ง statLifeMax และ statLifeMax2 เป็น targetMaxLife แต่เวลาคำนวณรอบถัดไปให้ดึงฐานจาก _playerBaseLife เท่านั้น
             tPlayer.statLifeMax = targetMaxLife;
             tPlayer.statLifeMax2 = targetMaxLife;
 
