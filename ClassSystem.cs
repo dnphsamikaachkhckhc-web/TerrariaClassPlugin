@@ -20,6 +20,7 @@ namespace ClassSystemPlugin
     {
         public string ClassName { get; set; }
         public int StarterChoice { get; set; } // 0 = ยังไม่เลือกไอเทม, 1 = /ch 1, 2 = /ch 2
+        public int BaseLife { get; set; } = 100; // เลือดพื้นฐานก่อนบวก/ลบโบนัสสาย (เริ่มต้น 100, เพิ่มทีละ 20 จาก Life Crystal สูงสุด 400)
     }
 
     [ApiVersion(2, 1)]
@@ -27,8 +28,8 @@ namespace ClassSystemPlugin
     {
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
-        public override string Description => "Class & starter-choice (/ch 1|2) system with full multi-slot stacked-item anti-bypass & cross-class weapon lock, atomic stacked-item ejection, zero-flicker permanent buffs/debuffs, +60 Max HP and unremovable Bleeding, Weak, and Endurance buffs for Melee /ch 1, permanent Swiftness buff for all classes/choices except Melee (warrior), natural Slow/debuff preservation across all classes, zero-rubberband movement, solid-ground Underworld spawn detection, zero-damage lock against NPCs & GodMode invulnerability while logging in/choosing class/starter pack, cross-class crafting/cursor/inventory ejection, NetGetData PlayerHp packet handling, incremental Life Crystal tracking, SlimeStaff for summoner /ch 1, and permanent class/choice buffs & debuffs.";
-        public override Version Version => new Version(17, 14, 0);
+        public override string Description => "Class & starter-choice (/ch 1|2) system with decoupled statLifeMax (100-400) & statLifeMax2 (up to 460 HP for Melee /ch 1), server-assisted 15-crystal consumption up to 460 HP, persistent SQLite BaseLife tracking, dupe-safe recipe material refund + crafted item removal on cross-class crafting, full multi-slot stacked-item anti-bypass & cross-class weapon lock, zero-flicker permanent buffs/debuffs, and solid-ground Underworld spawn detection.";
+        public override Version Version => new Version(17, 19, 0);
 
         private const string ClassSelectPrompt =
             "Chat by Shokuya :3 Please select your class >w<\n\n" +
@@ -48,7 +49,9 @@ namespace ClassSystemPlugin
         private readonly Dictionary<int, DateTime> _dropWarnCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, DateTime> _craftWarnCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<long, DateTime> _itemTypeEjectCooldown = new Dictionary<long, DateTime>();
+        private readonly Dictionary<long, DateTime> _craftRefundCooldown = new Dictionary<long, DateTime>();
         private readonly Dictionary<int, DateTime> _crystalWarnCooldown = new Dictionary<int, DateTime>();
+        private readonly Dictionary<int, DateTime> _crystalUseCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, DateTime> _buffRefreshCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, DateTime> _lockedBuffRestoreCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, DateTime> _legacyBuffPurgeCooldown = new Dictionary<int, DateTime>();
@@ -411,7 +414,6 @@ namespace ClassSystemPlugin
             return 0.0;
         }
 
-        // บัฟของสายและตัวเลือกที่ต้องล็อกไว้ถาวร ห้ามถูกลบหรือล้างออกได้
         private int[] GetLockedBuffsForState(PlayerClassState state)
         {
             var list = new List<int>();
@@ -440,7 +442,6 @@ namespace ClassSystemPlugin
             string c = state.ClassName.ToLowerInvariant();
             int ch = state.StarterChoice;
 
-            // ให้บัฟยาวิ่งเร็วถาวรทุกสายทั้ง /ch 1 และ /ch 2 ยกเว้นสาย Melee (warrior)
             if (c != "warrior")
             {
                 list.Add(BuffID.Swiftness);
@@ -450,10 +451,10 @@ namespace ClassSystemPlugin
             {
                 if (ch == 1)
                 {
-                    list.Add(BuffID.Ironskin); // บัฟยาเพิ่มเกราะ
-                    list.Add(BuffID.Bleeding); // บัฟ Bleeding ถาวร ล้างออกไม่ได้
-                    list.Add(BuffID.Weak);     // บัฟ Weak ถาวร ล้างออกไม่ได้
-                    list.Add(BuffID.Endurance);// บัฟ Endurance ถาวร ล้างออกไม่ได้
+                    list.Add(BuffID.Ironskin);
+                    list.Add(BuffID.Bleeding);
+                    list.Add(BuffID.Weak);
+                    list.Add(BuffID.Endurance);
                 }
             }
             else if (c == "ranger")
@@ -462,11 +463,11 @@ namespace ClassSystemPlugin
                 list.Add(hasImmunity ? BuffID.WitheredArmor : BuffID.BrokenArmor);
                 if (ch == 1)
                 {
-                    list.Add(BuffID.Archery); // บัฟยาธนูถาวรติดตัว
+                    list.Add(BuffID.Archery);
                 }
                 else if (ch == 2)
                 {
-                    list.Add(BuffID.AmmoReservation); // บัฟยาประหยัดกระสุนปืนติดตัวถาวร
+                    list.Add(BuffID.AmmoReservation);
                 }
             }
             else if (c == "mage")
@@ -475,26 +476,25 @@ namespace ClassSystemPlugin
                 list.Add(hasImmunity ? BuffID.WitheredArmor : BuffID.BrokenArmor);
                 if (ch == 1)
                 {
-                    list.Add(BuffID.MagicPower); // บัฟยาเพิ่มดาเมจสายเวทติดตัวถาวร
+                    list.Add(BuffID.MagicPower);
                 }
                 else if (ch == 2)
                 {
-                    list.Add(BuffID.ManaRegeneration); // บัฟยารีมานาเร็วถาวรติดตัว
+                    list.Add(BuffID.ManaRegeneration);
                 }
             }
             else if (c == "summoner")
             {
                 if (ch == 1)
                 {
-                    list.Add(BuffID.Summoning); // บัฟยาเพิ่มซัมม่อน +1
-                    list.Add(BuffID.Honey);     // บัฟน้ำผึ้งรีเลือดเร็ว 20%
+                    list.Add(BuffID.Summoning);
+                    list.Add(BuffID.Honey);
                 }
             }
 
             return list.ToArray();
         }
 
-        // คืนเฉพาะบัฟที่หายไปจริง ๆ ด้วย PlayerAddBuff ทีละตัว ไม่ส่ง PlayerBuff ยกแผงเพื่อไม่ให้แถบบัฟทั้งหมดกระพริบ
         private void RestoreMissingLockedBuffs(TSPlayer player, PlayerClassState state, ICollection<int> missingBuffIds, bool bypassCooldown = false)
         {
             if (player?.TPlayer == null || !player.Active || player.TPlayer.dead) return;
@@ -515,8 +515,6 @@ namespace ClassSystemPlugin
             }
         }
 
-        // ล้างเฉพาะบัฟ Swiftness สำหรับผู้เล่นที่ยังไม่ได้เลือกสาย หรือเลือกสาย Melee (warrior)
-        // ทุกสายสามารถติดสถานะเดินช้า (Slow) และดีบัฟอื่น ๆ ตามธรรมชาติของเกมได้ปกติ
         private void CleanDisallowedSpeedBuffs(TSPlayer player, PlayerClassState state, bool forceImmediate = false)
         {
             if (player?.TPlayer == null || !player.Active) return;
@@ -571,7 +569,6 @@ namespace ClassSystemPlugin
                     if (player.TPlayer.buffType[i] == buffId)
                     {
                         exists = true;
-                        // อัปเดตเวลาเฉพาะตอนที่ใกล้หมดจริง ๆ (เหลือน้อยกว่า 1 นาที = 3600 ticks)
                         if (player.TPlayer.buffTime[i] > 0 && player.TPlayer.buffTime[i] < 3600)
                         {
                             player.SetBuff(buffId, PermanentBuffDurationTicks, true);
@@ -676,6 +673,84 @@ namespace ClassSystemPlugin
             return false;
         }
 
+        // รองรับการกิน Life Crystal ให้ดันไปถึง 15 ลูก (BaseLife = 400 -> เลือดรวม 460 สำหรับ Melee /ch 1)
+        private bool TryConsumeLifeCrystalManually(TSPlayer player, PlayerClassState state)
+        {
+            if (player?.TPlayer == null || !player.Active || player.TPlayer.dead) return false;
+            if (state == null || string.IsNullOrEmpty(state.ClassName) || state.StarterChoice <= 0) return false;
+
+            int currentBase = GetTrackedBaseLife(player);
+            int maxAllowedBase = GetMaxAllowedBaseLife();
+            if (currentBase >= maxAllowedBase) return false;
+
+            if (_crystalUseCooldown.TryGetValue(player.Index, out DateTime lastUse) &&
+                (DateTime.UtcNow - lastUse).TotalMilliseconds < 450)
+            {
+                return false;
+            }
+
+            var tPlayer = player.TPlayer;
+            int crystalSlot = -1;
+
+            if (tPlayer.selectedItem >= 0 && tPlayer.selectedItem < 50 &&
+                tPlayer.inventory[tPlayer.selectedItem] != null &&
+                !tPlayer.inventory[tPlayer.selectedItem].IsAir &&
+                tPlayer.inventory[tPlayer.selectedItem].type == ItemID.LifeCrystal &&
+                tPlayer.inventory[tPlayer.selectedItem].stack > 0)
+            {
+                crystalSlot = tPlayer.selectedItem;
+            }
+            else
+            {
+                for (int i = 0; i < 50; i++)
+                {
+                    var inv = tPlayer.inventory[i];
+                    if (inv != null && !inv.IsAir && inv.type == ItemID.LifeCrystal && inv.stack > 0)
+                    {
+                        crystalSlot = i;
+                        break;
+                    }
+                }
+            }
+
+            if (crystalSlot < 0) return false;
+
+            _crystalUseCooldown[player.Index] = DateTime.UtcNow;
+
+            Item crystalItem = tPlayer.inventory[crystalSlot];
+            crystalItem.stack -= 1;
+            if (crystalItem.stack <= 0)
+            {
+                crystalItem.TurnToAir();
+            }
+
+            NetMessage.SendData((int)PacketTypes.PlayerSlot, -1, -1, null, player.Index, crystalSlot, crystalItem.prefix, 0, 0);
+            NetMessage.SendData((int)PacketTypes.PlayerSlot, player.Index, -1, null, player.Index, crystalSlot, crystalItem.prefix, 0, 0);
+
+            int newBase = Math.Min(maxAllowedBase, currentBase + HpPerLifeCrystal);
+            _playerBaseLife[player.Index] = newBase;
+            state.BaseLife = newBase;
+            if (player.Account != null)
+            {
+                SaveStateToDB(player.Account.ID, state);
+            }
+
+            int hpDelta = GetMaxHpDelta(state);
+            int targetMaxLife = Math.Max(20, newBase + hpDelta);
+
+            tPlayer.statLifeMax = newBase;
+            tPlayer.statLifeMax2 = targetMaxLife;
+            tPlayer.statLife = Math.Min(targetMaxLife, tPlayer.statLife + HpPerLifeCrystal);
+
+            _lastSyncedMaxLife[player.Index] = targetMaxLife;
+            NetMessage.SendData((int)PacketTypes.PlayerHp, -1, -1, null, player.Index);
+            NetMessage.SendData((int)PacketTypes.PlayerHp, player.Index, -1, null, player.Index);
+
+            int usedCount = (newBase - BaseStartHp) / HpPerLifeCrystal;
+            player.SendSuccessMessage($"[ClassSystem] Life Crystal used ({usedCount}/{MaxLifeCrystalsAllowed})! Max HP is now {targetMaxLife}.");
+            return true;
+        }
+
         private void OnNetGetData(GetDataEventArgs args)
         {
             if (args == null || args.Handled) return;
@@ -683,8 +758,6 @@ namespace ClassSystemPlugin
             var player = TShock.Players[args.Msg.whoAmI];
             if (player == null || !player.Active) return;
 
-            // ดักตรวจแพ็กเก็ตบัฟจาก Client เฉพาะเมื่อมีการพยายามลบบัฟที่ห้ามล้างออก (เช่น Bleeding, Weak, Endurance ของ warrior /ch 1)
-            // จะไม่แทรกแซงแพ็กเก็ตปกติเพื่อป้องกันแถบบัฟกระพริบ
             if (args.MsgID == PacketTypes.PlayerAddBuff || args.MsgID == PacketTypes.PlayerBuff)
             {
                 if (player.IsLoggedIn && player.Account != null)
@@ -778,19 +851,34 @@ namespace ClassSystemPlugin
                 }
 
                 int currentBase = GetTrackedBaseLife(player);
-                if (incomingMax == currentBase + hpDelta + HpPerLifeCrystal && currentBase + HpPerLifeCrystal <= maxAllowedBaseLife)
+                bool baseChanged = false;
+
+                // รองรับทั้งกรณี Client ส่งค่า +20 จาก BaseLife จริง (100..400) หรือส่ง +20 จากยอดรวม (currentBase + hpDelta)
+                if ((incomingMax == currentBase + HpPerLifeCrystal || incomingMax == currentBase + hpDelta + HpPerLifeCrystal) &&
+                    currentBase + HpPerLifeCrystal <= maxAllowedBaseLife)
                 {
                     currentBase += HpPerLifeCrystal;
-                    _playerBaseLife[player.Index] = currentBase;
+                    baseChanged = true;
                 }
                 else if (incomingMax <= maxAllowedBaseLife && incomingMax > currentBase && (incomingMax - currentBase) == HpPerLifeCrystal)
                 {
                     currentBase = incomingMax;
+                    baseChanged = true;
+                }
+
+                if (baseChanged)
+                {
+                    _crystalUseCooldown[player.Index] = DateTime.UtcNow;
                     _playerBaseLife[player.Index] = currentBase;
+                    state.BaseLife = currentBase;
+                    if (player.Account != null)
+                    {
+                        SaveStateToDB(player.Account.ID, state);
+                    }
                 }
 
                 int expectedTargetMax = Math.Max(20, currentBase + hpDelta);
-                if (incomingMax != expectedTargetMax)
+                if (incomingMax != expectedTargetMax || baseChanged)
                 {
                     args.Handled = true;
                     _lastSyncedMaxLife.Remove(player.Index);
@@ -997,6 +1085,16 @@ namespace ClassSystemPlugin
             return BaseStartHp + (crystals * HpPerLifeCrystal);
         }
 
+        private int NormalizeBaseLifeValue(int rawBase)
+        {
+            int maxAllowed = GetMaxAllowedBaseLife();
+            if (rawBase <= BaseStartHp) return BaseStartHp;
+            if (rawBase >= maxAllowed) return maxAllowed;
+            int offset = rawBase - BaseStartHp;
+            int steps = offset / HpPerLifeCrystal;
+            return BaseStartHp + (steps * HpPerLifeCrystal);
+        }
+
         private int GetTrackedBaseLife(TSPlayer player)
         {
             int maxAllowedBaseLife = GetMaxAllowedBaseLife();
@@ -1005,14 +1103,19 @@ namespace ClassSystemPlugin
                 return Math.Min(Math.Max(BaseStartHp, tracked), maxAllowedBaseLife);
             }
 
-            int currentStatMax = player?.TPlayer?.statLifeMax > 0 ? player.TPlayer.statLifeMax : BaseStartHp;
-            int clampedStatMax = Math.Min(Math.Max(BaseStartHp, currentStatMax), maxAllowedBaseLife);
-
-            if (player != null)
+            if (player != null && player.IsLoggedIn && player.Account != null)
             {
-                _playerBaseLife[player.Index] = clampedStatMax;
+                var state = GetPlayerState(player);
+                if (state != null && state.BaseLife >= BaseStartHp)
+                {
+                    int fromState = NormalizeBaseLifeValue(state.BaseLife);
+                    _playerBaseLife[player.Index] = fromState;
+                    return fromState;
+                }
             }
-            return clampedStatMax;
+
+            _playerBaseLife[player?.Index ?? 0] = BaseStartHp;
+            return BaseStartHp;
         }
 
         private bool IsLifeCrystalAtLimit(TSPlayer player)
@@ -1046,7 +1149,7 @@ namespace ClassSystemPlugin
             player.TPlayer.itemTime = 0;
         }
 
-        private int SpawnDroppedItemOnGround(TSPlayer player, int itemType, int stack, byte prefix)
+        private int SpawnDroppedItemOnGround(TSPlayer player, int itemType, int stack, byte prefix, bool allowSelfPickup = false)
         {
             if (player?.TPlayer == null || itemType <= ItemID.None) return -1;
 
@@ -1066,13 +1169,118 @@ namespace ClassSystemPlugin
 
                 NetMessage.SendData((int)PacketTypes.ItemDrop, -1, -1, null, droppedIndex);
                 NetMessage.SendData((int)PacketTypes.ItemOwner, -1, -1, null, droppedIndex);
-                RegisterBlockedWorldItem(player.Index, droppedIndex);
+
+                if (!allowSelfPickup)
+                {
+                    RegisterBlockedWorldItem(player.Index, droppedIndex);
+                }
             }
 
             return droppedIndex;
         }
 
-        private void NotifyBlockedPickup(TSPlayer player, string itemName, bool fromCraftingOrCursor = false)
+        private bool TryRefundCraftIngredientsSafely(TSPlayer player, int craftedItemType, int craftedStack)
+        {
+            if (player?.TPlayer == null || craftedItemType <= ItemID.None || craftedStack <= 0)
+                return false;
+
+            long key = ((long)player.Index << 32) | (uint)craftedItemType;
+            if (_craftRefundCooldown.TryGetValue(key, out DateTime lastRefund) &&
+                (DateTime.UtcNow - lastRefund).TotalMilliseconds < 350)
+            {
+                return false;
+            }
+
+            Recipe matchedRecipe = null;
+            if (Main.recipe != null)
+            {
+                for (int i = 0; i < Recipe.numRecipes; i++)
+                {
+                    var rec = Main.recipe[i];
+                    if (rec != null && rec.createItem != null && !rec.createItem.IsAir && rec.createItem.type == craftedItemType)
+                    {
+                        matchedRecipe = rec;
+                        break;
+                    }
+                }
+            }
+
+            if (matchedRecipe == null || matchedRecipe.requiredItem == null)
+                return false;
+
+            int outputPerCraft = Math.Max(1, matchedRecipe.createItem.stack);
+            int craftTimes = Math.Max(1, (int)Math.Ceiling((double)craftedStack / outputPerCraft));
+            if (craftTimes > 100) craftTimes = 100;
+
+            var refundedSummary = new List<string>();
+            var tPlayer = player.TPlayer;
+
+            foreach (var req in matchedRecipe.requiredItem)
+            {
+                if (req == null || req.IsAir || req.type <= ItemID.None || req.stack <= 0)
+                    continue;
+
+                int totalRefundStack = Math.Min(999, req.stack * craftTimes);
+                if (totalRefundStack <= 0) continue;
+
+                int remaining = totalRefundStack;
+
+                for (int i = 0; i < 50 && remaining > 0; i++)
+                {
+                    var inv = tPlayer.inventory[i];
+                    if (inv != null && !inv.IsAir && inv.type == req.type && inv.stack < inv.maxStack)
+                    {
+                        int add = Math.Min(remaining, inv.maxStack - inv.stack);
+                        inv.stack += add;
+                        remaining -= add;
+                        NetMessage.SendData((int)PacketTypes.PlayerSlot, -1, -1, null, player.Index, i, inv.prefix, 0, 0);
+                        NetMessage.SendData((int)PacketTypes.PlayerSlot, player.Index, -1, null, player.Index, i, inv.prefix, 0, 0);
+                    }
+                }
+
+                while (remaining > 0)
+                {
+                    int emptySlot = -1;
+                    for (int i = 0; i < 50; i++)
+                    {
+                        var inv = tPlayer.inventory[i];
+                        if (inv == null || inv.IsAir || inv.type == ItemID.None)
+                        {
+                            emptySlot = i;
+                            break;
+                        }
+                    }
+
+                    if (emptySlot < 0) break;
+
+                    Item newMat = new Item();
+                    newMat.SetDefaults(req.type);
+                    int putStack = Math.Min(remaining, Math.Max(1, newMat.maxStack));
+                    newMat.stack = putStack;
+                    tPlayer.inventory[emptySlot] = newMat;
+                    remaining -= putStack;
+
+                    NetMessage.SendData((int)PacketTypes.PlayerSlot, -1, -1, null, player.Index, emptySlot, newMat.prefix, 0, 0);
+                    NetMessage.SendData((int)PacketTypes.PlayerSlot, player.Index, -1, null, player.Index, emptySlot, newMat.prefix, 0, 0);
+                }
+
+                if (remaining > 0)
+                {
+                    SpawnDroppedItemOnGround(player, req.type, remaining, 0, true);
+                }
+
+                refundedSummary.Add($"{Lang.GetItemNameValue(req.type)} x{totalRefundStack}");
+            }
+
+            if (refundedSummary.Count == 0)
+                return false;
+
+            _craftRefundCooldown[key] = DateTime.UtcNow;
+            player.SendSuccessMessage($"[ClassSystem] Refunded crafting materials: {string.Join(", ", refundedSummary)}.");
+            return true;
+        }
+
+        private void NotifyBlockedPickup(TSPlayer player, string itemName, bool fromCraftingOrCursor = false, bool refunded = false)
         {
             if (player == null) return;
             var state = GetPlayerState(player);
@@ -1083,7 +1291,10 @@ namespace ClassSystemPlugin
                 if (!_craftWarnCooldown.TryGetValue(player.Index, out DateTime lastCraftWarn) || (DateTime.UtcNow - lastCraftWarn).TotalSeconds >= 2)
                 {
                     _craftWarnCooldown[player.Index] = DateTime.UtcNow;
-                    player.SendErrorMessage($"[ClassSystem] Crafting/holding '{itemName}' blocked — {className.ToUpper()} cannot craft or use items from other classes! Ejected onto the ground.");
+                    string tail = refunded
+                        ? "Crafted item removed & materials refunded."
+                        : "Crafted item ejected onto the ground (not deleted).";
+                    player.SendErrorMessage($"[ClassSystem] Crafting/holding '{itemName}' blocked — {className.ToUpper()} cannot craft or use items from other classes! {tail}");
                 }
                 return;
             }
@@ -1098,7 +1309,7 @@ namespace ClassSystemPlugin
         private bool TryAcquireItemTypeEjectLock(int playerIndex, int itemType)
         {
             long key = ((long)playerIndex << 32) | (uint)Math.Max(0, itemType);
-            if (_itemTypeEjectCooldown.TryGetValue(key, out DateTime lastTime) && (DateTime.UtcNow - lastTime).TotalMilliseconds < 250)
+            if (_itemTypeEjectCooldown.TryGetValue(key, out DateTime lastTime) && (DateTime.UtcNow - lastTime).TotalMilliseconds < 150)
             {
                 return false;
             }
@@ -1106,9 +1317,7 @@ namespace ClassSystemPlugin
             return true;
         }
 
-        // เคลียร์ทุกช่องที่มีไอเทมชนิดเดียวกันซ้อน/กระจายอยู่ และรวมจำนวนกอง (Stack) ทั้งหมดก่อนเด้งลงพื้นครั้งเดียว
-        // ป้องกันกรณีไอเทมต่างชนิดซ้อนกันบนพื้นแล้วรับเข้ากระเป๋าทำให้ตัวหนึ่งเด้งและอีกตัวค้างใช้ข้ามสายได้
-        private void EjectDisallowedItemSafely(TSPlayer player, int netSlotIndex, Item itemToDrop, int fallbackType, int fallbackStack, byte fallbackPrefix = 0, bool isCursorOrCraft = false)
+        private void EjectDisallowedItemSafely(TSPlayer player, int netSlotIndex, Item itemToDrop, int fallbackType, int fallbackStack, byte fallbackPrefix = 0, bool isCursorOrCraft = false, bool bypassCooldown = false)
         {
             if (player?.TPlayer == null) return;
 
@@ -1161,7 +1370,6 @@ namespace ClassSystemPlugin
                 ClearPlayerNetSlot(player, netSlotIndex);
             }
 
-            // กวาดทุกช่องในกระเป๋า (0..58) และเคอร์เซอร์ (58) เผื่อไอเทมซ้อนกันหลายช่องจากการรวมกองบนพื้น
             for (int i = 0; i < tPlayer.inventory.Length && i < 59; i++)
             {
                 Item inv = tPlayer.inventory[i];
@@ -1191,13 +1399,32 @@ namespace ClassSystemPlugin
             int totalStackToDrop = Math.Max(incomingStack, serverFoundStack);
             if (totalStackToDrop <= 0) return;
 
-            if (!TryAcquireItemTypeEjectLock(player.Index, itemType))
+            bool isCraftAction = isCursorOrCraft || netSlotIndex == 58;
+            bool forceDrop = bypassCooldown || isCraftAction;
+            if (!forceDrop && !TryAcquireItemTypeEjectLock(player.Index, itemType))
             {
                 return;
             }
 
-            SpawnDroppedItemOnGround(player, itemType, totalStackToDrop, prefix);
-            NotifyBlockedPickup(player, itemName, isCursorOrCraft || netSlotIndex == 58);
+            if (forceDrop)
+            {
+                long key = ((long)player.Index << 32) | (uint)Math.Max(0, itemType);
+                _itemTypeEjectCooldown[key] = DateTime.UtcNow;
+            }
+
+            if (isCraftAction)
+            {
+                bool refunded = TryRefundCraftIngredientsSafely(player, itemType, totalStackToDrop);
+                if (!refunded)
+                {
+                    SpawnDroppedItemOnGround(player, itemType, totalStackToDrop, prefix, false);
+                }
+                NotifyBlockedPickup(player, itemName, true, refunded);
+                return;
+            }
+
+            SpawnDroppedItemOnGround(player, itemType, totalStackToDrop, prefix, false);
+            NotifyBlockedPickup(player, itemName, false, false);
         }
 
         private void ClearPlayerNetSlot(TSPlayer player, int netSlotIndex)
@@ -1326,7 +1553,7 @@ namespace ClassSystemPlugin
                 Item cursorItem = tPlayer.inventory[58];
                 if (cursorItem != null && !cursorItem.IsAir && cursorItem.type > ItemID.None && !IsItemAllowedForClass(cursorItem, currentClass))
                 {
-                    EjectDisallowedItemSafely(player, 58, cursorItem, cursorItem.type, cursorItem.stack, cursorItem.prefix, true);
+                    EjectDisallowedItemSafely(player, 58, cursorItem, cursorItem.type, cursorItem.stack, cursorItem.prefix, true, true);
                 }
             }
 
@@ -1335,7 +1562,7 @@ namespace ClassSystemPlugin
                 Item item = tPlayer.inventory[i];
                 if (item != null && !item.IsAir && item.type > ItemID.None && !IsItemAllowedForClass(item, currentClass))
                 {
-                    EjectDisallowedItemSafely(player, i, item, item.type, item.stack, item.prefix, false);
+                    EjectDisallowedItemSafely(player, i, item, item.type, item.stack, item.prefix, false, false);
                 }
             }
 
@@ -1344,13 +1571,13 @@ namespace ClassSystemPlugin
                 Item armorItem = tPlayer.armor[i];
                 if (armorItem != null && !armorItem.IsAir && armorItem.type > ItemID.None && !IsItemAllowedForClass(armorItem, currentClass))
                 {
-                    EjectDisallowedItemSafely(player, 59 + i, armorItem, armorItem.type, armorItem.stack, armorItem.prefix, false);
+                    EjectDisallowedItemSafely(player, 59 + i, armorItem, armorItem.type, armorItem.stack, armorItem.prefix, false, false);
                 }
             }
 
             if (tPlayer.trashItem != null && !tPlayer.trashItem.IsAir && tPlayer.trashItem.type > ItemID.None && !IsItemAllowedForClass(tPlayer.trashItem, currentClass))
             {
-                EjectDisallowedItemSafely(player, 179, tPlayer.trashItem, tPlayer.trashItem.type, tPlayer.trashItem.stack, tPlayer.trashItem.prefix, false);
+                EjectDisallowedItemSafely(player, 179, tPlayer.trashItem, tPlayer.trashItem.type, tPlayer.trashItem.stack, tPlayer.trashItem.prefix, false, false);
             }
         }
 
@@ -1507,8 +1734,8 @@ namespace ClassSystemPlugin
                 _db = new SqliteConnection($"Data Source={dbPath}");
                 _db.Open();
 
-                ExecuteNonQuery("CREATE TABLE IF NOT EXISTS PlayerClasses (AccountID INTEGER PRIMARY KEY, ClassName TEXT NOT NULL, StarterChoice INTEGER NOT NULL DEFAULT 0)");
-                EnsureStarterChoiceColumnExists();
+                ExecuteNonQuery("CREATE TABLE IF NOT EXISTS PlayerClasses (AccountID INTEGER PRIMARY KEY, ClassName TEXT NOT NULL, StarterChoice INTEGER NOT NULL DEFAULT 0, BaseLife INTEGER NOT NULL DEFAULT 100)");
+                EnsureColumnsExist();
                 _dbReady = true;
             }
             catch (Exception ex)
@@ -1518,13 +1745,14 @@ namespace ClassSystemPlugin
             }
         }
 
-        private void EnsureStarterChoiceColumnExists()
+        private void EnsureColumnsExist()
         {
             if (_db == null) return;
             try
             {
                 EnsureConnectionOpen();
-                bool hasCol = false;
+                bool hasChoiceCol = false;
+                bool hasBaseLifeCol = false;
                 using (var cmd = _db.CreateCommand())
                 {
                     cmd.CommandText = "PRAGMA table_info(PlayerClasses)";
@@ -1532,17 +1760,24 @@ namespace ClassSystemPlugin
                     {
                         while (reader.Read())
                         {
-                            if (!reader.IsDBNull(1) && string.Equals(reader.GetString(1), "StarterChoice", StringComparison.OrdinalIgnoreCase))
+                            if (!reader.IsDBNull(1))
                             {
-                                hasCol = true;
-                                break;
+                                string colName = reader.GetString(1);
+                                if (string.Equals(colName, "StarterChoice", StringComparison.OrdinalIgnoreCase))
+                                    hasChoiceCol = true;
+                                else if (string.Equals(colName, "BaseLife", StringComparison.OrdinalIgnoreCase))
+                                    hasBaseLifeCol = true;
                             }
                         }
                     }
                 }
-                if (!hasCol)
+                if (!hasChoiceCol)
                 {
                     ExecuteNonQuery("ALTER TABLE PlayerClasses ADD COLUMN StarterChoice INTEGER NOT NULL DEFAULT 0");
+                }
+                if (!hasBaseLifeCol)
+                {
+                    ExecuteNonQuery("ALTER TABLE PlayerClasses ADD COLUMN BaseLife INTEGER NOT NULL DEFAULT 100");
                 }
             }
             catch { }
@@ -1632,7 +1867,10 @@ namespace ClassSystemPlugin
 
             if (savedState != null && !string.IsNullOrEmpty(savedState.ClassName))
             {
+                int normalizedBase = NormalizeBaseLifeValue(savedState.BaseLife);
+                savedState.BaseLife = normalizedBase;
                 _playerStates[accountId] = savedState;
+                _playerBaseLife[args.Player.Index] = normalizedBase;
                 _lastSyncedMaxLife.Remove(args.Player.Index);
 
                 if (savedState.StarterChoice > 0)
@@ -1658,6 +1896,8 @@ namespace ClassSystemPlugin
             }
             else
             {
+                int initialBase = NormalizeBaseLifeValue(args.Player.TPlayer?.statLifeMax ?? BaseStartHp);
+                _playerBaseLife[args.Player.Index] = initialBase;
                 ApplyUnderworldLock(args.Player, true);
                 args.Player.SendWarningMessage(ClassSelectPrompt);
                 BroadcastSelectionPhase(
@@ -1683,6 +1923,7 @@ namespace ClassSystemPlugin
             _dropWarnCooldown.Remove(args.Who);
             _craftWarnCooldown.Remove(args.Who);
             _crystalWarnCooldown.Remove(args.Who);
+            _crystalUseCooldown.Remove(args.Who);
             _buffRefreshCooldown.Remove(args.Who);
             _lockedBuffRestoreCooldown.Remove(args.Who);
             _legacyBuffPurgeCooldown.Remove(args.Who);
@@ -1702,6 +1943,19 @@ namespace ClassSystemPlugin
             foreach (long k in keysToRemove)
             {
                 _itemTypeEjectCooldown.Remove(k);
+            }
+
+            var refundKeysToRemove = new List<long>();
+            foreach (var kv in _craftRefundCooldown)
+            {
+                if ((int)(kv.Key >> 32) == args.Who)
+                {
+                    refundKeysToRemove.Add(kv.Key);
+                }
+            }
+            foreach (long k in refundKeysToRemove)
+            {
+                _craftRefundCooldown.Remove(k);
             }
         }
 
@@ -1830,10 +2084,17 @@ namespace ClassSystemPlugin
                     CleanupInactiveBlockedWorldItems(player.Index);
                     Item held = player.TPlayer.HeldItem;
 
-                    if (held != null && !held.IsAir && held.type == ItemID.LifeCrystal && IsLifeCrystalAtLimit(player))
+                    if (held != null && !held.IsAir && held.type == ItemID.LifeCrystal)
                     {
-                        BlockLifeCrystalUsage(player);
-                        NotifyBlockedLifeCrystal(player);
+                        if (IsLifeCrystalAtLimit(player))
+                        {
+                            BlockLifeCrystalUsage(player);
+                            NotifyBlockedLifeCrystal(player);
+                        }
+                        else if (args.Control.IsUsingItem)
+                        {
+                            TryConsumeLifeCrystalManually(player, state);
+                        }
                     }
 
                     if (HasAnyDisallowedItemInInventory(player, state.ClassName))
@@ -1879,11 +2140,10 @@ namespace ClassSystemPlugin
                     player.TPlayer.itemTime = 0;
                     CancelActivePlayerProjectiles(player);
                     bool isCursorOrCraft = (args.Slot == 58);
-                    EjectDisallowedItemSafely(player, args.Slot, testItem, args.Type, args.Stack, (byte)args.Prefix, isCursorOrCraft);
+                    EjectDisallowedItemSafely(player, args.Slot, testItem, args.Type, args.Stack, (byte)args.Prefix, isCursorOrCraft, true);
                 }
             }
 
-            // สแกนทั้งกระเป๋าซ้ำทันทีหลังแพ็กเก็ต PlayerSlot เพื่อดักไอเทมที่ซ้อนกันอยู่แล้วถูกอัปเดตในช่องอื่น
             if (HasAnyDisallowedItemInInventory(player, state.ClassName))
             {
                 args.Handled = true;
@@ -2129,14 +2389,20 @@ namespace ClassSystemPlugin
                 return;
             }
 
+            int baseLife = _playerBaseLife.TryGetValue(args.Player.Index, out int tracked)
+                ? NormalizeBaseLifeValue(tracked)
+                : NormalizeBaseLifeValue(args.Player.TPlayer?.statLifeMax ?? BaseStartHp);
+
             var newState = new PlayerClassState
             {
                 ClassName = chosen,
-                StarterChoice = 0
+                StarterChoice = 0,
+                BaseLife = baseLife
             };
 
             SaveStateToDB(args.Player.Account.ID, newState);
             _playerStates[args.Player.Account.ID] = newState;
+            _playerBaseLife[args.Player.Index] = baseLife;
 
             string choicePrompt = GetStarterChoicePrompt(chosen);
             ApplyUnderworldLock(args.Player, true);
@@ -2171,23 +2437,19 @@ namespace ClassSystemPlugin
                 return;
             }
 
+            int baseLife = NormalizeBaseLifeValue(state.BaseLife);
             state.StarterChoice = choice;
+            state.BaseLife = baseLife;
+
             SaveStateToDB(args.Player.Account.ID, state);
             _playerStates[args.Player.Account.ID] = state;
+            _playerBaseLife[args.Player.Index] = baseLife;
 
             RemoveAllWeaponsFromInventory(args.Player);
             EnforceAllowedInventory(args.Player, state.ClassName);
             GiveStarterItems(args.Player, state.ClassName, choice);
             ClearWebAndTeleportToSpawn(args.Player);
             CleanDisallowedSpeedBuffs(args.Player, state, true);
-
-            if (!_playerBaseLife.ContainsKey(args.Player.Index))
-            {
-                int initialBase = args.Player.TPlayer.statLifeMax > 0
-                    ? Math.Min(Math.Max(BaseStartHp, args.Player.TPlayer.statLifeMax), GetMaxAllowedBaseLife())
-                    : BaseStartHp;
-                _playerBaseLife[args.Player.Index] = initialBase;
-            }
 
             _lastSyncedMaxLife.Remove(args.Player.Index);
             ApplyClassStats(args.Player, state);
@@ -2219,14 +2481,29 @@ namespace ClassSystemPlugin
                 return;
             }
 
+            var prevState = GetPlayerState(target);
+            int preservedBaseLife = prevState != null
+                ? NormalizeBaseLifeValue(prevState.BaseLife)
+                : (_playerBaseLife.TryGetValue(target.Index, out int tracked) ? NormalizeBaseLifeValue(tracked) : BaseStartHp);
+
             string option = args.Parameters[1].ToLowerInvariant();
             if (option == "none" || option == "reset")
             {
                 DeleteStateFromDB(target.Account.ID);
                 _playerStates.Remove(target.Account.ID);
                 _lastSyncedMaxLife.Remove(target.Index);
-                _playerBaseLife.Remove(target.Index);
+                _playerBaseLife[target.Index] = preservedBaseLife;
                 _lastBroadcastPhase.Remove(target.Index);
+
+                target.TPlayer.statLifeMax = preservedBaseLife;
+                target.TPlayer.statLifeMax2 = preservedBaseLife;
+                if (target.TPlayer.statLife > preservedBaseLife)
+                {
+                    target.TPlayer.statLife = preservedBaseLife;
+                }
+                NetMessage.SendData((int)PacketTypes.PlayerHp, -1, -1, null, target.Index);
+                NetMessage.SendData((int)PacketTypes.PlayerHp, target.Index, -1, null, target.Index);
+
                 CleanDisallowedSpeedBuffs(target, null, true);
                 ApplyUnderworldLock(target, true);
                 target.SendWarningMessage(ClassSelectPrompt);
@@ -2245,13 +2522,24 @@ namespace ClassSystemPlugin
             var newState = new PlayerClassState
             {
                 ClassName = resolvedOption,
-                StarterChoice = 0
+                StarterChoice = 0,
+                BaseLife = preservedBaseLife
             };
             SaveStateToDB(target.Account.ID, newState);
             _playerStates[target.Account.ID] = newState;
             _lastSyncedMaxLife.Remove(target.Index);
-            _playerBaseLife.Remove(target.Index);
+            _playerBaseLife[target.Index] = preservedBaseLife;
             _lastBroadcastPhase.Remove(target.Index);
+
+            target.TPlayer.statLifeMax = preservedBaseLife;
+            target.TPlayer.statLifeMax2 = preservedBaseLife;
+            if (target.TPlayer.statLife > preservedBaseLife)
+            {
+                target.TPlayer.statLife = preservedBaseLife;
+            }
+            NetMessage.SendData((int)PacketTypes.PlayerHp, -1, -1, null, target.Index);
+            NetMessage.SendData((int)PacketTypes.PlayerHp, target.Index, -1, null, target.Index);
+
             CleanDisallowedSpeedBuffs(target, newState, true);
             string choicePrompt = GetStarterChoicePrompt(resolvedOption);
             ApplyUnderworldLock(target, true);
@@ -2279,7 +2567,9 @@ namespace ClassSystemPlugin
             int hpDelta = GetMaxHpDelta(state);
             int targetMaxLife = Math.Max(20, currentBaseLife + hpDelta);
 
-            tPlayer.statLifeMax = targetMaxLife;
+            // เก็บ statLifeMax เป็นเลือดฐานจริง (100..400) เพื่อให้ Client กดใช้ Life Crystal ได้ครบ 15 ลูก
+            // และใช้ statLifeMax2 เป็นเลือดสุทธิรวมโบนัสสาย (เช่น 160..460 สำหรับ Melee /ch 1)
+            tPlayer.statLifeMax = currentBaseLife;
             tPlayer.statLifeMax2 = targetMaxLife;
 
             if (tPlayer.statLife > targetMaxLife)
@@ -2303,7 +2593,7 @@ namespace ClassSystemPlugin
                 EnsureConnectionOpen();
                 using (var cmd = _db.CreateCommand())
                 {
-                    cmd.CommandText = "SELECT ClassName, StarterChoice FROM PlayerClasses WHERE AccountID = @0";
+                    cmd.CommandText = "SELECT ClassName, StarterChoice, BaseLife FROM PlayerClasses WHERE AccountID = @0";
                     var p = cmd.CreateParameter();
                     p.ParameterName = "@0";
                     p.Value = accountId;
@@ -2315,10 +2605,12 @@ namespace ClassSystemPlugin
                         {
                             string cName = reader.GetString(0);
                             int choice = !reader.IsDBNull(1) ? reader.GetInt32(1) : 0;
+                            int baseLife = !reader.IsDBNull(2) ? reader.GetInt32(2) : BaseStartHp;
                             return new PlayerClassState
                             {
                                 ClassName = cName,
-                                StarterChoice = choice
+                                StarterChoice = choice,
+                                BaseLife = NormalizeBaseLifeValue(baseLife)
                             };
                         }
                     }
@@ -2336,9 +2628,10 @@ namespace ClassSystemPlugin
             if (state == null || string.IsNullOrEmpty(state.ClassName)) return;
             try
             {
+                int normalizedBase = NormalizeBaseLifeValue(state.BaseLife);
                 ExecuteNonQuery(
-                    "INSERT INTO PlayerClasses (AccountID, ClassName, StarterChoice) VALUES (@0, @1, @2) ON CONFLICT(AccountID) DO UPDATE SET ClassName = excluded.ClassName, StarterChoice = excluded.StarterChoice",
-                    ("@0", accountId), ("@1", state.ClassName), ("@2", state.StarterChoice));
+                    "INSERT INTO PlayerClasses (AccountID, ClassName, StarterChoice, BaseLife) VALUES (@0, @1, @2, @3) ON CONFLICT(AccountID) DO UPDATE SET ClassName = excluded.ClassName, StarterChoice = excluded.StarterChoice, BaseLife = excluded.BaseLife",
+                    ("@0", accountId), ("@1", state.ClassName), ("@2", state.StarterChoice), ("@3", normalizedBase));
             }
             catch (Exception ex)
             {
