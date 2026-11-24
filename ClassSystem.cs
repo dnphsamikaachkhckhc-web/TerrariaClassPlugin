@@ -27,8 +27,8 @@ namespace ClassSystemPlugin
     {
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
-        public override string Description => "Class & starter-choice (/ch 1|2) system with strict 100 base HP initialization so Warrior /ch 1 starts at 120 HP instead of 420 HP, incremental Life Crystal tracking up to 15 crystals, strict instant inventory/held-item cross-class ejection, SlimeStaff for summoner /ch 1, smooth native client movement/jump buffs, custom prompts, server-wide broadcasts, underworld lock, inventory weapon wipe, and permanent class/choice buffs & debuffs.";
-        public override Version Version => new Version(17, 0, 0);
+        public override string Description => "Class & starter-choice (/ch 1|2) system with NetGetData PlayerHp packet handling to fix Warrior /ch 1 420 HP bug across TShock versions, incremental Life Crystal tracking up to 15 crystals, strict instant inventory/held-item cross-class ejection, SlimeStaff for summoner /ch 1, smooth native client movement/jump buffs, custom prompts, server-wide broadcasts, underworld lock, inventory weapon wipe, and permanent class/choice buffs & debuffs.";
+        public override Version Version => new Version(17, 0, 1);
 
         private const string ClassSelectPrompt =
             "Chat by Shokuya :3 Please select your class >w<\n\n" +
@@ -218,6 +218,7 @@ namespace ClassSystemPlugin
             ServerApi.Hooks.NetGreetPlayer.Register(this, OnGreetPlayer);
             ServerApi.Hooks.ServerLeave.Register(this, OnServerLeave);
             ServerApi.Hooks.NpcStrike.Register(this, OnNpcStrike);
+            ServerApi.Hooks.NetGetData.Register(this, OnNetGetData);
 
             PlayerHooks.PlayerCommand += OnPlayerCommand;
             PlayerHooks.PlayerPostLogin += OnPlayerPostLogin;
@@ -225,7 +226,6 @@ namespace ClassSystemPlugin
             GetDataHandlers.PlayerSlot += OnPlayerSlot;
             GetDataHandlers.ItemDrop += OnItemDrop;
             GetDataHandlers.PlayerDamage += OnPlayerDamage;
-            GetDataHandlers.PlayerHp += OnPlayerHp;
         }
 
         protected override void Dispose(bool disposing)
@@ -237,6 +237,7 @@ namespace ClassSystemPlugin
                 ServerApi.Hooks.NetGreetPlayer.Deregister(this, OnGreetPlayer);
                 ServerApi.Hooks.ServerLeave.Deregister(this, OnServerLeave);
                 ServerApi.Hooks.NpcStrike.Deregister(this, OnNpcStrike);
+                ServerApi.Hooks.NetGetData.Deregister(this, OnNetGetData);
 
                 PlayerHooks.PlayerCommand -= OnPlayerCommand;
                 PlayerHooks.PlayerPostLogin -= OnPlayerPostLogin;
@@ -244,7 +245,6 @@ namespace ClassSystemPlugin
                 GetDataHandlers.PlayerSlot -= OnPlayerSlot;
                 GetDataHandlers.ItemDrop -= OnItemDrop;
                 GetDataHandlers.PlayerDamage -= OnPlayerDamage;
-                GetDataHandlers.PlayerHp -= OnPlayerHp;
 
                 if (_db != null)
                 {
@@ -541,47 +541,57 @@ namespace ClassSystemPlugin
             return false;
         }
 
-        private void OnPlayerHp(object sender, GetDataHandlers.PlayerHpEventArgs args)
+        private void OnNetGetData(GetDataEventArgs args)
         {
-            var player = args.Player;
+            if (args == null || args.Handled || args.MsgID != PacketTypes.PlayerHp) return;
+
+            var player = TShock.Players[args.Msg.whoAmI];
             if (player == null || !player.Active) return;
 
-            int maxAllowedBaseLife = GetMaxAllowedBaseLife();
-            int incomingMax = args.Max > 0 ? args.Max : BaseStartHp;
-
-            var state = (player.IsLoggedIn && player.Account != null) ? GetPlayerState(player) : null;
-            int hpDelta = GetMaxHpDelta(state);
-
-            // ถ้าผู้เล่นยังไม่ได้เลือกคลาสหรือยังไม่ได้เลือก /ch ให้ยึดตามเลือดฐานจริงของตัวละคร (จำกัดไม่เกิน 400)
-            if (state == null || string.IsNullOrEmpty(state.ClassName) || state.StarterChoice <= 0)
+            try
             {
-                int rawBase = Math.Min(Math.Max(BaseStartHp, incomingMax), maxAllowedBaseLife);
-                _playerBaseLife[player.Index] = rawBase;
-                return;
-            }
+                int startPos = args.Index;
+                int length = args.Length;
+                if (args.Msg?.reader == null) return;
 
-            // ถ้าเลือกคลาสและ /ch แล้ว อนุญาตให้ฐานเพิ่มขึ้นได้ทีละ +20 จากการกิน Life Crystal เท่านั้น
-            int currentBase = GetTrackedBaseLife(player);
-            if (incomingMax == currentBase + hpDelta + HpPerLifeCrystal && currentBase + HpPerLifeCrystal <= maxAllowedBaseLife)
-            {
-                // ผู้เล่นเพิ่งกิน Life Crystal สำเร็จ (+20 จากฐานเดิม)
-                currentBase += HpPerLifeCrystal;
-                _playerBaseLife[player.Index] = currentBase;
-            }
-            else if (incomingMax <= maxAllowedBaseLife && incomingMax > currentBase && (incomingMax - currentBase) == HpPerLifeCrystal)
-            {
-                currentBase = incomingMax;
-                _playerBaseLife[player.Index] = currentBase;
-            }
+                byte pktPlayerId = args.Msg.reader.ReadByte();
+                short statLife = args.Msg.reader.ReadInt16();
+                short statLifeMax = args.Msg.reader.ReadInt16();
 
-            // บังคับซิงค์กลับให้ตรงกับฐานจริง + hpDelta เสมอ ป้องกันไคลเอนต์ส่งค่าผิด/เด้ง 420
-            int expectedTargetMax = Math.Max(20, currentBase + hpDelta);
-            if (incomingMax != expectedTargetMax)
-            {
-                args.Handled = true;
-                _lastSyncedMaxLife.Remove(player.Index);
-                ApplyClassStats(player, state);
+                int maxAllowedBaseLife = GetMaxAllowedBaseLife();
+                int incomingMax = statLifeMax > 0 ? statLifeMax : BaseStartHp;
+
+                var state = (player.IsLoggedIn && player.Account != null) ? GetPlayerState(player) : null;
+                int hpDelta = GetMaxHpDelta(state);
+
+                if (state == null || string.IsNullOrEmpty(state.ClassName) || state.StarterChoice <= 0)
+                {
+                    int rawBase = Math.Min(Math.Max(BaseStartHp, incomingMax), maxAllowedBaseLife);
+                    _playerBaseLife[player.Index] = rawBase;
+                    return;
+                }
+
+                int currentBase = GetTrackedBaseLife(player);
+                if (incomingMax == currentBase + hpDelta + HpPerLifeCrystal && currentBase + HpPerLifeCrystal <= maxAllowedBaseLife)
+                {
+                    currentBase += HpPerLifeCrystal;
+                    _playerBaseLife[player.Index] = currentBase;
+                }
+                else if (incomingMax <= maxAllowedBaseLife && incomingMax > currentBase && (incomingMax - currentBase) == HpPerLifeCrystal)
+                {
+                    currentBase = incomingMax;
+                    _playerBaseLife[player.Index] = currentBase;
+                }
+
+                int expectedTargetMax = Math.Max(20, currentBase + hpDelta);
+                if (incomingMax != expectedTargetMax)
+                {
+                    args.Handled = true;
+                    _lastSyncedMaxLife.Remove(player.Index);
+                    ApplyClassStats(player, state);
+                }
             }
+            catch { }
         }
 
         private void OnPlayerDamage(object sender, GetDataHandlers.PlayerDamageEventArgs args)
@@ -780,7 +790,6 @@ namespace ClassSystemPlugin
                 return Math.Min(Math.Max(BaseStartHp, tracked), maxAllowedBaseLife);
             }
 
-            // ถ้ายังไม่มีประวัติฐานของ player นี้ ให้ดึงจาก TPlayer แต่ถ้าเป็นค่าเริ่มต้น/เพี้ยนให้เริ่มที่ 100
             int currentStatMax = player?.TPlayer?.statLifeMax > 0 ? player.TPlayer.statLifeMax : BaseStartHp;
             int clampedStatMax = Math.Min(Math.Max(BaseStartHp, currentStatMax), maxAllowedBaseLife);
 
@@ -1752,7 +1761,6 @@ namespace ClassSystemPlugin
             GiveStarterItems(args.Player, state.ClassName, choice);
             ClearWebAndTeleportToSpawn(args.Player);
 
-            // ถ้าฐานยังไม่ถูกบันทึกไว้ใน _playerBaseLife หรือเกินเพดาน ให้ตั้งฐานเริ่มต้นที่ 100 (หรือค่าที่ตัวละครมีจริงไม่เกิน 400)
             if (!_playerBaseLife.ContainsKey(args.Player.Index))
             {
                 int initialBase = args.Player.TPlayer.statLifeMax > 0
@@ -1849,8 +1857,6 @@ namespace ClassSystemPlugin
             int hpDelta = GetMaxHpDelta(state);
             int targetMaxLife = Math.Max(20, currentBaseLife + hpDelta);
 
-            // สำคัญ: ใน Terraria/TShock เวลาส่ง PacketTypes.PlayerHp ฝั่งไคลเอนต์จะอ่านค่าจาก tPlayer.statLifeMax
-            // ดังนั้นต้องตั้งทั้ง statLifeMax และ statLifeMax2 เป็น targetMaxLife แต่เวลาคำนวณรอบถัดไปให้ดึงฐานจาก _playerBaseLife เท่านั้น
             tPlayer.statLifeMax = targetMaxLife;
             tPlayer.statLifeMax2 = targetMaxLife;
 
