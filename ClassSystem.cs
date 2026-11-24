@@ -28,8 +28,8 @@ namespace ClassSystemPlugin
     {
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
-        public override string Description => "Class & starter-choice (/ch 1|2) system with synced 160 HP for Melee /ch 1 (100 base + 60 bonus), loop-safe cross-class item/craft blocker and ingredient refund preventing infinite Wooden Bow duplication/drops, persistent SQLite BaseLife tracking, zero-flicker permanent buffs/debuffs, and solid-ground Underworld spawn detection.";
-        public override Version Version => new Version(17, 20, 1);
+        public override string Description => "Class & starter-choice (/ch 1|2) system with synced 160 HP for Melee /ch 1 (100 base + 60 bonus), cross-class item ejection away from the player without ingredient refund loops, persistent SQLite BaseLife tracking, zero-flicker permanent buffs/debuffs, and solid-ground Underworld spawn detection.";
+        public override Version Version => new Version(17, 21, 0);
 
         private const string ClassSelectPrompt =
             "Chat by Shokuya :3 Please select your class >w<\n\n" +
@@ -49,7 +49,6 @@ namespace ClassSystemPlugin
         private readonly Dictionary<int, DateTime> _dropWarnCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, DateTime> _craftWarnCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<long, DateTime> _itemTypeEjectCooldown = new Dictionary<long, DateTime>();
-        private readonly Dictionary<long, DateTime> _craftRefundCooldown = new Dictionary<long, DateTime>();
         private readonly Dictionary<int, DateTime> _crystalWarnCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, DateTime> _crystalUseCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, DateTime> _buffRefreshCooldown = new Dictionary<int, DateTime>();
@@ -853,7 +852,6 @@ namespace ClassSystemPlugin
                 int expectedTargetMax = Math.Max(20, currentBase + hpDelta);
                 bool baseChanged = false;
 
-                // ตรวจจับการกิน Life Crystal จริง (+20 จากเลือดเป้าหมายปัจจุบัน)
                 if (incomingMax == expectedTargetMax + HpPerLifeCrystal && currentBase + HpPerLifeCrystal <= maxAllowedBaseLife)
                 {
                     currentBase += HpPerLifeCrystal;
@@ -1141,137 +1139,38 @@ namespace ClassSystemPlugin
             player.TPlayer.itemTime = 0;
         }
 
-        private int SpawnDroppedItemOnGround(TSPlayer player, int itemType, int stack, byte prefix, bool allowSelfPickup = false)
+        // ดรอปของที่คราฟผิดสายออกไปให้ตกห่างจากตัวผู้เล่น
+        private int SpawnDroppedItemAwayFromPlayer(TSPlayer player, int itemType, int stack, byte prefix)
         {
             if (player?.TPlayer == null || itemType <= ItemID.None) return -1;
 
+            float dir = player.TPlayer.direction != 0 ? player.TPlayer.direction : 1f;
+            float offsetX = dir * 130f; // ห่างจากตัวผู้เล่นประมาณ 8 บล็อก
+            Vector2 dropPos = new Vector2(player.TPlayer.position.X + offsetX, player.TPlayer.position.Y - 16f);
+
             int droppedIndex = Item.NewItem(
                 new MiscEntitySource(),
-                player.TPlayer.position,
+                dropPos,
                 itemType,
                 Math.Max(1, stack)
             );
 
             if (droppedIndex >= 0 && droppedIndex < Main.maxItems)
             {
-                float dir = player.TPlayer.direction != 0 ? player.TPlayer.direction : 1f;
                 Main.item[droppedIndex].prefix = prefix;
                 Main.item[droppedIndex].playerIndexTheItemIsReservedFor = 255;
-                Main.item[droppedIndex].velocity = new Vector2(dir * 3.5f, -2.5f);
+                Main.item[droppedIndex].velocity = new Vector2(dir * 7.5f, -4.5f);
 
                 NetMessage.SendData((int)PacketTypes.ItemDrop, -1, -1, null, droppedIndex);
                 NetMessage.SendData((int)PacketTypes.ItemOwner, -1, -1, null, droppedIndex);
 
-                if (!allowSelfPickup)
-                {
-                    RegisterBlockedWorldItem(player.Index, droppedIndex);
-                }
+                RegisterBlockedWorldItem(player.Index, droppedIndex);
             }
 
             return droppedIndex;
         }
 
-        private bool TryRefundCraftIngredientsSafely(TSPlayer player, int craftedItemType, int craftedStack)
-        {
-            if (player?.TPlayer == null || craftedItemType <= ItemID.None || craftedStack <= 0)
-                return false;
-
-            long key = ((long)player.Index << 32) | (uint)craftedItemType;
-            if (_craftRefundCooldown.TryGetValue(key, out DateTime lastRefund) &&
-                (DateTime.UtcNow - lastRefund).TotalMilliseconds < 1500)
-            {
-                return false;
-            }
-
-            Recipe matchedRecipe = null;
-            if (Main.recipe != null)
-            {
-                for (int i = 0; i < Recipe.numRecipes; i++)
-                {
-                    var rec = Main.recipe[i];
-                    if (rec != null && rec.createItem != null && !rec.createItem.IsAir && rec.createItem.type == craftedItemType)
-                    {
-                        matchedRecipe = rec;
-                        break;
-                    }
-                }
-            }
-
-            if (matchedRecipe == null || matchedRecipe.requiredItem == null)
-                return false;
-
-            int outputPerCraft = Math.Max(1, matchedRecipe.createItem.stack);
-            int craftTimes = Math.Max(1, Math.Min(20, (int)Math.Ceiling((double)craftedStack / outputPerCraft)));
-
-            var refundedSummary = new List<string>();
-            var tPlayer = player.TPlayer;
-
-            foreach (var req in matchedRecipe.requiredItem)
-            {
-                if (req == null || req.IsAir || req.type <= ItemID.None || req.stack <= 0)
-                    continue;
-
-                int totalRefundStack = Math.Min(999, req.stack * craftTimes);
-                if (totalRefundStack <= 0) continue;
-
-                int remaining = totalRefundStack;
-
-                for (int i = 0; i < 50 && remaining > 0; i++)
-                {
-                    var inv = tPlayer.inventory[i];
-                    if (inv != null && !inv.IsAir && inv.type == req.type && inv.stack < inv.maxStack)
-                    {
-                        int add = Math.Min(remaining, inv.maxStack - inv.stack);
-                        inv.stack += add;
-                        remaining -= add;
-                        NetMessage.SendData((int)PacketTypes.PlayerSlot, -1, -1, null, player.Index, i, inv.prefix, 0, 0);
-                        NetMessage.SendData((int)PacketTypes.PlayerSlot, player.Index, -1, null, player.Index, i, inv.prefix, 0, 0);
-                    }
-                }
-
-                while (remaining > 0)
-                {
-                    int emptySlot = -1;
-                    for (int i = 0; i < 50; i++)
-                    {
-                        var inv = tPlayer.inventory[i];
-                        if (inv == null || inv.IsAir || inv.type == ItemID.None)
-                        {
-                            emptySlot = i;
-                            break;
-                        }
-                    }
-
-                    if (emptySlot < 0) break;
-
-                    Item newMat = new Item();
-                    newMat.SetDefaults(req.type);
-                    int putStack = Math.Min(remaining, Math.Max(1, newMat.maxStack));
-                    newMat.stack = putStack;
-                    tPlayer.inventory[emptySlot] = newMat;
-                    remaining -= putStack;
-
-                    NetMessage.SendData((int)PacketTypes.PlayerSlot, -1, -1, null, player.Index, emptySlot, newMat.prefix, 0, 0);
-                    NetMessage.SendData((int)PacketTypes.PlayerSlot, player.Index, -1, null, player.Index, emptySlot, newMat.prefix, 0, 0);
-                }
-
-                if (remaining > 0)
-                {
-                    SpawnDroppedItemOnGround(player, req.type, remaining, 0, true);
-                }
-
-                refundedSummary.Add($"{Lang.GetItemNameValue(req.type)} x{totalRefundStack}");
-            }
-
-            if (refundedSummary.Count == 0)
-                return false;
-
-            _craftRefundCooldown[key] = DateTime.UtcNow;
-            player.SendSuccessMessage($"[ClassSystem] Refunded crafting materials: {string.Join(", ", refundedSummary)}.");
-            return true;
-        }
-
-        private void NotifyBlockedPickup(TSPlayer player, string itemName, bool fromCraftingOrCursor = false, bool refunded = false)
+        private void NotifyBlockedPickup(TSPlayer player, string itemName, bool fromCraftingOrCursor = false, bool droppedAway = false)
         {
             if (player == null) return;
             var state = GetPlayerState(player);
@@ -1282,8 +1181,8 @@ namespace ClassSystemPlugin
                 if (!_craftWarnCooldown.TryGetValue(player.Index, out DateTime lastCraftWarn) || (DateTime.UtcNow - lastCraftWarn).TotalSeconds >= 3)
                 {
                     _craftWarnCooldown[player.Index] = DateTime.UtcNow;
-                    string tail = refunded
-                        ? "Crafted item removed & materials refunded."
+                    string tail = droppedAway
+                        ? "Crafted item dropped away from you."
                         : "Crafted item removed.";
                     player.SendErrorMessage($"[ClassSystem] Crafting/holding '{itemName}' blocked — {className.ToUpper()} cannot craft or use items from other classes! {tail}");
                 }
@@ -1297,7 +1196,7 @@ namespace ClassSystemPlugin
             }
         }
 
-        private bool TryAcquireItemTypeEjectLock(int playerIndex, int itemType, double cooldownMs = 1000)
+        private bool TryAcquireItemTypeEjectLock(int playerIndex, int itemType, double cooldownMs = 1200)
         {
             long key = ((long)playerIndex << 32) | (uint)Math.Max(0, itemType);
             if (_itemTypeEjectCooldown.TryGetValue(key, out DateTime lastTime) && (DateTime.UtcNow - lastTime).TotalMilliseconds < cooldownMs)
@@ -1322,6 +1221,7 @@ namespace ClassSystemPlugin
                 ? itemToDrop.stack
                 : Math.Max(1, fallbackStack);
 
+            byte prefix = itemToDrop != null && itemToDrop.prefix > 0 ? itemToDrop.prefix : fallbackPrefix;
             string itemName = itemToDrop != null && !string.IsNullOrWhiteSpace(itemToDrop.Name)
                 ? itemToDrop.Name
                 : Lang.GetItemNameValue(itemType);
@@ -1386,19 +1286,20 @@ namespace ClassSystemPlugin
                 ClearPlayerNetSlot(player, 179);
             }
 
-            int totalStackToHandle = Math.Max(incomingStack, serverFoundStack);
-            if (totalStackToHandle <= 0) return;
+            int totalStackToDrop = Math.Max(incomingStack, serverFoundStack);
+            if (totalStackToDrop <= 0) return;
 
             bool isCraftAction = isCursorOrCraft || netSlotIndex == 58;
-            if (!TryAcquireItemTypeEjectLock(player.Index, itemType, isCraftAction ? 1500 : 1000))
+            if (!TryAcquireItemTypeEjectLock(player.Index, itemType, isCraftAction ? 1500 : 1200))
             {
                 return;
             }
 
             if (isCraftAction)
             {
-                bool refunded = TryRefundCraftIngredientsSafely(player, itemType, totalStackToHandle);
-                NotifyBlockedPickup(player, itemName, true, refunded);
+                int dropStack = Math.Min(totalStackToDrop, Math.Max(1, itemToDrop?.maxStack ?? 1));
+                int droppedIdx = SpawnDroppedItemAwayFromPlayer(player, itemType, dropStack, prefix);
+                NotifyBlockedPickup(player, itemName, true, droppedIdx >= 0);
                 return;
             }
 
@@ -1921,19 +1822,6 @@ namespace ClassSystemPlugin
             foreach (long k in keysToRemove)
             {
                 _itemTypeEjectCooldown.Remove(k);
-            }
-
-            var refundKeysToRemove = new List<long>();
-            foreach (var kv in _craftRefundCooldown)
-            {
-                if ((int)(kv.Key >> 32) == args.Who)
-                {
-                    refundKeysToRemove.Add(kv.Key);
-                }
-            }
-            foreach (long k in refundKeysToRemove)
-            {
-                _craftRefundCooldown.Remove(k);
             }
         }
 
