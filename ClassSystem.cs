@@ -27,8 +27,8 @@ namespace ClassSystemPlugin
     {
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
-        public override string Description => "Class & starter-choice (/ch 1|2) system with custom base movement speed multiplier per class/choice (Swiftness & Slow buffs removed), solid-ground Underworld spawn detection, zero-damage lock against NPCs & GodMode invulnerability while logging in/choosing class/starter pack, cross-class crafting/cursor/inventory ejection, NetGetData PlayerHp packet handling, incremental Life Crystal tracking, SlimeStaff for summoner /ch 1, and permanent class/choice buffs & debuffs.";
-        public override Version Version => new Version(17, 4, 0);
+        public override string Description => "Class & starter-choice (/ch 1|2) system with forced client-side Swiftness/Slow buff purge, custom base movement speed multiplier per class/choice, solid-ground Underworld spawn detection, zero-damage lock against NPCs & GodMode invulnerability while logging in/choosing class/starter pack, cross-class crafting/cursor/inventory ejection, NetGetData PlayerHp packet handling, incremental Life Crystal tracking, SlimeStaff for summoner /ch 1, and permanent class/choice buffs & debuffs.";
+        public override Version Version => new Version(17, 4, 1);
 
         private const string ClassSelectPrompt =
             "Chat by Shokuya :3 Please select your class >w<\n\n" +
@@ -51,6 +51,7 @@ namespace ClassSystemPlugin
         private readonly Dictionary<int, DateTime> _crystalWarnCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, DateTime> _buffRefreshCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, DateTime> _speedSyncCooldown = new Dictionary<int, DateTime>();
+        private readonly Dictionary<int, DateTime> _legacyBuffPurgeCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, int> _lastSyncedMaxLife = new Dictionary<int, int>();
         private readonly Dictionary<int, int> _playerBaseLife = new Dictionary<int, int>();
         private readonly Dictionary<int, double> _honeyRegenAccumulator = new Dictionary<int, double>();
@@ -259,7 +260,6 @@ namespace ClassSystemPlugin
             base.Dispose(disposing);
         }
 
-        // กำหนดตัวคูณความเร็วพื้นฐานของแต่ละสาย (1.0f = ความเร็วปกติ 100%, 1.20f = +20%, 0.88f = -12%)
         private float GetMoveSpeedMultiplier(PlayerClassState state)
         {
             if (state == null || string.IsNullOrEmpty(state.ClassName) || state.StarterChoice <= 0)
@@ -303,7 +303,6 @@ namespace ClassSystemPlugin
             tPlayer.accRunSpeed *= mult;
             tPlayer.maxRunSpeed *= mult;
 
-            // ซิงก์ความเร็วเคลื่อนที่แนวราบ (velocity.X) ให้ Client เห็นผลจริงเมื่อกำลังวิ่ง
             if (Math.Abs(tPlayer.velocity.X) > 0.25f)
             {
                 float extraRatio = mult - 1.0f;
@@ -471,7 +470,6 @@ namespace ClassSystemPlugin
             return 0.0;
         }
 
-        // เอา BuffID.Swiftness และ BuffID.Slow ออกทั้งหมดแล้ว
         private int[] GetPermanentBuffsForState(PlayerClassState state, Player tPlayer)
         {
             var list = new List<int>();
@@ -526,10 +524,12 @@ namespace ClassSystemPlugin
             return list.ToArray();
         }
 
-        private void ClearLegacySpeedBuffs(TSPlayer player)
+        // บังคับล้างบัฟ Swiftness (วิ่งเร็ว) และ Slow (เดินช้า) ทั้งฝั่ง Server และบนหน้าจอ Client ทันที
+        private void ClearLegacySpeedBuffs(TSPlayer player, bool forceImmediate = false)
         {
-            if (player?.TPlayer == null) return;
-            bool removed = false;
+            if (player?.TPlayer == null || !player.Active) return;
+
+            bool foundOnServer = false;
             for (int i = 0; i < Player.maxBuffs; i++)
             {
                 int bType = player.TPlayer.buffType[i];
@@ -537,11 +537,22 @@ namespace ClassSystemPlugin
                 {
                     player.TPlayer.buffType[i] = 0;
                     player.TPlayer.buffTime[i] = 0;
-                    removed = true;
+                    foundOnServer = true;
                 }
             }
-            if (removed)
+
+            bool cooldownReady = !_legacyBuffPurgeCooldown.TryGetValue(player.Index, out DateTime lastPurge) ||
+                                 (DateTime.UtcNow - lastPurge).TotalSeconds >= 2.0;
+
+            if (forceImmediate || foundOnServer || cooldownReady)
             {
+                _legacyBuffPurgeCooldown[player.Index] = DateTime.UtcNow;
+
+                // ส่งเวลาบัฟ = 0 ไปให้ Client เพื่อให้ Client ลบไอคอนบัฟ Swiftness และ Slow ออกจากหน้าจอทันที
+                NetMessage.SendData((int)PacketTypes.AddPlayerBuff, player.Index, -1, null, player.Index, BuffID.Swiftness, 0);
+                NetMessage.SendData((int)PacketTypes.AddPlayerBuff, player.Index, -1, null, player.Index, BuffID.Slow, 0);
+
+                // ซิงก์ตารางบัฟทั้งหมดทับอีกรอบเพื่อป้องกันบัฟค้าง
                 NetMessage.SendData((int)PacketTypes.PlayerBuff, -1, -1, null, player.Index);
                 NetMessage.SendData((int)PacketTypes.PlayerBuff, player.Index, -1, null, player.Index);
             }
@@ -561,6 +572,8 @@ namespace ClassSystemPlugin
             bool appliedAny = false;
             foreach (int buffId in requiredBuffs)
             {
+                if (buffId == BuffID.Swiftness || buffId == BuffID.Slow) continue;
+
                 bool found = false;
                 for (int i = 0; i < Player.maxBuffs; i++)
                 {
@@ -1296,6 +1309,7 @@ namespace ClassSystemPlugin
             }
             if (removed)
             {
+                NetMessage.SendData((int)PacketTypes.AddPlayerBuff, player.Index, -1, null, player.Index, BuffID.Webbed, 0);
                 NetMessage.SendData((int)PacketTypes.PlayerBuff, -1, -1, null, player.Index);
                 NetMessage.SendData((int)PacketTypes.PlayerBuff, player.Index, -1, null, player.Index);
             }
@@ -1468,6 +1482,7 @@ namespace ClassSystemPlugin
             if (player != null && !player.IsLoggedIn)
             {
                 ClearWebBuff(player);
+                ClearLegacySpeedBuffs(player, true);
                 ApplyUnderworldLock(player, false);
                 player.SendWarningMessage("[ClassSystem] Welcome to the Underworld! (GodMode active) Log in with /login and pick a class with /c <Me|Rg|Mg|sm> or /class <warrior|ranger|mage|summoner>.");
             }
@@ -1478,6 +1493,7 @@ namespace ClassSystemPlugin
             if (args.Player?.Account == null) return;
 
             ClearWebBuff(args.Player);
+            ClearLegacySpeedBuffs(args.Player, true);
 
             int accountId = args.Player.Account.ID;
             var savedState = GetStateFromDB(accountId);
@@ -1490,7 +1506,7 @@ namespace ClassSystemPlugin
                 if (savedState.StarterChoice > 0)
                 {
                     ClearWebAndTeleportToSpawn(args.Player);
-                    ClearLegacySpeedBuffs(args.Player);
+                    ClearLegacySpeedBuffs(args.Player, true);
                     EnforceAllowedInventory(args.Player, savedState.ClassName);
                     ApplyClassStats(args.Player, savedState);
                     EnsurePermanentClassBuffs(args.Player, savedState);
@@ -1537,6 +1553,7 @@ namespace ClassSystemPlugin
             _crystalWarnCooldown.Remove(args.Who);
             _buffRefreshCooldown.Remove(args.Who);
             _speedSyncCooldown.Remove(args.Who);
+            _legacyBuffPurgeCooldown.Remove(args.Who);
             _lastSyncedMaxLife.Remove(args.Who);
             _playerBaseLife.Remove(args.Who);
             _honeyRegenAccumulator.Remove(args.Who);
@@ -1758,6 +1775,7 @@ namespace ClassSystemPlugin
                     DisarmLockedPlayer(player);
                     if (runPeriodicSync)
                     {
+                        ClearLegacySpeedBuffs(player, false);
                         ApplyUnderworldLock(player, false);
                     }
                     continue;
@@ -1771,6 +1789,7 @@ namespace ClassSystemPlugin
                     DisarmLockedPlayer(player);
                     if (runPeriodicSync)
                     {
+                        ClearLegacySpeedBuffs(player, false);
                         ApplyUnderworldLock(player, true);
                         BroadcastSelectionPhase(
                             player,
@@ -1789,6 +1808,7 @@ namespace ClassSystemPlugin
                     DisarmLockedPlayer(player);
                     if (runPeriodicSync)
                     {
+                        ClearLegacySpeedBuffs(player, false);
                         ApplyUnderworldLock(player, true);
                         BroadcastSelectionPhase(
                             player,
@@ -1813,7 +1833,7 @@ namespace ClassSystemPlugin
                 if (runPeriodicSync)
                 {
                     ClearWebBuff(player);
-                    ClearLegacySpeedBuffs(player);
+                    ClearLegacySpeedBuffs(player, false);
                     CleanupInactiveBlockedWorldItems(player.Index);
                     EnforceAllowedInventory(player, state.ClassName);
                     EnsurePermanentClassBuffs(player, state);
@@ -2011,7 +2031,7 @@ namespace ClassSystemPlugin
             EnforceAllowedInventory(args.Player, state.ClassName);
             GiveStarterItems(args.Player, state.ClassName, choice);
             ClearWebAndTeleportToSpawn(args.Player);
-            ClearLegacySpeedBuffs(args.Player);
+            ClearLegacySpeedBuffs(args.Player, true);
 
             if (!_playerBaseLife.ContainsKey(args.Player.Index))
             {
@@ -2059,7 +2079,7 @@ namespace ClassSystemPlugin
                 _lastSyncedMaxLife.Remove(target.Index);
                 _playerBaseLife.Remove(target.Index);
                 _lastBroadcastPhase.Remove(target.Index);
-                ClearLegacySpeedBuffs(target);
+                ClearLegacySpeedBuffs(target, true);
                 ApplyUnderworldLock(target, true);
                 target.SendWarningMessage(ClassSelectPrompt);
                 TShock.Utils.Broadcast($"[ClassSystem] {target.Name}\n{ClassSelectPrompt}", Color.Gold);
@@ -2084,7 +2104,7 @@ namespace ClassSystemPlugin
             _lastSyncedMaxLife.Remove(target.Index);
             _playerBaseLife.Remove(target.Index);
             _lastBroadcastPhase.Remove(target.Index);
-            ClearLegacySpeedBuffs(target);
+            ClearLegacySpeedBuffs(target, true);
             string choicePrompt = GetStarterChoicePrompt(resolvedOption);
             ApplyUnderworldLock(target, true);
             target.SendSuccessMessage(choicePrompt);
