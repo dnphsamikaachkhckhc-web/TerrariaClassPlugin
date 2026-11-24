@@ -29,7 +29,7 @@ namespace ClassSystemPlugin
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
         public override string Description => "Class & starter-choice (/ch 1|2) system with persistent SQLite BaseLife across relogs, strict 15 Life Crystal cap & refund on excess use, proper death/respawn state tracking, cross-class item ejection away from the player, and zero-flicker permanent buffs/debuffs.";
-        public override Version Version => new Version(17, 25, 0);
+        public override Version Version => new Version(17, 25, 1);
 
         private const string ClassSelectPrompt =
             "Chat by Shokuya :3 Please select your class >w<\n\n" +
@@ -1007,7 +1007,6 @@ namespace ClassSystemPlugin
                 var state = GetPlayerState(player);
                 int hpDelta = GetMaxHpDelta(state);
 
-                // ช่วงเพิ่งล็อกอินหรือเกิดใหม่ ให้ยึดค่า BaseLife จาก DB/แคช ไม่ให้ Client มาทับค่า Max HP ให้ลดลง
                 if (IsInLoginLifeLock(player))
                 {
                     int lockedBase = GetTrackedBaseLife(player);
@@ -1017,7 +1016,7 @@ namespace ClassSystemPlugin
                         args.Handled = true;
                         if (player.TPlayer != null)
                         {
-                            player.TPlayer.statLife = Math.Min(lockedTargetMax, Math.Max(1, statLife));
+                            player.TPlayer.statLife = Math.Min(lockedTargetMax, Math.Max(1, (int)statLife));
                             player.TPlayer.statLifeMax = lockedTargetMax;
                             player.TPlayer.statLifeMax2 = lockedTargetMax;
                         }
@@ -1034,10 +1033,13 @@ namespace ClassSystemPlugin
                     }
                     int rawBase = Math.Min(Math.Max(BaseStartHp, incomingMax), maxAllowedBaseLife);
                     _playerBaseLife[player.Index] = rawBase;
-                    state?.BaseLife = rawBase;
-                    if (state != null && !string.IsNullOrEmpty(state.ClassName))
+                    if (state != null)
                     {
-                        SaveStateToDB(player.Account.ID, state);
+                        state.BaseLife = rawBase;
+                        if (!string.IsNullOrEmpty(state.ClassName))
+                        {
+                            SaveStateToDB(player.Account.ID, state);
+                        }
                     }
                     return;
                 }
@@ -1045,7 +1047,6 @@ namespace ClassSystemPlugin
                 int currentBase = GetTrackedBaseLife(player);
                 int expectedTargetMax = Math.Max(20, currentBase + hpDelta);
 
-                // ดักการใช้ Life Crystal เกินลิมิต 15 ก้อนทันที ไม่ว่า incomingMax จะเพิ่มทีละเท่าไร
                 if (incomingMax > expectedTargetMax && IsLifeCrystalAtLimit(player))
                 {
                     args.Handled = true;
@@ -1059,7 +1060,7 @@ namespace ClassSystemPlugin
 
                     if (player.TPlayer != null)
                     {
-                        int revertedLife = Math.Max(1, Math.Min(expectedTargetMax, statLife - HpPerLifeCrystal));
+                        int revertedLife = Math.Max(1, Math.Min(expectedTargetMax, (int)statLife - HpPerLifeCrystal));
                         player.TPlayer.statLife = revertedLife;
                         player.TPlayer.statLifeMax = expectedTargetMax;
                         player.TPlayer.statLifeMax2 = expectedTargetMax;
@@ -1091,7 +1092,7 @@ namespace ClassSystemPlugin
 
                     if (player.TPlayer != null)
                     {
-                        player.TPlayer.statLife = Math.Min(newTargetMax, Math.Max(1, statLife));
+                        player.TPlayer.statLife = Math.Min(newTargetMax, Math.Max(1, (int)statLife));
                         player.TPlayer.statLifeMax = newTargetMax;
                         player.TPlayer.statLifeMax2 = newTargetMax;
                     }
@@ -1103,7 +1104,7 @@ namespace ClassSystemPlugin
 
                 if (player.TPlayer != null)
                 {
-                    player.TPlayer.statLife = Math.Min(expectedTargetMax, statLife);
+                    player.TPlayer.statLife = Math.Min(expectedTargetMax, (int)statLife);
                 }
 
                 if (incomingMax != expectedTargetMax)
