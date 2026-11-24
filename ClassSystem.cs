@@ -28,8 +28,8 @@ namespace ClassSystemPlugin
     {
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
-        public override string Description => "Class & starter-choice (/ch 1|2) system with synced 160 HP for Melee /ch 1 (100 base + 60 bonus), loop-safe cross-class item/craft blocker preventing infinite Wooden Bow duplication/drops, persistent SQLite BaseLife tracking, zero-flicker permanent buffs/debuffs, and solid-ground Underworld spawn detection.";
-        public override Version Version => new Version(17, 20, 0);
+        public override string Description => "Class & starter-choice (/ch 1|2) system with synced 160 HP for Melee /ch 1 (100 base + 60 bonus), loop-safe cross-class item/craft blocker and ingredient refund preventing infinite Wooden Bow duplication/drops, persistent SQLite BaseLife tracking, zero-flicker permanent buffs/debuffs, and solid-ground Underworld spawn detection.";
+        public override Version Version => new Version(17, 20, 1);
 
         private const string ClassSelectPrompt =
             "Chat by Shokuya :3 Please select your class >w<\n\n" +
@@ -1178,7 +1178,7 @@ namespace ClassSystemPlugin
 
             long key = ((long)player.Index << 32) | (uint)craftedItemType;
             if (_craftRefundCooldown.TryGetValue(key, out DateTime lastRefund) &&
-                (DateTime.UtcNow - lastRefund).TotalMilliseconds < 1200)
+                (DateTime.UtcNow - lastRefund).TotalMilliseconds < 1500)
             {
                 return false;
             }
@@ -1201,7 +1201,7 @@ namespace ClassSystemPlugin
                 return false;
 
             int outputPerCraft = Math.Max(1, matchedRecipe.createItem.stack);
-            int craftTimes = Math.Max(1, Math.Min(5, (int)Math.Ceiling((double)craftedStack / outputPerCraft)));
+            int craftTimes = Math.Max(1, Math.Min(20, (int)Math.Ceiling((double)craftedStack / outputPerCraft)));
 
             var refundedSummary = new List<string>();
             var tPlayer = player.TPlayer;
@@ -1211,7 +1211,7 @@ namespace ClassSystemPlugin
                 if (req == null || req.IsAir || req.type <= ItemID.None || req.stack <= 0)
                     continue;
 
-                int totalRefundStack = Math.Min(99, req.stack * craftTimes);
+                int totalRefundStack = Math.Min(999, req.stack * craftTimes);
                 if (totalRefundStack <= 0) continue;
 
                 int remaining = totalRefundStack;
@@ -1255,7 +1255,12 @@ namespace ClassSystemPlugin
                     NetMessage.SendData((int)PacketTypes.PlayerSlot, player.Index, -1, null, player.Index, emptySlot, newMat.prefix, 0, 0);
                 }
 
-                refundedSummary.Add($"{Lang.GetItemNameValue(req.type)} x{totalRefundStack - remaining}");
+                if (remaining > 0)
+                {
+                    SpawnDroppedItemOnGround(player, req.type, remaining, 0, true);
+                }
+
+                refundedSummary.Add($"{Lang.GetItemNameValue(req.type)} x{totalRefundStack}");
             }
 
             if (refundedSummary.Count == 0)
@@ -1292,7 +1297,7 @@ namespace ClassSystemPlugin
             }
         }
 
-        private bool TryAcquireItemTypeEjectLock(int playerIndex, int itemType, double cooldownMs = 800)
+        private bool TryAcquireItemTypeEjectLock(int playerIndex, int itemType, double cooldownMs = 1000)
         {
             long key = ((long)playerIndex << 32) | (uint)Math.Max(0, itemType);
             if (_itemTypeEjectCooldown.TryGetValue(key, out DateTime lastTime) && (DateTime.UtcNow - lastTime).TotalMilliseconds < cooldownMs)
@@ -1303,7 +1308,6 @@ namespace ClassSystemPlugin
             return true;
         }
 
-        // เคลียร์ไอเทมผิดสายและป้องกันลูปดรอป/เสกซ้ำไม่จำกัด
         private void EjectDisallowedItemSafely(TSPlayer player, int netSlotIndex, Item itemToDrop, int fallbackType, int fallbackStack, byte fallbackPrefix = 0, bool isCursorOrCraft = false, bool bypassCooldown = false)
         {
             if (player?.TPlayer == null) return;
@@ -1386,14 +1390,14 @@ namespace ClassSystemPlugin
             if (totalStackToHandle <= 0) return;
 
             bool isCraftAction = isCursorOrCraft || netSlotIndex == 58;
-            if (!TryAcquireItemTypeEjectLock(player.Index, itemType, isCraftAction ? 1000 : 800))
+            if (!TryAcquireItemTypeEjectLock(player.Index, itemType, isCraftAction ? 1500 : 1000))
             {
                 return;
             }
 
             if (isCraftAction)
             {
-                bool refunded = TryRefundCraftIngredientsSafely(player, itemType, Math.Min(totalStackToHandle, 5));
+                bool refunded = TryRefundCraftIngredientsSafely(player, itemType, totalStackToHandle);
                 NotifyBlockedPickup(player, itemName, true, refunded);
                 return;
             }
