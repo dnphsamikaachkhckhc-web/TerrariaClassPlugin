@@ -27,8 +27,8 @@ namespace ClassSystemPlugin
     {
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
-        public override string Description => "Class & starter-choice (/ch 1|2) system with zero-flicker permanent buffs/debuffs, +60 Max HP and unremovable Bleeding, Weak, and Endurance buffs for Melee /ch 1, permanent Swiftness buff for all classes/choices except Melee (warrior), natural Slow/debuff preservation across all classes, zero-rubberband movement, solid-ground Underworld spawn detection, zero-damage lock against NPCs & GodMode invulnerability while logging in/choosing class/starter pack, cross-class crafting/cursor/inventory ejection, NetGetData PlayerHp packet handling, incremental Life Crystal tracking, SlimeStaff for summoner /ch 1, and permanent class/choice buffs & debuffs.";
-        public override Version Version => new Version(17, 12, 0);
+        public override string Description => "Class & starter-choice (/ch 1|2) system with full multi-slot stacked-item anti-bypass & cross-class weapon lock, atomic stacked-item ejection, zero-flicker permanent buffs/debuffs, +60 Max HP and unremovable Bleeding, Weak, and Endurance buffs for Melee /ch 1, permanent Swiftness buff for all classes/choices except Melee (warrior), natural Slow/debuff preservation across all classes, zero-rubberband movement, solid-ground Underworld spawn detection, zero-damage lock against NPCs & GodMode invulnerability while logging in/choosing class/starter pack, cross-class crafting/cursor/inventory ejection, NetGetData PlayerHp packet handling, incremental Life Crystal tracking, SlimeStaff for summoner /ch 1, and permanent class/choice buffs & debuffs.";
+        public override Version Version => new Version(17, 14, 0);
 
         private const string ClassSelectPrompt =
             "Chat by Shokuya :3 Please select your class >w<\n\n" +
@@ -47,7 +47,7 @@ namespace ClassSystemPlugin
         private readonly Dictionary<int, string> _lastBroadcastPhase = new Dictionary<int, string>();
         private readonly Dictionary<int, DateTime> _dropWarnCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, DateTime> _craftWarnCooldown = new Dictionary<int, DateTime>();
-        private readonly Dictionary<int, DateTime> _slotEjectCooldown = new Dictionary<int, DateTime>();
+        private readonly Dictionary<long, DateTime> _itemTypeEjectCooldown = new Dictionary<long, DateTime>();
         private readonly Dictionary<int, DateTime> _crystalWarnCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, DateTime> _buffRefreshCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, DateTime> _lockedBuffRestoreCooldown = new Dictionary<int, DateTime>();
@@ -1095,21 +1095,22 @@ namespace ClassSystemPlugin
             }
         }
 
-        private bool CanEjectSlotNow(int playerIndex, int netSlotIndex)
+        private bool TryAcquireItemTypeEjectLock(int playerIndex, int itemType)
         {
-            int key = (playerIndex * 1000) + Math.Max(0, netSlotIndex);
-            if (_slotEjectCooldown.TryGetValue(key, out DateTime lastTime) && (DateTime.UtcNow - lastTime).TotalMilliseconds < 120)
+            long key = ((long)playerIndex << 32) | (uint)Math.Max(0, itemType);
+            if (_itemTypeEjectCooldown.TryGetValue(key, out DateTime lastTime) && (DateTime.UtcNow - lastTime).TotalMilliseconds < 250)
             {
                 return false;
             }
-            _slotEjectCooldown[key] = DateTime.UtcNow;
+            _itemTypeEjectCooldown[key] = DateTime.UtcNow;
             return true;
         }
 
+        // เคลียร์ทุกช่องที่มีไอเทมชนิดเดียวกันซ้อน/กระจายอยู่ และรวมจำนวนกอง (Stack) ทั้งหมดก่อนเด้งลงพื้นครั้งเดียว
+        // ป้องกันกรณีไอเทมต่างชนิดซ้อนกันบนพื้นแล้วรับเข้ากระเป๋าทำให้ตัวหนึ่งเด้งและอีกตัวค้างใช้ข้ามสายได้
         private void EjectDisallowedItemSafely(TSPlayer player, int netSlotIndex, Item itemToDrop, int fallbackType, int fallbackStack, byte fallbackPrefix = 0, bool isCursorOrCraft = false)
         {
             if (player?.TPlayer == null) return;
-            if (!CanEjectSlotNow(player.Index, netSlotIndex)) return;
 
             int itemType = itemToDrop != null && !itemToDrop.IsAir && itemToDrop.type > ItemID.None
                 ? itemToDrop.type
@@ -1117,7 +1118,7 @@ namespace ClassSystemPlugin
 
             if (itemType <= ItemID.None) return;
 
-            int stack = itemToDrop != null && itemToDrop.stack > 0
+            int incomingStack = itemToDrop != null && itemToDrop.stack > 0
                 ? itemToDrop.stack
                 : Math.Max(1, fallbackStack);
 
@@ -1133,14 +1134,69 @@ namespace ClassSystemPlugin
             player.TPlayer.itemTime = 0;
             CancelActivePlayerProjectiles(player);
 
-            int droppedIdx = SpawnDroppedItemOnGround(player, itemType, stack, prefix);
-            if (droppedIdx < 0) return;
+            int serverFoundStack = 0;
+            var tPlayer = player.TPlayer;
 
-            if (netSlotIndex >= 0)
+            if (netSlotIndex >= 0 && netSlotIndex < 59 && tPlayer.inventory[netSlotIndex] != null && !tPlayer.inventory[netSlotIndex].IsAir && tPlayer.inventory[netSlotIndex].type == itemType)
+            {
+                serverFoundStack += Math.Max(1, tPlayer.inventory[netSlotIndex].stack);
+                ClearPlayerNetSlot(player, netSlotIndex);
+            }
+            else if (netSlotIndex >= 59 && netSlotIndex < 79)
+            {
+                int armorIdx = netSlotIndex - 59;
+                if (armorIdx < tPlayer.armor.Length && tPlayer.armor[armorIdx] != null && !tPlayer.armor[armorIdx].IsAir && tPlayer.armor[armorIdx].type == itemType)
+                {
+                    serverFoundStack += Math.Max(1, tPlayer.armor[armorIdx].stack);
+                    ClearPlayerNetSlot(player, netSlotIndex);
+                }
+            }
+            else if (netSlotIndex == 179 && tPlayer.trashItem != null && !tPlayer.trashItem.IsAir && tPlayer.trashItem.type == itemType)
+            {
+                serverFoundStack += Math.Max(1, tPlayer.trashItem.stack);
+                ClearPlayerNetSlot(player, 179);
+            }
+            else if (netSlotIndex >= 0)
             {
                 ClearPlayerNetSlot(player, netSlotIndex);
             }
 
+            // กวาดทุกช่องในกระเป๋า (0..58) และเคอร์เซอร์ (58) เผื่อไอเทมซ้อนกันหลายช่องจากการรวมกองบนพื้น
+            for (int i = 0; i < tPlayer.inventory.Length && i < 59; i++)
+            {
+                Item inv = tPlayer.inventory[i];
+                if (inv != null && !inv.IsAir && inv.type == itemType)
+                {
+                    serverFoundStack += Math.Max(1, inv.stack);
+                    ClearPlayerNetSlot(player, i);
+                }
+            }
+
+            for (int i = 0; i < 3 && i < tPlayer.armor.Length; i++)
+            {
+                Item arm = tPlayer.armor[i];
+                if (arm != null && !arm.IsAir && arm.type == itemType)
+                {
+                    serverFoundStack += Math.Max(1, arm.stack);
+                    ClearPlayerNetSlot(player, 59 + i);
+                }
+            }
+
+            if (tPlayer.trashItem != null && !tPlayer.trashItem.IsAir && tPlayer.trashItem.type == itemType)
+            {
+                serverFoundStack += Math.Max(1, tPlayer.trashItem.stack);
+                ClearPlayerNetSlot(player, 179);
+            }
+
+            int totalStackToDrop = Math.Max(incomingStack, serverFoundStack);
+            if (totalStackToDrop <= 0) return;
+
+            if (!TryAcquireItemTypeEjectLock(player.Index, itemType))
+            {
+                return;
+            }
+
+            SpawnDroppedItemOnGround(player, itemType, totalStackToDrop, prefix);
             NotifyBlockedPickup(player, itemName, isCursorOrCraft || netSlotIndex == 58);
         }
 
@@ -1239,6 +1295,21 @@ namespace ClassSystemPlugin
                 {
                     return true;
                 }
+            }
+
+            for (int i = 0; i < 3 && i < tPlayer.armor.Length; i++)
+            {
+                Item arm = tPlayer.armor[i];
+                if (arm != null && !arm.IsAir && arm.type > ItemID.None && !IsItemAllowedForClass(arm, currentClass))
+                {
+                    return true;
+                }
+            }
+
+            if (tPlayer.trashItem != null && !tPlayer.trashItem.IsAir && tPlayer.trashItem.type > ItemID.None &&
+                !IsItemAllowedForClass(tPlayer.trashItem, currentClass))
+            {
+                return true;
             }
 
             return false;
@@ -1620,17 +1691,17 @@ namespace ClassSystemPlugin
             _honeyRegenAccumulator.Remove(args.Who);
             _blockedWorldItemsByPlayer.Remove(args.Who);
 
-            var keysToRemove = new List<int>();
-            foreach (var kv in _slotEjectCooldown)
+            var keysToRemove = new List<long>();
+            foreach (var kv in _itemTypeEjectCooldown)
             {
-                if (kv.Key / 1000 == args.Who)
+                if ((int)(kv.Key >> 32) == args.Who)
                 {
                     keysToRemove.Add(kv.Key);
                 }
             }
-            foreach (int k in keysToRemove)
+            foreach (long k in keysToRemove)
             {
-                _slotEjectCooldown.Remove(k);
+                _itemTypeEjectCooldown.Remove(k);
             }
         }
 
@@ -1811,6 +1882,17 @@ namespace ClassSystemPlugin
                     EjectDisallowedItemSafely(player, args.Slot, testItem, args.Type, args.Stack, (byte)args.Prefix, isCursorOrCraft);
                 }
             }
+
+            // สแกนทั้งกระเป๋าซ้ำทันทีหลังแพ็กเก็ต PlayerSlot เพื่อดักไอเทมที่ซ้อนกันอยู่แล้วถูกอัปเดตในช่องอื่น
+            if (HasAnyDisallowedItemInInventory(player, state.ClassName))
+            {
+                args.Handled = true;
+                player.TPlayer.controlUseItem = false;
+                player.TPlayer.itemAnimation = 0;
+                player.TPlayer.itemTime = 0;
+                CancelActivePlayerProjectiles(player);
+                EnforceAllowedInventory(player, state.ClassName);
+            }
         }
 
         private void OnGameUpdate(EventArgs args)
@@ -1887,6 +1969,10 @@ namespace ClassSystemPlugin
 
                 if (HasAnyDisallowedItemInInventory(player, state.ClassName))
                 {
+                    player.TPlayer.controlUseItem = false;
+                    player.TPlayer.itemAnimation = 0;
+                    player.TPlayer.itemTime = 0;
+                    CancelActivePlayerProjectiles(player);
                     EnforceAllowedInventory(player, state.ClassName);
                 }
 
@@ -1929,6 +2015,8 @@ namespace ClassSystemPlugin
                 HasAnyDisallowedItemInInventory(tsPlayer, state.ClassName))
             {
                 args.Damage = 0;
+                args.Handled = true;
+                DisarmLockedPlayer(tsPlayer);
                 EnforceAllowedInventory(tsPlayer, state.ClassName);
             }
         }
