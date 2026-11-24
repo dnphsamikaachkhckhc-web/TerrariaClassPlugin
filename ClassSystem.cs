@@ -28,8 +28,8 @@ namespace ClassSystemPlugin
     {
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
-        public override string Description => "Class & starter-choice (/ch 1|2) system with synced 160 HP for Melee /ch 1 (100 base + 60 bonus), cross-class item ejection away from the player without ingredient refund loops, persistent SQLite BaseLife tracking, zero-flicker permanent buffs/debuffs, and solid-ground Underworld spawn detection.";
-        public override Version Version => new Version(17, 21, 0);
+        public override string Description => "Class & starter-choice (/ch 1|2) system with synced 160 HP for Melee /ch 1 (100 base + 60 bonus), cross-class item ejection away from the player with strict re-pickup prevention, persistent SQLite BaseLife tracking, zero-flicker permanent buffs/debuffs, and solid-ground Underworld spawn detection.";
+        public override Version Version => new Version(17, 22, 0);
 
         private const string ClassSelectPrompt =
             "Chat by Shokuya :3 Please select your class >w<\n\n" +
@@ -756,6 +756,34 @@ namespace ClassSystemPlugin
             var player = TShock.Players[args.Msg.whoAmI];
             if (player == null || !player.Active) return;
 
+            if (args.MsgID == PacketTypes.ItemOwner)
+            {
+                if (player.IsLoggedIn && player.Account != null)
+                {
+                    try
+                    {
+                        long pos = args.Msg.reader.BaseStream.Position;
+                        short itemIdx = args.Msg.reader.ReadInt16();
+                        byte ownerId = args.Msg.reader.ReadByte();
+                        args.Msg.reader.BaseStream.Position = pos;
+
+                        if (itemIdx >= 0 && itemIdx < Main.maxItems && ownerId == player.Index && IsBlockedWorldItem(player.Index, itemIdx))
+                        {
+                            args.Handled = true;
+                            var wItem = Main.item[itemIdx];
+                            if (wItem != null && wItem.active)
+                            {
+                                wItem.playerIndexTheItemIsReservedFor = 255;
+                            }
+                            NetMessage.SendData((int)PacketTypes.ItemOwner, -1, -1, null, itemIdx);
+                            return;
+                        }
+                    }
+                    catch { }
+                }
+                return;
+            }
+
             if (args.MsgID == PacketTypes.PlayerAddBuff || args.MsgID == PacketTypes.PlayerBuff)
             {
                 if (player.IsLoggedIn && player.Account != null)
@@ -1015,17 +1043,46 @@ namespace ClassSystemPlugin
             return false;
         }
 
-        private void CleanupInactiveBlockedWorldItems(int playerIndex)
+        private void MaintainBlockedWorldItems(TSPlayer player)
         {
-            if (!_blockedWorldItemsByPlayer.TryGetValue(playerIndex, out var set) || set.Count == 0) return;
+            if (player?.TPlayer == null || !player.Active) return;
+            if (!_blockedWorldItemsByPlayer.TryGetValue(player.Index, out var set) || set.Count == 0) return;
+
             var expired = new List<int>();
+            Vector2 playerCenter = player.TPlayer.Center;
+
             foreach (int idx in set)
             {
                 if (idx < 0 || idx >= Main.maxItems || Main.item[idx] == null || !Main.item[idx].active || Main.item[idx].type <= ItemID.None)
                 {
                     expired.Add(idx);
+                    continue;
+                }
+
+                var wItem = Main.item[idx];
+                wItem.playerIndexTheItemIsReservedFor = 255;
+
+                // ถ้าผู้เล่นเดินเข้าใกล้ไอเทมผิดสายที่ถูกดรอปทิ้งไว้ ให้ผลักไอเทมออกห่างไม่ให้ดูดเข้าตัว
+                float dist = Vector2.Distance(playerCenter, wItem.Center);
+                if (dist < 120f)
+                {
+                    float pushDir = wItem.Center.X >= playerCenter.X ? 1f : -1f;
+                    int targetTileX = (int)((playerCenter.X + pushDir * 145f) / 16f);
+                    int targetTileY = (int)(wItem.Center.Y / 16f);
+
+                    if (targetTileX > 20 && targetTileX < Main.maxTilesX - 20 &&
+                        targetTileY > 20 && targetTileY < Main.maxTilesY - 20 &&
+                        !Collision.SolidCollision(new Vector2(targetTileX * 16f, targetTileY * 16f), wItem.width, wItem.height))
+                    {
+                        wItem.position.X = targetTileX * 16f;
+                    }
+
+                    wItem.velocity = new Vector2(pushDir * 6.5f, -3.5f);
+                    NetMessage.SendData((int)PacketTypes.ItemDrop, -1, -1, null, idx);
+                    NetMessage.SendData((int)PacketTypes.ItemOwner, -1, -1, null, idx);
                 }
             }
+
             foreach (int idx in expired)
             {
                 set.Remove(idx);
@@ -1055,13 +1112,16 @@ namespace ClassSystemPlugin
                     }
                 }
 
+                // ถ้าผู้เล่นพยายามเก็บไอเทมผิดสาย (Stacks <= 0) ให้ยกเลิกทันทีและล็อกไม่ให้เก็บ
                 if (args.Stacks <= 0 && IsBlockedWorldItem(player.Index, args.ID))
                 {
                     args.Handled = true;
                     var wItem = Main.item[args.ID];
                     if (wItem != null && wItem.active && wItem.type > ItemID.None)
                     {
+                        float pushDir = wItem.Center.X >= player.TPlayer.Center.X ? 1f : -1f;
                         wItem.playerIndexTheItemIsReservedFor = 255;
+                        wItem.velocity = new Vector2(pushDir * 6.5f, -3.5f);
                     }
                     NetMessage.SendData((int)PacketTypes.ItemDrop, -1, -1, null, args.ID);
                     NetMessage.SendData((int)PacketTypes.ItemOwner, -1, -1, null, args.ID);
@@ -1139,14 +1199,31 @@ namespace ClassSystemPlugin
             player.TPlayer.itemTime = 0;
         }
 
-        // ดรอปของที่คราฟผิดสายออกไปให้ตกห่างจากตัวผู้เล่น
+        // ดรอปของผิดสายออกไปให้ตกห่างจากตัวผู้เล่น และล็อกไม่ให้ผู้เล่นเก็บกลับเข้าตัวได้อีก
         private int SpawnDroppedItemAwayFromPlayer(TSPlayer player, int itemType, int stack, byte prefix)
         {
             if (player?.TPlayer == null || itemType <= ItemID.None) return -1;
 
             float dir = player.TPlayer.direction != 0 ? player.TPlayer.direction : 1f;
-            float offsetX = dir * 130f; // ห่างจากตัวผู้เล่นประมาณ 8 บล็อก
-            Vector2 dropPos = new Vector2(player.TPlayer.position.X + offsetX, player.TPlayer.position.Y - 16f);
+            float targetX = player.TPlayer.Center.X + (dir * 160f); // ห่างออกไป 10 บล็อก
+            float targetY = player.TPlayer.Center.Y - 24f;
+
+            // เช็กว่าจุดที่จะวางไม่จมอยู่ในบล็อกทึบ ถ้าติดกำแพงให้ขยับเข้ามาในระยะที่โล่ง
+            Vector2 dropPos = new Vector2(targetX, targetY);
+            if (Collision.SolidCollision(dropPos, 24, 24))
+            {
+                float altX = player.TPlayer.Center.X - (dir * 160f);
+                Vector2 altPos = new Vector2(altX, targetY);
+                if (!Collision.SolidCollision(altPos, 24, 24))
+                {
+                    dropPos = altPos;
+                    dir = -dir;
+                }
+                else
+                {
+                    dropPos = new Vector2(player.TPlayer.Center.X + (dir * 80f), targetY);
+                }
+            }
 
             int droppedIndex = Item.NewItem(
                 new MiscEntitySource(),
@@ -1159,7 +1236,7 @@ namespace ClassSystemPlugin
             {
                 Main.item[droppedIndex].prefix = prefix;
                 Main.item[droppedIndex].playerIndexTheItemIsReservedFor = 255;
-                Main.item[droppedIndex].velocity = new Vector2(dir * 7.5f, -4.5f);
+                Main.item[droppedIndex].velocity = new Vector2(dir * 8.5f, -4.5f);
 
                 NetMessage.SendData((int)PacketTypes.ItemDrop, -1, -1, null, droppedIndex);
                 NetMessage.SendData((int)PacketTypes.ItemOwner, -1, -1, null, droppedIndex);
@@ -1182,9 +1259,9 @@ namespace ClassSystemPlugin
                 {
                     _craftWarnCooldown[player.Index] = DateTime.UtcNow;
                     string tail = droppedAway
-                        ? "Crafted item dropped away from you."
-                        : "Crafted item removed.";
-                    player.SendErrorMessage($"[ClassSystem] Crafting/holding '{itemName}' blocked — {className.ToUpper()} cannot craft or use items from other classes! {tail}");
+                        ? "Item dropped away from you and cannot be picked up."
+                        : "Item removed.";
+                    player.SendErrorMessage($"[ClassSystem] '{itemName}' blocked — {className.ToUpper()} cannot craft or hold items from other classes! {tail}");
                 }
                 return;
             }
@@ -1192,11 +1269,11 @@ namespace ClassSystemPlugin
             if (!_dropWarnCooldown.TryGetValue(player.Index, out DateTime lastWarn) || (DateTime.UtcNow - lastWarn).TotalSeconds >= 3)
             {
                 _dropWarnCooldown[player.Index] = DateTime.UtcNow;
-                player.SendWarningMessage($"[ClassSystem] Removed '{itemName}' — {className.ToUpper()} cannot use or pick up items from other classes.");
+                player.SendWarningMessage($"[ClassSystem] Dropped '{itemName}' away — {className.ToUpper()} cannot use or pick up items from other classes.");
             }
         }
 
-        private bool TryAcquireItemTypeEjectLock(int playerIndex, int itemType, double cooldownMs = 1200)
+        private bool TryAcquireItemTypeEjectLock(int playerIndex, int itemType, double cooldownMs = 1500)
         {
             long key = ((long)playerIndex << 32) | (uint)Math.Max(0, itemType);
             if (_itemTypeEjectCooldown.TryGetValue(key, out DateTime lastTime) && (DateTime.UtcNow - lastTime).TotalMilliseconds < cooldownMs)
@@ -1290,20 +1367,14 @@ namespace ClassSystemPlugin
             if (totalStackToDrop <= 0) return;
 
             bool isCraftAction = isCursorOrCraft || netSlotIndex == 58;
-            if (!TryAcquireItemTypeEjectLock(player.Index, itemType, isCraftAction ? 1500 : 1200))
+            if (!TryAcquireItemTypeEjectLock(player.Index, itemType, 1500))
             {
                 return;
             }
 
-            if (isCraftAction)
-            {
-                int dropStack = Math.Min(totalStackToDrop, Math.Max(1, itemToDrop?.maxStack ?? 1));
-                int droppedIdx = SpawnDroppedItemAwayFromPlayer(player, itemType, dropStack, prefix);
-                NotifyBlockedPickup(player, itemName, true, droppedIdx >= 0);
-                return;
-            }
-
-            NotifyBlockedPickup(player, itemName, false, false);
+            int dropStack = Math.Min(totalStackToDrop, Math.Max(1, itemToDrop?.maxStack ?? 1));
+            int droppedIdx = SpawnDroppedItemAwayFromPlayer(player, itemType, dropStack, prefix);
+            NotifyBlockedPickup(player, itemName, isCraftAction, droppedIdx >= 0);
         }
 
         private void ClearPlayerNetSlot(TSPlayer player, int netSlotIndex)
@@ -1947,7 +2018,7 @@ namespace ClassSystemPlugin
                     SetUnderworldGodMode(player, false);
                     _frozenPositions.Remove(player.Index);
 
-                    CleanupInactiveBlockedWorldItems(player.Index);
+                    MaintainBlockedWorldItems(player);
                     Item held = player.TPlayer.HeldItem;
 
                     if (held != null && !held.IsAir && held.type == ItemID.LifeCrystal)
@@ -2087,7 +2158,7 @@ namespace ClassSystemPlugin
                 {
                     ClearWebBuff(player);
                     CleanDisallowedSpeedBuffs(player, state, false);
-                    CleanupInactiveBlockedWorldItems(player.Index);
+                    MaintainBlockedWorldItems(player);
                     EnforceAllowedInventory(player, state.ClassName);
                     EnsurePermanentClassBuffs(player, state, false);
                 }
