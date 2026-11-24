@@ -27,8 +27,8 @@ namespace ClassSystemPlugin
     {
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
-        public override string Description => "Class & starter-choice (/ch 1|2) system with NetGetData PlayerHp packet handling to fix Warrior /ch 1 420 HP bug across TShock versions, incremental Life Crystal tracking up to 15 crystals, strict instant inventory/held-item cross-class ejection, SlimeStaff for summoner /ch 1, smooth native client movement/jump buffs, custom prompts, server-wide broadcasts, underworld lock, inventory weapon wipe, and permanent class/choice buffs & debuffs.";
-        public override Version Version => new Version(17, 0, 1);
+        public override string Description => "Class & starter-choice (/ch 1|2) system with Underworld GodMode invulnerability & safe non-solid spawn detection while logging in/choosing class/starter pack, NetGetData PlayerHp packet handling, incremental Life Crystal tracking, strict instant cross-class ejection, SlimeStaff for summoner /ch 1, smooth native client movement/jump buffs, custom prompts, server-wide broadcasts, inventory weapon wipe, and permanent class/choice buffs & debuffs.";
+        public override Version Version => new Version(17, 1, 0);
 
         private const string ClassSelectPrompt =
             "Chat by Shokuya :3 Please select your class >w<\n\n" +
@@ -53,6 +53,8 @@ namespace ClassSystemPlugin
         private readonly Dictionary<int, int> _playerBaseLife = new Dictionary<int, int>();
         private readonly Dictionary<int, double> _honeyRegenAccumulator = new Dictionary<int, double>();
         private readonly Dictionary<int, HashSet<int>> _blockedWorldItemsByPlayer = new Dictionary<int, HashSet<int>>();
+        private readonly HashSet<int> _pluginGrantedGodMode = new HashSet<int>();
+        private Vector2? _cachedSafeUnderworldPos = null;
         private DateTime _lastTickSync = DateTime.MinValue;
         private DateTime _lastHoneyTick = DateTime.UtcNow;
 
@@ -253,6 +255,50 @@ namespace ClassSystemPlugin
                 }
             }
             base.Dispose(disposing);
+        }
+
+        private bool IsPlayerInSelectionLock(TSPlayer player)
+        {
+            if (player == null || !player.Active) return false;
+            if (!player.IsLoggedIn || player.Account == null) return true;
+            var state = GetPlayerState(player);
+            if (state == null || string.IsNullOrEmpty(state.ClassName) || state.StarterChoice <= 0)
+                return true;
+            return false;
+        }
+
+        private void SetUnderworldGodMode(TSPlayer player, bool enable)
+        {
+            if (player == null || !player.Active) return;
+
+            if (enable)
+            {
+                if (!player.GodMode)
+                {
+                    player.GodMode = true;
+                    _pluginGrantedGodMode.Add(player.Index);
+                }
+
+                if (player.TPlayer != null)
+                {
+                    player.TPlayer.immune = true;
+                    player.TPlayer.immuneTime = 60;
+                    player.TPlayer.breath = player.TPlayer.breathMax;
+                    if (player.TPlayer.statLife < player.TPlayer.statLifeMax2)
+                    {
+                        player.TPlayer.statLife = player.TPlayer.statLifeMax2;
+                        NetMessage.SendData((int)PacketTypes.PlayerHp, -1, -1, null, player.Index);
+                        NetMessage.SendData((int)PacketTypes.PlayerHp, player.Index, -1, null, player.Index);
+                    }
+                }
+            }
+            else
+            {
+                if (_pluginGrantedGodMode.Remove(player.Index))
+                {
+                    player.GodMode = false;
+                }
+            }
         }
 
         private string GetStarterChoicePrompt(string className)
@@ -550,8 +596,6 @@ namespace ClassSystemPlugin
 
             try
             {
-                int startPos = args.Index;
-                int length = args.Length;
                 if (args.Msg?.reader == null) return;
 
                 byte pktPlayerId = args.Msg.reader.ReadByte();
@@ -597,7 +641,17 @@ namespace ClassSystemPlugin
         private void OnPlayerDamage(object sender, GetDataHandlers.PlayerDamageEventArgs args)
         {
             var player = TShock.Players[args.ID];
-            if (player == null || !player.Active || !player.IsLoggedIn || player.Account == null) return;
+            if (player == null || !player.Active) return;
+
+            // เป็นอมตะ 100% ระหว่างที่ยังล็อกอิน/เลือกคลาส/เลือกอาวุธในนรก
+            if (IsPlayerInSelectionLock(player))
+            {
+                args.Handled = true;
+                SetUnderworldGodMode(player, true);
+                return;
+            }
+
+            if (!player.IsLoggedIn || player.Account == null) return;
 
             var state = GetPlayerState(player);
             double reduction = GetBrokenArmorReduction(state);
@@ -1055,11 +1109,64 @@ namespace ClassSystemPlugin
             return new Vector2(tileX * 16f, tileY * 16f);
         }
 
+        private bool IsTileAreaClear(int centerTileX, int feetTileY)
+        {
+            if (centerTileX < 50 || centerTileX > Main.maxTilesX - 50 || feetTileY < 50 || feetTileY > Main.maxTilesY - 30)
+                return false;
+
+            // ตรวจพื้นที่ขนาดกว้าง 2 บล็อก สูง 3 บล็อก (ตัวผู้เล่น) ต้องไม่มีบล็อกทึบและไม่มีลาวา/น้ำ
+            for (int dx = -1; dx <= 1; dx++)
+            {
+                for (int dy = -3; dy <= 0; dy++)
+                {
+                    var tile = Main.tile[centerTileX + dx, feetTileY + dy];
+                    if (tile == null) return false;
+                    if (tile.active() && Main.tileSolid[tile.type] && !Main.tileSolidTop[tile.type])
+                        return false;
+                    if (tile.liquid > 0)
+                        return false;
+                }
+            }
+            return true;
+        }
+
         private Vector2 GetUnderworldPosition()
         {
-            int tileX = Main.maxTilesX / 2;
-            int tileY = Math.Max(100, Main.maxTilesY - 60);
-            return new Vector2(tileX * 16f, tileY * 16f);
+            if (_cachedSafeUnderworldPos.HasValue)
+            {
+                int cx = (int)(_cachedSafeUnderworldPos.Value.X / 16f);
+                int cy = (int)(_cachedSafeUnderworldPos.Value.Y / 16f) + 3;
+                if (IsTileAreaClear(cx, cy))
+                {
+                    return _cachedSafeUnderworldPos.Value;
+                }
+            }
+
+            int startX = Main.maxTilesX / 2;
+            int minY = Math.Max(100, Main.maxTilesY - 190);
+            int maxY = Math.Max(minY + 10, Main.maxTilesY - 45);
+
+            // สแกนหาช่องว่างโล่งๆ ในนรก รอบๆ จุดกึ่งกลางโลก
+            for (int offsetX = 0; offsetX <= 250; offsetX += 2)
+            {
+                int[] candidateXs = offsetX == 0 ? new[] { startX } : new[] { startX + offsetX, startX - offsetX };
+                foreach (int tx in candidateXs)
+                {
+                    for (int ty = minY; ty <= maxY; ty++)
+                    {
+                        if (IsTileAreaClear(tx, ty))
+                        {
+                            Vector2 safePos = new Vector2(tx * 16f, (ty - 3) * 16f);
+                            _cachedSafeUnderworldPos = safePos;
+                            return safePos;
+                        }
+                    }
+                }
+            }
+
+            int fallbackX = Main.maxTilesX / 2;
+            int fallbackY = Math.Max(100, Main.maxTilesY - 120);
+            return new Vector2(fallbackX * 16f, fallbackY * 16f);
         }
 
         private void ClearWebBuff(TSPlayer player)
@@ -1085,6 +1192,9 @@ namespace ClassSystemPlugin
         private void ApplyUnderworldLock(TSPlayer player, bool applyWeb)
         {
             if (player == null || !player.Active) return;
+
+            // เปิดอมตะตลอดเวลาที่อยู่ในช่วงล็อกในนรก
+            SetUnderworldGodMode(player, true);
 
             Vector2 hellPos = GetUnderworldPosition();
             _frozenPositions[player.Index] = hellPos;
@@ -1114,6 +1224,9 @@ namespace ClassSystemPlugin
         private void ClearWebAndTeleportToSpawn(TSPlayer player)
         {
             if (player == null) return;
+
+            // ปิดอมตะของปลั๊กอินทันทีเมื่อเลือกคลาสและเลือกอาวุธครบแล้ว
+            SetUnderworldGodMode(player, false);
 
             _frozenPositions.Remove(player.Index);
             _lastBroadcastPhase.Remove(player.Index);
@@ -1244,7 +1357,7 @@ namespace ClassSystemPlugin
             {
                 ClearWebBuff(player);
                 ApplyUnderworldLock(player, false);
-                player.SendWarningMessage("[ClassSystem] Welcome to the Underworld! Log in with /login and pick a class with /c <Me|Rg|Mg|sm> or /class <warrior|ranger|mage|summoner>.");
+                player.SendWarningMessage("[ClassSystem] Welcome to the Underworld! (GodMode active) Log in with /login and pick a class with /c <Me|Rg|Mg|sm> or /class <warrior|ranger|mage|summoner>.");
             }
         }
 
@@ -1301,6 +1414,7 @@ namespace ClassSystemPlugin
             {
                 _playerStates.Remove(player.Account.ID);
             }
+            _pluginGrantedGodMode.Remove(args.Who);
             _frozenPositions.Remove(args.Who);
             _warnCooldown.Remove(args.Who);
             _serverBroadcastCooldown.Remove(args.Who);
@@ -1446,6 +1560,7 @@ namespace ClassSystemPlugin
                 }
                 else
                 {
+                    SetUnderworldGodMode(player, false);
                     _frozenPositions.Remove(player.Index);
                     CleanupInactiveBlockedWorldItems(player.Index);
                     Item held = player.TPlayer.HeldItem;
@@ -1522,6 +1637,7 @@ namespace ClassSystemPlugin
                 if (!player.IsLoggedIn || player.Account == null)
                 {
                     _honeyRegenAccumulator.Remove(player.Index);
+                    SetUnderworldGodMode(player, true);
                     if (runPeriodicSync)
                     {
                         ApplyUnderworldLock(player, false);
@@ -1533,6 +1649,7 @@ namespace ClassSystemPlugin
                 if (state == null || string.IsNullOrEmpty(state.ClassName))
                 {
                     _honeyRegenAccumulator.Remove(player.Index);
+                    SetUnderworldGodMode(player, true);
                     if (runPeriodicSync)
                     {
                         ApplyUnderworldLock(player, true);
@@ -1549,6 +1666,7 @@ namespace ClassSystemPlugin
                 {
                     string choicePrompt = GetStarterChoicePrompt(state.ClassName);
                     _honeyRegenAccumulator.Remove(player.Index);
+                    SetUnderworldGodMode(player, true);
                     if (runPeriodicSync)
                     {
                         ApplyUnderworldLock(player, true);
@@ -1561,6 +1679,7 @@ namespace ClassSystemPlugin
                     continue;
                 }
 
+                SetUnderworldGodMode(player, false);
                 ApplyHoneyRegenBonus(player, state, honeyDeltaSec);
                 ApplyClassStats(player, state);
                 ApplyBrokenArmorDefenseEffect(player, state);
@@ -1773,7 +1892,7 @@ namespace ClassSystemPlugin
             ApplyClassStats(args.Player, state);
             EnsurePermanentClassBuffs(args.Player, state);
 
-            args.Player.SendSuccessMessage($"[ClassSystem] Starter pack /ch {choice} selected for {state.ClassName.ToUpper()}! Weapons cleared, starter gear granted, buffs active, and released from the Underworld.");
+            args.Player.SendSuccessMessage($"[ClassSystem] Starter pack /ch {choice} selected for {state.ClassName.ToUpper()}! Weapons cleared, starter gear granted, buffs active, GodMode disabled, and released from the Underworld.");
             TShock.Utils.Broadcast($"[ClassSystem] {args.Player.Name} picked starter pack /ch {choice} for {state.ClassName.ToUpper()} and joined the surface!", Color.LightGreen);
         }
 
