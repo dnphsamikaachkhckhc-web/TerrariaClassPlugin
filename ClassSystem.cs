@@ -27,8 +27,8 @@ namespace ClassSystemPlugin
     {
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
-        public override string Description => "Class & starter-choice (/ch 1|2) system with +60 Max HP and permanent unremovable Bleeding, Weak, and Endurance buffs for Melee /ch 1, permanent Swiftness buff for all classes/choices except Melee (warrior), natural Slow/debuff preservation across all classes, zero-rubberband movement, solid-ground Underworld spawn detection, zero-damage lock against NPCs & GodMode invulnerability while logging in/choosing class/starter pack, cross-class crafting/cursor/inventory ejection, NetGetData PlayerHp packet handling, incremental Life Crystal tracking, SlimeStaff for summoner /ch 1, and permanent class/choice buffs & debuffs.";
-        public override Version Version => new Version(17, 10, 0);
+        public override string Description => "Class & starter-choice (/ch 1|2) system with flicker-free permanent buffs/debuffs, +60 Max HP and unremovable Bleeding, Weak, and Endurance buffs for Melee /ch 1, permanent Swiftness buff for all classes/choices except Melee (warrior), natural Slow/debuff preservation across all classes, zero-rubberband movement, solid-ground Underworld spawn detection, zero-damage lock against NPCs & GodMode invulnerability while logging in/choosing class/starter pack, cross-class crafting/cursor/inventory ejection, NetGetData PlayerHp packet handling, incremental Life Crystal tracking, SlimeStaff for summoner /ch 1, and permanent class/choice buffs & debuffs.";
+        public override Version Version => new Version(17, 11, 0);
 
         private const string ClassSelectPrompt =
             "Chat by Shokuya :3 Please select your class >w<\n\n" +
@@ -63,6 +63,10 @@ namespace ClassSystemPlugin
         private const int MaxLifeCrystalsAllowed = 15;
         private const int BaseStartHp = 100;
         private const int HpPerLifeCrystal = 20;
+
+        // ระยะเวลาบัฟ 10 นาที (36000 ticks) และเติมใหม่เมื่อต่ำกว่า 5 นาที (18000 ticks) เพื่อป้องกันไอคอนบัฟกระพริบ
+        private const int PermanentBuffDurationTicks = 36000;
+        private const int PermanentBuffRefreshThresholdTicks = 18000;
 
         private readonly List<string> _availableClasses = new List<string>
         {
@@ -490,7 +494,7 @@ namespace ClassSystemPlugin
             return list.ToArray();
         }
 
-        // บังคับคงบัฟที่ห้ามล้างออก (เช่น Bleeding, Weak, Endurance ของ warrior /ch 1) ไม่ให้ถูกล้างหรือคลิกออกได้
+        // บังคับคงบัฟที่ห้ามล้างออกแบบนิ่ง ไม่ส่งแพ็กเก็ตซ้ำซ้อนจนไอคอนกระพริบ
         private void EnforceUnremovableBuffs(TSPlayer player, PlayerClassState state, bool forceSync = false)
         {
             if (player?.TPlayer == null || !player.Active || player.TPlayer.dead) return;
@@ -506,9 +510,9 @@ namespace ClassSystemPlugin
                 {
                     if (player.TPlayer.buffType[i] == lockId)
                     {
-                        if (player.TPlayer.buffTime[i] <= 300)
+                        if (player.TPlayer.buffTime[i] <= PermanentBuffRefreshThresholdTicks)
                         {
-                            player.TPlayer.buffTime[i] = 1800;
+                            player.TPlayer.buffTime[i] = PermanentBuffDurationTicks;
                             needsSync = true;
                         }
                         activeNow = true;
@@ -518,7 +522,7 @@ namespace ClassSystemPlugin
 
                 if (!activeNow)
                 {
-                    player.SetBuff(lockId, 1800, true);
+                    player.SetBuff(lockId, PermanentBuffDurationTicks, true);
                     needsSync = true;
                 }
             }
@@ -554,10 +558,7 @@ namespace ClassSystemPlugin
                 }
             }
 
-            bool cooldownReady = !_legacyBuffPurgeCooldown.TryGetValue(player.Index, out DateTime lastPurge) ||
-                                 (DateTime.UtcNow - lastPurge).TotalSeconds >= 2.0;
-
-            if (forceImmediate || foundDisallowedOnServer || cooldownReady)
+            if (forceImmediate || foundDisallowedOnServer)
             {
                 _legacyBuffPurgeCooldown[player.Index] = DateTime.UtcNow;
 
@@ -574,7 +575,7 @@ namespace ClassSystemPlugin
 
             EnforceUnremovableBuffs(player, state, false);
 
-            if (_buffRefreshCooldown.TryGetValue(player.Index, out DateTime lastCd) && (DateTime.UtcNow - lastCd).TotalMilliseconds < 1500)
+            if (_buffRefreshCooldown.TryGetValue(player.Index, out DateTime lastCd) && (DateTime.UtcNow - lastCd).TotalMilliseconds < 2500)
                 return;
 
             int[] requiredBuffs = GetPermanentBuffsForState(state, player.TPlayer);
@@ -586,7 +587,7 @@ namespace ClassSystemPlugin
                 bool found = false;
                 for (int i = 0; i < Player.maxBuffs; i++)
                 {
-                    if (player.TPlayer.buffType[i] == buffId && player.TPlayer.buffTime[i] > 180)
+                    if (player.TPlayer.buffType[i] == buffId && player.TPlayer.buffTime[i] > PermanentBuffRefreshThresholdTicks)
                     {
                         found = true;
                         break;
@@ -595,7 +596,7 @@ namespace ClassSystemPlugin
 
                 if (!found)
                 {
-                    player.SetBuff(buffId, 600, true);
+                    player.SetBuff(buffId, PermanentBuffDurationTicks, true);
                     appliedAny = true;
                 }
             }
@@ -703,6 +704,7 @@ namespace ClassSystemPlugin
             if (player == null || !player.Active) return;
 
             // ป้องกันการส่งแพ็กเก็ตบัฟ (เช่น ล้างบัฟหรือกดยาแก้บัฟ) ที่พยายามลบ Bleeding, Weak, หรือ Endurance ของ warrior /ch 1
+            // โดยจะยิงซิงก์กลับเฉพาะเมื่อบัฟที่ถูกล็อกหายไปจริง ๆ เพื่อไม่ให้เกิดอาการไอคอนกระพริบ
             if (args.MsgID == PacketTypes.PlayerAddBuff || args.MsgID == PacketTypes.PlayerBuff)
             {
                 if (player.IsLoggedIn && player.Account != null)
@@ -732,7 +734,43 @@ namespace ClassSystemPlugin
                         }
                         else if (args.MsgID == PacketTypes.PlayerBuff)
                         {
-                            EnforceUnremovableBuffs(player, state, true);
+                            try
+                            {
+                                long pos = args.Msg.reader.BaseStream.Position;
+                                byte targetId = args.Msg.reader.ReadByte();
+                                if (targetId == player.Index)
+                                {
+                                    var incomingBuffs = new HashSet<int>();
+                                    for (int i = 0; i < Player.maxBuffs; i++)
+                                    {
+                                        ushort bType = args.Msg.reader.ReadUInt16();
+                                        if (bType > 0) incomingBuffs.Add(bType);
+                                    }
+                                    args.Msg.reader.BaseStream.Position = pos;
+
+                                    bool missingLocked = false;
+                                    foreach (int lockId in lockedBuffs)
+                                    {
+                                        if (!incomingBuffs.Contains(lockId))
+                                        {
+                                            missingLocked = true;
+                                            break;
+                                        }
+                                    }
+
+                                    if (missingLocked)
+                                    {
+                                        args.Handled = true;
+                                        EnforceUnremovableBuffs(player, state, true);
+                                        return;
+                                    }
+                                }
+                                else
+                                {
+                                    args.Msg.reader.BaseStream.Position = pos;
+                                }
+                            }
+                            catch { }
                         }
                     }
                 }
