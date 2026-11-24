@@ -29,7 +29,7 @@ namespace ClassSystemPlugin
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
         public override string Description => "Class & starter-choice (/ch 1|2) system with persistent SQLite BaseLife across relogs, strict 15 Life Crystal cap & refund on excess use, proper death/respawn state tracking, cross-class item ejection away from the player, and zero-flicker permanent buffs/debuffs.";
-        public override Version Version => new Version(17, 25, 1);
+        public override Version Version => new Version(17, 26, 0);
 
         private const string ClassSelectPrompt =
             "Chat by Shokuya :3 Please select your class >w<\n\n" +
@@ -283,7 +283,7 @@ namespace ClassSystemPlugin
             return false;
         }
 
-        private void ArmLoginLifeLock(TSPlayer player, double seconds = 3.0)
+        private void ArmLoginLifeLock(TSPlayer player, double seconds = 5.0)
         {
             if (player == null) return;
             _loginLifeLockUntil[player.Index] = DateTime.UtcNow.AddSeconds(seconds);
@@ -354,7 +354,7 @@ namespace ClassSystemPlugin
                     _playerStates[player.Account.ID] = dbState;
                     _playerBaseLife[player.Index] = persistedBase;
                     _lastSyncedMaxLife.Remove(player.Index);
-                    ArmLoginLifeLock(player, 2.5);
+                    ArmLoginLifeLock(player, 5.0);
 
                     if (dbState.StarterChoice > 0)
                     {
@@ -1007,11 +1007,16 @@ namespace ClassSystemPlugin
                 var state = GetPlayerState(player);
                 int hpDelta = GetMaxHpDelta(state);
 
+                // ยึดค่า BaseLife จากฐานข้อมูลเสมอในช่วงแรกหลังล็อกอินหรือเกิดใหม่
                 if (IsInLoginLifeLock(player))
                 {
-                    int lockedBase = GetTrackedBaseLife(player);
+                    var freshDb = GetStateFromDB(player.Account.ID);
+                    int lockedBase = freshDb != null ? NormalizeBaseLifeValue(freshDb.BaseLife) : GetTrackedBaseLife(player);
+                    _playerBaseLife[player.Index] = lockedBase;
+                    if (state != null) state.BaseLife = lockedBase;
                     int lockedTargetMax = Math.Max(20, lockedBase + hpDelta);
-                    if (incomingMax < lockedTargetMax)
+
+                    if (incomingMax != lockedTargetMax)
                     {
                         args.Handled = true;
                         if (player.TPlayer != null)
@@ -1020,7 +1025,7 @@ namespace ClassSystemPlugin
                             player.TPlayer.statLifeMax = lockedTargetMax;
                             player.TPlayer.statLifeMax2 = lockedTargetMax;
                         }
-                        ForceSyncLifeToClient(player, state);
+                        ForceSyncLifeToClient(player, state ?? freshDb);
                         return;
                     }
                 }
@@ -1047,7 +1052,8 @@ namespace ClassSystemPlugin
                 int currentBase = GetTrackedBaseLife(player);
                 int expectedTargetMax = Math.Max(20, currentBase + hpDelta);
 
-                if (incomingMax > expectedTargetMax && IsLifeCrystalAtLimit(player))
+                // หากผู้เล่นครบ 15 ก้อนแล้ว (currentBase >= maxAllowedBaseLife) และพยายามใช้ Life Crystal เพิ่ม
+                if (currentBase >= maxAllowedBaseLife && (incomingMax > expectedTargetMax || (int)statLife > expectedTargetMax))
                 {
                     args.Handled = true;
                     BlockLifeCrystalUsage(player);
@@ -1060,8 +1066,7 @@ namespace ClassSystemPlugin
 
                     if (player.TPlayer != null)
                     {
-                        int revertedLife = Math.Max(1, Math.Min(expectedTargetMax, (int)statLife - HpPerLifeCrystal));
-                        player.TPlayer.statLife = revertedLife;
+                        player.TPlayer.statLife = Math.Min(expectedTargetMax, Math.Max(1, (int)statLife));
                         player.TPlayer.statLifeMax = expectedTargetMax;
                         player.TPlayer.statLifeMax2 = expectedTargetMax;
                     }
@@ -1079,6 +1084,15 @@ namespace ClassSystemPlugin
                     {
                         currentBase = normalizedNewBase;
                         baseChanged = true;
+                    }
+                    else if (IsLifeCrystalAtLimit(player))
+                    {
+                        args.Handled = true;
+                        BlockLifeCrystalUsage(player);
+                        RefundBlockedLifeCrystal(player);
+                        NotifyBlockedLifeCrystal(player);
+                        ForceSyncLifeToClient(player, state);
+                        return;
                     }
                 }
 
@@ -2022,7 +2036,7 @@ namespace ClassSystemPlugin
             if (args.Player?.Account == null) return;
 
             ClearWebBuff(args.Player);
-            ArmLoginLifeLock(args.Player, 4.0);
+            ArmLoginLifeLock(args.Player, 5.0);
 
             int accountId = args.Player.Account.ID;
             var savedState = GetStateFromDB(accountId);
