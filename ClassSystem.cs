@@ -27,8 +27,8 @@ namespace ClassSystemPlugin
     {
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
-        public override string Description => "Class & starter-choice (/ch 1|2) system with forced client-side Swiftness/Slow buff purge via PlayerAddBuff/PlayerBuff, custom base movement speed multiplier per class/choice, solid-ground Underworld spawn detection, zero-damage lock against NPCs & GodMode invulnerability while logging in/choosing class/starter pack, cross-class crafting/cursor/inventory ejection, NetGetData PlayerHp packet handling, incremental Life Crystal tracking, SlimeStaff for summoner /ch 1, and permanent class/choice buffs & debuffs.";
-        public override Version Version => new Version(17, 4, 2);
+        public override string Description => "Class & starter-choice (/ch 1|2) system with smooth non-compounding base movement speed control (no rubberbanding or sliding), forced client-side Swiftness/Slow buff purge, solid-ground Underworld spawn detection, zero-damage lock against NPCs & GodMode invulnerability while logging in/choosing class/starter pack, cross-class crafting/cursor/inventory ejection, NetGetData PlayerHp packet handling, incremental Life Crystal tracking, SlimeStaff for summoner /ch 1, and permanent class/choice buffs & debuffs.";
+        public override Version Version => new Version(17, 5, 0);
 
         private const string ClassSelectPrompt =
             "Chat by Shokuya :3 Please select your class >w<\n\n" +
@@ -260,6 +260,7 @@ namespace ClassSystemPlugin
             base.Dispose(disposing);
         }
 
+        // ตัวคูณความเร็วเคลื่อนที่ของแต่ละสาย (1.0f = ความเร็วปกติ 100%)
         private float GetMoveSpeedMultiplier(PlayerClassState state)
         {
             if (state == null || string.IsNullOrEmpty(state.ClassName) || state.StarterChoice <= 0)
@@ -292,33 +293,42 @@ namespace ClassSystemPlugin
             return 1.0f;
         }
 
-        private void ApplyBaseMovementSpeed(TSPlayer player, PlayerClassState state)
+        // คำนวณและซิงก์ความเร็วอย่างนุ่มนวลเฉพาะตอนที่ผู้เล่นกดเดินซ้าย/ขวา (ไม่คูณทบ ไม่สไลด์ ไม่แลค)
+        private void ApplySmoothMovementSpeed(TSPlayer player, PlayerClassState state)
         {
             if (player?.TPlayer == null || !player.Active || player.TPlayer.dead) return;
             float mult = GetMoveSpeedMultiplier(state);
             if (Math.Abs(mult - 1.0f) < 0.001f) return;
 
             var tPlayer = player.TPlayer;
-            tPlayer.moveSpeed *= mult;
-            tPlayer.accRunSpeed *= mult;
-            tPlayer.maxRunSpeed *= mult;
 
-            if (Math.Abs(tPlayer.velocity.X) > 0.25f)
+            // เฉพาะตอนที่ผู้เล่นกำลังกดปุ่มเดินซ้ายหรือขวาอยู่เท่านั้น (ถ้าปล่อยปุ่ม จะไม่ดันตัวต่อ ไม่สไลด์)
+            bool pressingLeft = tPlayer.controlLeft && !tPlayer.controlRight;
+            bool pressingRight = tPlayer.controlRight && !tPlayer.controlLeft;
+            if (!pressingLeft && !pressingRight) return;
+
+            float dir = pressingRight ? 1f : -1f;
+            float currentSpeed = Math.Abs(tPlayer.velocity.X);
+
+            // ถ้าเพิ่งเริ่มออกตัวหรือหยุดนิ่งอยู่ ให้ข้ามเพื่อไม่ให้กระชาก
+            if (currentSpeed < 1.2f) return;
+
+            // ฐานความเร็ววิ่งปกติใน Terraria (~3.0f เดินเปล่า, ~6.0f รองเท้าวิ่ง, ~7.5f+ ปีก/บูทขั้นสูง)
+            // ใช้ค่าที่ Client ส่งมาเป็นฐาน แล้วปรับสัดส่วนเพียงครั้งเดียวต่อแพ็กเก็ตจาก Client
+            float maxCap = 11.5f * mult;
+            float desiredVx = MathHelper.Clamp(currentSpeed * mult, 1.2f, maxCap) * dir;
+
+            // ถ้าความเร็วต่างจากเป้าหมายไม่มาก ไม่ต้องส่งแพ็กเก็ตทับให้แลค
+            if (Math.Abs(desiredVx - tPlayer.velocity.X) < 0.15f) return;
+
+            tPlayer.velocity.X = desiredVx;
+
+            // จำกัดการส่งซิงก์ไม่ให้ถี่เกิน 120ms ต่อครั้ง เพื่อป้องกันอาการกระตุก/แลค
+            if (!_speedSyncCooldown.TryGetValue(player.Index, out DateTime lastSync) ||
+                (DateTime.UtcNow - lastSync).TotalMilliseconds >= 120)
             {
-                float extraRatio = mult - 1.0f;
-                float targetVx = tPlayer.velocity.X * mult;
-                float maxAllowedVx = 16.0f;
-                targetVx = MathHelper.Clamp(targetVx, -maxAllowedVx, maxAllowedVx);
-
-                if (Math.Abs(extraRatio) > 0.005f)
-                {
-                    tPlayer.velocity.X = targetVx;
-                    if (!_speedSyncCooldown.TryGetValue(player.Index, out DateTime lastSync) || (DateTime.UtcNow - lastSync).TotalMilliseconds >= 85)
-                    {
-                        _speedSyncCooldown[player.Index] = DateTime.UtcNow;
-                        NetMessage.SendData((int)PacketTypes.PlayerUpdate, -1, -1, null, player.Index);
-                    }
-                }
+                _speedSyncCooldown[player.Index] = DateTime.UtcNow;
+                NetMessage.SendData((int)PacketTypes.PlayerUpdate, -1, -1, null, player.Index);
             }
         }
 
@@ -1692,7 +1702,10 @@ namespace ClassSystemPlugin
                 {
                     SetUnderworldGodMode(player, false);
                     _frozenPositions.Remove(player.Index);
-                    ApplyBaseMovementSpeed(player, state);
+
+                    // ปรับความเร็วเฉพาะตอนรับอัปเดตการเคลื่อนที่จากตัวละครผู้เล่น (ไม่รันซ้ำใน OnGameUpdate)
+                    ApplySmoothMovementSpeed(player, state);
+
                     CleanupInactiveBlockedWorldItems(player.Index);
                     Item held = player.TPlayer.HeldItem;
 
@@ -1818,7 +1831,6 @@ namespace ClassSystemPlugin
                 }
 
                 SetUnderworldGodMode(player, false);
-                ApplyBaseMovementSpeed(player, state);
                 ApplyHoneyRegenBonus(player, state, honeyDeltaSec);
                 ApplyClassStats(player, state);
                 ApplyBrokenArmorDefenseEffect(player, state);
