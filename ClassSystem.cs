@@ -28,8 +28,8 @@ namespace ClassSystemPlugin
     {
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
-        public override string Description => "Class & starter-choice (/ch 1|2) system with synced 160 HP for Melee /ch 1 (100 base + 60 bonus), cross-class item ejection away from the player with strict re-pickup prevention, persistent SQLite BaseLife tracking, zero-flicker permanent buffs/debuffs, and solid-ground Underworld spawn detection.";
-        public override Version Version => new Version(17, 22, 0);
+        public override string Description => "Class & starter-choice (/ch 1|2) system with proper death/respawn state tracking (fixing the instant-revive bug on fall/fatal damage), synced 160 HP for Melee /ch 1, cross-class item ejection away from the player, persistent SQLite BaseLife tracking, and zero-flicker permanent buffs/debuffs.";
+        public override Version Version => new Version(17, 23, 0);
 
         private const string ClassSelectPrompt =
             "Chat by Shokuya :3 Please select your class >w<\n\n" +
@@ -58,6 +58,7 @@ namespace ClassSystemPlugin
         private readonly Dictionary<int, int> _playerBaseLife = new Dictionary<int, int>();
         private readonly Dictionary<int, double> _honeyRegenAccumulator = new Dictionary<int, double>();
         private readonly Dictionary<int, HashSet<int>> _blockedWorldItemsByPlayer = new Dictionary<int, HashSet<int>>();
+        private readonly Dictionary<int, DateTime> _playerDeadUntil = new Dictionary<int, DateTime>();
         private readonly HashSet<int> _pluginGrantedGodMode = new HashSet<int>();
         private Vector2? _cachedSafeUnderworldPos = null;
         private DateTime _lastTickSync = DateTime.MinValue;
@@ -236,6 +237,8 @@ namespace ClassSystemPlugin
             GetDataHandlers.PlayerSlot += OnPlayerSlot;
             GetDataHandlers.ItemDrop += OnItemDrop;
             GetDataHandlers.PlayerDamage += OnPlayerDamage;
+            GetDataHandlers.KillMe += OnPlayerKillMe;
+            GetDataHandlers.PlayerSpawn += OnPlayerSpawn;
         }
 
         protected override void Dispose(bool disposing)
@@ -255,6 +258,8 @@ namespace ClassSystemPlugin
                 GetDataHandlers.PlayerSlot -= OnPlayerSlot;
                 GetDataHandlers.ItemDrop -= OnItemDrop;
                 GetDataHandlers.PlayerDamage -= OnPlayerDamage;
+                GetDataHandlers.KillMe -= OnPlayerKillMe;
+                GetDataHandlers.PlayerSpawn -= OnPlayerSpawn;
 
                 if (_db != null)
                 {
@@ -263,6 +268,83 @@ namespace ClassSystemPlugin
                 }
             }
             base.Dispose(disposing);
+        }
+
+        private bool IsPlayerDeadState(TSPlayer player)
+        {
+            if (player?.TPlayer == null) return true;
+            if (player.TPlayer.dead || player.TPlayer.statLife <= 0)
+                return true;
+
+            if (_playerDeadUntil.TryGetValue(player.Index, out DateTime deadUntil))
+            {
+                if (DateTime.UtcNow < deadUntil)
+                    return true;
+                _playerDeadUntil.Remove(player.Index);
+            }
+            return false;
+        }
+
+        private void MarkPlayerDead(TSPlayer player, double lockSeconds = 20.0)
+        {
+            if (player?.TPlayer == null) return;
+            player.TPlayer.dead = true;
+            player.TPlayer.statLife = 0;
+            _playerDeadUntil[player.Index] = DateTime.UtcNow.AddSeconds(lockSeconds);
+            _honeyRegenAccumulator.Remove(player.Index);
+            _lastSyncedMaxLife.Remove(player.Index);
+        }
+
+        private void ClearPlayerDeadState(TSPlayer player)
+        {
+            if (player == null) return;
+            _playerDeadUntil.Remove(player.Index);
+            _honeyRegenAccumulator.Remove(player.Index);
+            _lastSyncedMaxLife.Remove(player.Index);
+        }
+
+        private void OnPlayerKillMe(object sender, GetDataHandlers.KillMeEventArgs args)
+        {
+            var player = args.Player;
+            if (player == null || !player.Active) return;
+
+            if (IsPlayerInSelectionLock(player))
+            {
+                args.Handled = true;
+                SetUnderworldGodMode(player, true);
+                return;
+            }
+
+            MarkPlayerDead(player, 25.0);
+        }
+
+        private void OnPlayerSpawn(object sender, GetDataHandlers.SpawnEventArgs args)
+        {
+            var player = args.Player;
+            if (player == null || !player.Active) return;
+
+            ClearPlayerDeadState(player);
+
+            if (player.IsLoggedIn && player.Account != null)
+            {
+                var state = GetPlayerState(player);
+                if (state != null && !string.IsNullOrEmpty(state.ClassName) && state.StarterChoice > 0)
+                {
+                    if (player.TPlayer != null)
+                    {
+                        player.TPlayer.dead = false;
+                        int targetMaxLife = Math.Max(20, GetTrackedBaseLife(player) + GetMaxHpDelta(state));
+                        player.TPlayer.statLifeMax = targetMaxLife;
+                        player.TPlayer.statLifeMax2 = targetMaxLife;
+                        if (player.TPlayer.statLife <= 0)
+                        {
+                            player.TPlayer.statLife = Math.Min(targetMaxLife, 100);
+                        }
+                    }
+                    ApplyClassStats(player, state);
+                    EnsurePermanentClassBuffs(player, state, true);
+                }
+            }
         }
 
         private bool IsPlayerInSelectionLock(TSPlayer player)
@@ -291,6 +373,7 @@ namespace ClassSystemPlugin
 
             if (enable)
             {
+                ClearPlayerDeadState(player);
                 if (!player.GodMode)
                 {
                     player.GodMode = true;
@@ -299,6 +382,7 @@ namespace ClassSystemPlugin
 
                 if (player.TPlayer != null)
                 {
+                    player.TPlayer.dead = false;
                     player.TPlayer.immune = true;
                     player.TPlayer.immuneTime = 60;
                     player.TPlayer.breath = player.TPlayer.breathMax;
@@ -496,7 +580,7 @@ namespace ClassSystemPlugin
 
         private void RestoreMissingLockedBuffs(TSPlayer player, PlayerClassState state, ICollection<int> missingBuffIds, bool bypassCooldown = false)
         {
-            if (player?.TPlayer == null || !player.Active || player.TPlayer.dead) return;
+            if (player?.TPlayer == null || !player.Active || IsPlayerDeadState(player)) return;
             if (missingBuffIds == null || missingBuffIds.Count == 0) return;
 
             if (!bypassCooldown &&
@@ -545,7 +629,7 @@ namespace ClassSystemPlugin
 
         private void EnsurePermanentClassBuffs(TSPlayer player, PlayerClassState state, bool forceInitial = false)
         {
-            if (player == null || player.TPlayer == null || !player.Active || player.TPlayer.dead) return;
+            if (player == null || player.TPlayer == null || !player.Active || IsPlayerDeadState(player)) return;
             if (state == null || string.IsNullOrEmpty(state.ClassName) || state.StarterChoice <= 0) return;
 
             if (!forceInitial &&
@@ -674,7 +758,7 @@ namespace ClassSystemPlugin
 
         private bool TryConsumeLifeCrystalManually(TSPlayer player, PlayerClassState state)
         {
-            if (player?.TPlayer == null || !player.Active || player.TPlayer.dead) return false;
+            if (player?.TPlayer == null || !player.Active || IsPlayerDeadState(player)) return false;
             if (state == null || string.IsNullOrEmpty(state.ClassName) || state.StarterChoice <= 0) return false;
 
             int currentBase = GetTrackedBaseLife(player);
@@ -786,7 +870,7 @@ namespace ClassSystemPlugin
 
             if (args.MsgID == PacketTypes.PlayerAddBuff || args.MsgID == PacketTypes.PlayerBuff)
             {
-                if (player.IsLoggedIn && player.Account != null)
+                if (player.IsLoggedIn && player.Account != null && !IsPlayerDeadState(player))
                 {
                     var state = GetPlayerState(player);
                     int[] lockedBuffs = GetLockedBuffsForState(state);
@@ -863,6 +947,24 @@ namespace ClassSystemPlugin
                 short statLife = args.Msg.reader.ReadInt16();
                 short statLifeMax = args.Msg.reader.ReadInt16();
 
+                // หาก Client แจ้งว่าเลือด <= 0 (กำลังจะตายหรือตายแล้ว) ให้บันทึกสถานะตายทันทีและห้ามซิงก์เลือดบวกกลับไปทับ
+                if (statLife <= 0)
+                {
+                    MarkPlayerDead(player, 25.0);
+                    return;
+                }
+
+                // ถ้าผู้เล่นยังติดสถานะตายอยู่ ห้ามซิงก์เลือดทับจนกว่าแพ็กเก็ต PlayerSpawn จะเข้ามา
+                if (IsPlayerDeadState(player))
+                {
+                    return;
+                }
+
+                if (player.TPlayer != null)
+                {
+                    player.TPlayer.statLife = statLife;
+                }
+
                 int maxAllowedBaseLife = GetMaxAllowedBaseLife();
                 int incomingMax = statLifeMax > 0 ? statLifeMax : BaseStartHp;
 
@@ -920,6 +1022,7 @@ namespace ClassSystemPlugin
                 return;
             }
 
+            if (IsPlayerDeadState(player)) return;
             if (!player.IsLoggedIn || player.Account == null) return;
 
             var state = GetPlayerState(player);
@@ -940,7 +1043,10 @@ namespace ClassSystemPlugin
             {
                 int maxRefund = Math.Max(0, args.Damage - 1);
                 int actualRefund = Math.Min(damageRefund, maxRefund);
-                if (actualRefund > 0 && player.TPlayer.statLife > 0)
+
+                // คืนเลือดเฉพาะกรณีที่ผู้เล่นยังไม่ตายและเลือดหลังหักดาเมจสุทธิยังมากกว่า 0
+                int predictedRemainingLife = player.TPlayer.statLife - args.Damage;
+                if (actualRefund > 0 && predictedRemainingLife > 0 && player.TPlayer.statLife > 0 && !player.TPlayer.dead)
                 {
                     player.TPlayer.statLife = Math.Min(player.TPlayer.statLifeMax2, player.TPlayer.statLife + actualRefund);
                     NetMessage.SendData((int)PacketTypes.PlayerHp, -1, -1, null, player.Index);
@@ -951,7 +1057,7 @@ namespace ClassSystemPlugin
 
         private void ApplyBrokenArmorDefenseEffect(TSPlayer player, PlayerClassState state)
         {
-            if (player?.TPlayer == null || !player.Active || player.TPlayer.dead) return;
+            if (player?.TPlayer == null || !player.Active || IsPlayerDeadState(player)) return;
             double reduction = GetBrokenArmorReduction(state);
             if (reduction <= 0.0) return;
 
@@ -963,7 +1069,11 @@ namespace ClassSystemPlugin
 
         private void ApplyHoneyRegenBonus(TSPlayer player, PlayerClassState state, double deltaSeconds)
         {
-            if (player?.TPlayer == null || !player.Active || player.TPlayer.dead) return;
+            if (player?.TPlayer == null || !player.Active || IsPlayerDeadState(player))
+            {
+                if (player != null) _honeyRegenAccumulator.Remove(player.Index);
+                return;
+            }
 
             double bonusMult = GetHoneyBonusMultiplier(state);
             if (bonusMult <= 0.0)
@@ -980,7 +1090,7 @@ namespace ClassSystemPlugin
 
             double bonusHpPerSec = Math.Max(0.5, baseHoneyHpPerSec * bonusMult);
 
-            if (tPlayer.statLife > 0 && tPlayer.statLife < tPlayer.statLifeMax2 && deltaSeconds > 0)
+            if (!tPlayer.dead && tPlayer.statLife > 0 && tPlayer.statLife < tPlayer.statLifeMax2 && deltaSeconds > 0)
             {
                 _honeyRegenAccumulator.TryGetValue(player.Index, out double acc);
                 acc += bonusHpPerSec * deltaSeconds;
@@ -1062,7 +1172,6 @@ namespace ClassSystemPlugin
                 var wItem = Main.item[idx];
                 wItem.playerIndexTheItemIsReservedFor = 255;
 
-                // ถ้าผู้เล่นเดินเข้าใกล้ไอเทมผิดสายที่ถูกดรอปทิ้งไว้ ให้ผลักไอเทมออกห่างไม่ให้ดูดเข้าตัว
                 float dist = Vector2.Distance(playerCenter, wItem.Center);
                 if (dist < 120f)
                 {
@@ -1112,7 +1221,6 @@ namespace ClassSystemPlugin
                     }
                 }
 
-                // ถ้าผู้เล่นพยายามเก็บไอเทมผิดสาย (Stacks <= 0) ให้ยกเลิกทันทีและล็อกไม่ให้เก็บ
                 if (args.Stacks <= 0 && IsBlockedWorldItem(player.Index, args.ID))
                 {
                     args.Handled = true;
@@ -1199,16 +1307,14 @@ namespace ClassSystemPlugin
             player.TPlayer.itemTime = 0;
         }
 
-        // ดรอปของผิดสายออกไปให้ตกห่างจากตัวผู้เล่น และล็อกไม่ให้ผู้เล่นเก็บกลับเข้าตัวได้อีก
         private int SpawnDroppedItemAwayFromPlayer(TSPlayer player, int itemType, int stack, byte prefix)
         {
             if (player?.TPlayer == null || itemType <= ItemID.None) return -1;
 
             float dir = player.TPlayer.direction != 0 ? player.TPlayer.direction : 1f;
-            float targetX = player.TPlayer.Center.X + (dir * 160f); // ห่างออกไป 10 บล็อก
+            float targetX = player.TPlayer.Center.X + (dir * 160f);
             float targetY = player.TPlayer.Center.Y - 24f;
 
-            // เช็กว่าจุดที่จะวางไม่จมอยู่ในบล็อกทึบ ถ้าติดกำแพงให้ขยับเข้ามาในระยะที่โล่ง
             Vector2 dropPos = new Vector2(targetX, targetY);
             if (Collision.SolidCollision(dropPos, 24, 24))
             {
@@ -1798,6 +1904,7 @@ namespace ClassSystemPlugin
             var player = TShock.Players[args.Who];
             if (player != null && !player.IsLoggedIn)
             {
+                ClearPlayerDeadState(player);
                 ClearWebBuff(player);
                 CleanDisallowedSpeedBuffs(player, null, true);
                 ApplyUnderworldLock(player, false);
@@ -1828,8 +1935,11 @@ namespace ClassSystemPlugin
                     ClearWebAndTeleportToSpawn(args.Player);
                     CleanDisallowedSpeedBuffs(args.Player, savedState, true);
                     EnforceAllowedInventory(args.Player, savedState.ClassName);
-                    ApplyClassStats(args.Player, savedState);
-                    EnsurePermanentClassBuffs(args.Player, savedState, true);
+                    if (!IsPlayerDeadState(args.Player))
+                    {
+                        ApplyClassStats(args.Player, savedState);
+                        EnsurePermanentClassBuffs(args.Player, savedState, true);
+                    }
                     args.Player.SendSuccessMessage($"[ClassSystem] Welcome back! Class: {savedState.ClassName.ToUpper()} (Pack /ch {savedState.StarterChoice})");
                 }
                 else
@@ -1881,6 +1991,7 @@ namespace ClassSystemPlugin
             _playerBaseLife.Remove(args.Who);
             _honeyRegenAccumulator.Remove(args.Who);
             _blockedWorldItemsByPlayer.Remove(args.Who);
+            _playerDeadUntil.Remove(args.Who);
 
             var keysToRemove = new List<long>();
             foreach (var kv in _itemTypeEjectCooldown)
@@ -2018,6 +2129,11 @@ namespace ClassSystemPlugin
                     SetUnderworldGodMode(player, false);
                     _frozenPositions.Remove(player.Index);
 
+                    if (IsPlayerDeadState(player))
+                    {
+                        return;
+                    }
+
                     MaintainBlockedWorldItems(player);
                     Item held = player.TPlayer.HeldItem;
 
@@ -2150,6 +2266,14 @@ namespace ClassSystemPlugin
                 }
 
                 SetUnderworldGodMode(player, false);
+
+                // หากผู้เล่นตายอยู่ ข้ามการฮีล การอัปเดตเลือด และการเสกบัฟจนกว่าจะเกิดใหม่
+                if (IsPlayerDeadState(player))
+                {
+                    _honeyRegenAccumulator.Remove(player.Index);
+                    continue;
+                }
+
                 ApplyHoneyRegenBonus(player, state, honeyDeltaSec);
                 ApplyClassStats(player, state);
                 ApplyBrokenArmorDefenseEffect(player, state);
@@ -2182,6 +2306,7 @@ namespace ClassSystemPlugin
                 return;
             }
 
+            if (IsPlayerDeadState(tsPlayer)) return;
             if (!tsPlayer.IsLoggedIn || tsPlayer.Account == null) return;
 
             var state = GetPlayerState(tsPlayer);
@@ -2412,6 +2537,7 @@ namespace ClassSystemPlugin
                 _lastSyncedMaxLife.Remove(target.Index);
                 _playerBaseLife[target.Index] = preservedBaseLife;
                 _lastBroadcastPhase.Remove(target.Index);
+                ClearPlayerDeadState(target);
 
                 target.TPlayer.statLifeMax = preservedBaseLife;
                 target.TPlayer.statLifeMax2 = preservedBaseLife;
@@ -2448,6 +2574,7 @@ namespace ClassSystemPlugin
             _lastSyncedMaxLife.Remove(target.Index);
             _playerBaseLife[target.Index] = preservedBaseLife;
             _lastBroadcastPhase.Remove(target.Index);
+            ClearPlayerDeadState(target);
 
             target.TPlayer.statLifeMax = preservedBaseLife;
             target.TPlayer.statLifeMax2 = preservedBaseLife;
@@ -2480,6 +2607,8 @@ namespace ClassSystemPlugin
 
         private void ApplyClassStats(TSPlayer player, PlayerClassState state)
         {
+            if (IsPlayerDeadState(player)) return;
+
             var tPlayer = player.TPlayer;
             int currentBaseLife = GetTrackedBaseLife(player);
             int hpDelta = GetMaxHpDelta(state);
