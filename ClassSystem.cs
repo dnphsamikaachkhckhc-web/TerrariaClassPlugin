@@ -33,8 +33,8 @@ namespace ClassSystemPlugin
     {
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
-        public override string Description => "Class & starter-choice (/ch 1|2) system with SQLite persistence, boss-gated Life Crystal quotas (3 base + 2 per boss: King Slime, EoC, EoW/BoC, Queen Bee, Deerclops, Skeletron up to 15), guaranteed 15s Cursed debuff & 2s crystal refund on any over-phase Life Crystal use, per-class/pack Max HP caps (Melee /ch 1 up to 460), proper death/respawn state tracking, cross-class item ejection, and zero-flicker permanent buffs/debuffs.";
-        public override Version Version => new Version(18, 10, 0);
+        public override string Description => "Class & starter-choice (/ch 1|2) system with SQLite persistence, boss-gated Life Crystal quotas (3 base + 2 per boss up to 15), guaranteed 15s Cursed debuff & 2s crystal refund on any over-phase Life Crystal use, per-class/pack Max HP caps (Melee /ch 1 up to 460), multiplayer death-desync fix (no ghost-walking gibs), cross-class item ejection, and zero-flicker permanent buffs/debuffs.";
+        public override Version Version => new Version(18, 11, 0);
 
         private const string ClassSelectPrompt =
             "Chat by Shokuya :3 Please select your class >w<\n\n" +
@@ -73,12 +73,12 @@ namespace ClassSystemPlugin
         private readonly Dictionary<int, double> _honeyRegenAccumulator = new Dictionary<int, double>();
         private readonly Dictionary<int, HashSet<int>> _blockedWorldItemsByPlayer = new Dictionary<int, HashSet<int>>();
         private readonly Dictionary<int, DateTime> _playerDeadUntil = new Dictionary<int, DateTime>();
+        private readonly Dictionary<int, DateTime> _recentDamageGraceUntil = new Dictionary<int, DateTime>();
         private readonly HashSet<int> _pluginGrantedGodMode = new HashSet<int>();
         private Vector2? _cachedSafeUnderworldPos = null;
         private DateTime _lastTickSync = DateTime.MinValue;
         private DateTime _lastHoneyTick = DateTime.UtcNow;
 
-        // ระยะเวลาบัฟ 15 นาที (54000 ticks) เพื่อให้นิ่งสนิทไม่เกิดการรีเฟรชถี่
         private const int PermanentBuffDurationTicks = 54000;
 
         private readonly List<string> _availableClasses = new List<string>
@@ -94,7 +94,6 @@ namespace ClassSystemPlugin
             ["sm"] = "summoner"
         };
 
-        // ชุดเกราะที่แยกสายชัดเจน (ไม่รวมเครื่องประดับเพราะเครื่องประดับใส่อะไรก็ได้)
         private readonly Dictionary<int, string> _restrictedArmors = new Dictionary<int, string>
         {
             // Pre-Hardmode Melee / Warrior
@@ -280,15 +279,6 @@ namespace ClassSystemPlugin
             base.Dispose(disposing);
         }
 
-        // โควตา Life Crystal ตามบอสที่ปราบได้ในโลก:
-        // เริ่มเกม = 3 เม็ด
-        // +2 King Slime (NPC.downedSlimeKing)
-        // +2 Eye of Cthulhu (NPC.downedBoss1)
-        // +2 Eater of Worlds / Brain of Cthulhu (NPC.downedBoss2)
-        // +2 Queen Bee (NPC.downedQueenBee)
-        // +2 Deerclops (NPC.downedDeerclops)
-        // +2 Skeletron (NPC.downedBoss3)
-        // รวมสูงสุด = 15 เม็ด
         private int GetUnlockedLifeCrystalLimit()
         {
             int limit = StarterPhaseLifeCrystalLimit;
@@ -303,7 +293,6 @@ namespace ClassSystemPlugin
             return Math.Min(MaxLifeCrystalsPerClass, Math.Max(0, limit));
         }
 
-        // กำหนด Max HP เริ่มต้นตามสายและแพ็ก /ch
         private int? GetClassStarterMaxHp(PlayerClassState state)
         {
             if (state == null || string.IsNullOrEmpty(state.ClassName) || state.StarterChoice <= 0)
@@ -334,7 +323,6 @@ namespace ClassSystemPlugin
             return null;
         }
 
-        // เพดาน Max HP ที่อนุญาตในเฟสปัจจุบันของแต่ละสาย/แพ็ก
         private int? GetClassMaxAllowedHp(PlayerClassState state)
         {
             int? starter = GetClassStarterMaxHp(state);
@@ -344,7 +332,6 @@ namespace ClassSystemPlugin
             return starter.Value + (unlockedCrystals * HpPerLifeCrystal);
         }
 
-        // เพดาน Max HP สูงสุดเมื่อปลดล็อกครบ 15 เม็ด (ใช้แสดงผลในคำสั่ง /class)
         private int? GetClassFullCapHp(PlayerClassState state)
         {
             int? starter = GetClassStarterMaxHp(state);
@@ -421,9 +408,6 @@ namespace ClassSystemPlugin
             return false;
         }
 
-        // ดักจับการกดใช้ Life Crystal ทั้งกรณี:
-        // 1) กดเกินโควตาของเฟสปัจจุบัน (ติดดีบัฟ Cursed 15 วินาที + คืน Life Crystal ภายใน 2 วินาที ทันทีไม่ว่าเลือดจะอยู่ที่ 400 หรือเท่าไหร่ก็ตาม)
-        // 2) สาย Melee /ch 1 กดเพิ่มเลือดช่วง 400 -> 460 เมื่อเฟสปลดล็อกถึง
         private void TryHandleLifeCrystalUse(TSPlayer player, PlayerClassState state)
         {
             if (player?.TPlayer == null || !player.Active || IsPlayerDeadState(player)) return;
@@ -454,13 +438,11 @@ namespace ClassSystemPlugin
 
             if (isOverPhaseQuota)
             {
-                // หักคริสตัลถ้ามีอยู่ในตัวแล้วตั้งคิวคืนใน 2 วินาที หรือถ้าตัวเกมยังไม่หัก (เช่นตอน 400 HP) ก็ลงโทษ Cursed ทันทีโดยไม่เสียของ
                 bool consumed = ConsumeOneLifeCrystalFromPlayer(player);
                 TriggerOverLimitLifeCrystalPenalty(player, state, consumed ? 1 : 0);
                 return;
             }
 
-            // กรณีกดเพิ่มเลือดช่วง 400 -> 460 (Melee /ch 1 เมื่อปลดล็อกเฟสถึง)
             if (!ConsumeOneLifeCrystalFromPlayer(player)) return;
 
             int newMaxHp = Math.Min(maxAllowedHp.Value, currentMax + HpPerLifeCrystal);
@@ -478,15 +460,13 @@ namespace ClassSystemPlugin
 
         private void TriggerOverLimitLifeCrystalPenalty(TSPlayer player, PlayerClassState state, int refundedAmount = 1)
         {
-            if (player == null || !player.Active || player.TPlayer == null) return;
+            if (player == null || !player.Active || player.TPlayer == null || IsPlayerDeadState(player)) return;
 
             MaintainClassMaxHp(player, state);
 
-            // ติดสถานะ Cursed 15 วินาที และล็อกไม่ให้ถูกล้างออกก่อนครบเวลา
             _cursedPenaltyUntilUtc[player.Index] = DateTime.UtcNow.AddSeconds(CursedPenaltySeconds);
             player.SetBuff(BuffID.Cursed, CursedPenaltyTicks, true);
 
-            // คิวคืน Life Crystal ภายใน 2 วินาที (เฉพาะกรณีที่คริสตัลถูกหักออกจากกระเป๋าไปแล้ว)
             if (refundedAmount > 0)
             {
                 if (!_pendingCrystalRefunds.TryGetValue(player.Index, out var list))
@@ -593,34 +573,44 @@ namespace ClassSystemPlugin
         {
             if (player?.TPlayer == null || !player.Active || IsPlayerDeadState(player)) return;
 
+            var tPlayer = player.TPlayer;
+            // ห้ามแตะต้องหรือส่ง PacketTypes.PlayerHp เด็ดขาดถ้าเลือดเหลือน้อยกว่าหรือเท่ากับ 0 หรือตัวละครกำลังตาย
+            if (tPlayer.dead || tPlayer.statLife <= 0) return;
+
+            // เว้นช่วง 400ms หลังเพิ่งโดนดาเมจเพื่อป้องกันการยิงแพ็กเก็ตสวนจังหวะตาย (ป้องกันบัคตัวบิดเบี้ยวเดินได้หลังตาย)
+            if (_recentDamageGraceUntil.TryGetValue(player.Index, out DateTime graceUntil) && DateTime.UtcNow < graceUntil)
+                return;
+
             int? starterMaxHp = GetClassStarterMaxHp(state);
             if (!starterMaxHp.HasValue) return;
 
             int targetMaxHp = GetClampedMaxHpForPlayer(player, state);
-            var tPlayer = player.TPlayer;
 
-            bool changed = false;
+            bool maxChanged = false;
             if (tPlayer.statLifeMax != targetMaxHp)
             {
                 tPlayer.statLifeMax = targetMaxHp;
-                changed = true;
+                maxChanged = true;
             }
             if (tPlayer.statLifeMax2 != targetMaxHp)
             {
                 tPlayer.statLifeMax2 = targetMaxHp;
-                changed = true;
+                maxChanged = true;
             }
             if (tPlayer.statLife > targetMaxHp)
             {
                 tPlayer.statLife = targetMaxHp;
-                changed = true;
+                maxChanged = true;
             }
 
-            if (changed || !_lastAppliedMaxHp.TryGetValue(player.Index, out int prevMax) || prevMax != targetMaxHp)
+            if (maxChanged || !_lastAppliedMaxHp.TryGetValue(player.Index, out int prevMax) || prevMax != targetMaxHp)
             {
                 _lastAppliedMaxHp[player.Index] = targetMaxHp;
-                NetMessage.SendData((int)PacketTypes.PlayerHp, -1, -1, null, player.Index);
-                NetMessage.SendData((int)PacketTypes.PlayerHp, player.Index, -1, null, player.Index);
+                if (!tPlayer.dead && tPlayer.statLife > 0)
+                {
+                    NetMessage.SendData((int)PacketTypes.PlayerHp, -1, -1, null, player.Index);
+                    NetMessage.SendData((int)PacketTypes.PlayerHp, player.Index, -1, null, player.Index);
+                }
             }
         }
 
@@ -647,6 +637,7 @@ namespace ClassSystemPlugin
             _playerDeadUntil[player.Index] = DateTime.UtcNow.AddSeconds(lockSeconds);
             _honeyRegenAccumulator.Remove(player.Index);
             _cursedPenaltyUntilUtc.Remove(player.Index);
+            _recentDamageGraceUntil.Remove(player.Index);
         }
 
         private void ClearPlayerDeadState(TSPlayer player)
@@ -654,6 +645,7 @@ namespace ClassSystemPlugin
             if (player == null) return;
             _playerDeadUntil.Remove(player.Index);
             _honeyRegenAccumulator.Remove(player.Index);
+            _recentDamageGraceUntil.Remove(player.Index);
         }
 
         private void OnPlayerKillMe(object sender, GetDataHandlers.KillMeEventArgs args)
@@ -668,7 +660,7 @@ namespace ClassSystemPlugin
                 return;
             }
 
-            MarkPlayerDead(player, 25.0);
+            MarkPlayerDead(player, 95.0);
         }
 
         private void OnPlayerSpawn(object sender, GetDataHandlers.SpawnEventArgs args)
@@ -689,8 +681,17 @@ namespace ClassSystemPlugin
                         if (player.TPlayer != null)
                         {
                             player.TPlayer.dead = false;
+                            int targetMax = GetClampedMaxHpForPlayer(player, dbState);
+                            player.TPlayer.statLifeMax = targetMax;
+                            player.TPlayer.statLifeMax2 = targetMax;
+                            if (player.TPlayer.statLife <= 0 || player.TPlayer.statLife > targetMax)
+                            {
+                                player.TPlayer.statLife = targetMax;
+                            }
+                            _lastAppliedMaxHp[player.Index] = targetMax;
+                            NetMessage.SendData((int)PacketTypes.PlayerHp, -1, -1, null, player.Index);
+                            NetMessage.SendData((int)PacketTypes.PlayerHp, player.Index, -1, null, player.Index);
                         }
-                        MaintainClassMaxHp(player, dbState);
                         EnsurePermanentClassBuffs(player, dbState, true);
                     }
                 }
@@ -1082,7 +1083,6 @@ namespace ClassSystemPlugin
             var player = TShock.Players[args.Msg.whoAmI];
             if (player == null || !player.Active) return;
 
-            // บล็อกการใช้ Life Crystal เกินโควตาของเฟสปัจจุบัน (PacketTypes.PlayerHp = 16) + ติด Cursed 15 วิ + คืน Life Crystal ภายใน 2 วิ
             if (args.MsgID == PacketTypes.PlayerHp && player.IsLoggedIn && player.Account != null)
             {
                 var state = GetPlayerState(player);
@@ -1097,13 +1097,23 @@ namespace ClassSystemPlugin
                         short statLifeMax = args.Msg.reader.ReadInt16();
                         args.Msg.reader.BaseStream.Position = pos;
 
-                        if (targetId == player.Index && statLifeMax > maxAllowedHp.Value)
+                        if (targetId == player.Index)
                         {
-                            args.Handled = true;
-                            int extraHp = statLifeMax - maxAllowedHp.Value;
-                            int crystalsToRefund = Math.Max(1, (int)Math.Ceiling((double)extraHp / HpPerLifeCrystal));
-                            TriggerOverLimitLifeCrystalPenalty(player, state, crystalsToRefund);
-                            return;
+                            // ถ้าผู้เล่นส่งค่าเลือด <= 0 ให้ถือว่ากำลังตาย อย่าส่ง PlayerHp สวนกลับเด็ดขาด
+                            if (statLife <= 0)
+                            {
+                                _recentDamageGraceUntil[player.Index] = DateTime.UtcNow.AddMilliseconds(600);
+                                return;
+                            }
+
+                            if (!IsPlayerDeadState(player) && statLifeMax > maxAllowedHp.Value)
+                            {
+                                args.Handled = true;
+                                int extraHp = statLifeMax - maxAllowedHp.Value;
+                                int crystalsToRefund = Math.Max(1, (int)Math.Ceiling((double)extraHp / HpPerLifeCrystal));
+                                TriggerOverLimitLifeCrystalPenalty(player, state, crystalsToRefund);
+                                return;
+                            }
                         }
                     }
                     catch { }
@@ -1236,7 +1246,12 @@ namespace ClassSystemPlugin
                 return;
             }
 
-            if (IsPlayerDeadState(player)) return;
+            // บันทึกช่วงเวลาปลอดภัยหลังโดนดาเมจ เพื่อไม่ให้ระบบ Max HP ยิงแพ็กเก็ตสวนจังหวะตาย
+            _recentDamageGraceUntil[player.Index] = DateTime.UtcNow.AddMilliseconds(500);
+
+            if (IsPlayerDeadState(player) || player.TPlayer == null || player.TPlayer.dead || player.TPlayer.statLife <= 0)
+                return;
+
             if (!player.IsLoggedIn || player.Account == null) return;
 
             var state = GetPlayerState(player);
@@ -1255,11 +1270,21 @@ namespace ClassSystemPlugin
             int damageRefund = (int)Math.Floor(extraDefenseSaved * defenseEffectiveness);
             if (damageRefund > 0)
             {
-                int maxRefund = Math.Max(0, args.Damage - 1);
+                // คำนวณดาเมจสุทธิที่ผู้เล่นโดนจริง (หลังหักเกราะเดิม 50% ของ Broken Armor)
+                int rawNetDamage = Math.Max(1, args.Damage - (int)Math.Floor(defAt50Percent * defenseEffectiveness));
+                int remainingAfterHit = player.TPlayer.statLife - rawNetDamage;
+
+                // ถ้านัดนี้ทำให้เลือดเหลือ <= 0 (ตายแน่นอน) ห้ามคืนเลือดหรือส่ง PlayerHp สวนกลับเด็ดขาด!
+                if (remainingAfterHit <= 0)
+                {
+                    _recentDamageGraceUntil[player.Index] = DateTime.UtcNow.AddMilliseconds(1000);
+                    return;
+                }
+
+                int maxRefund = Math.Max(0, rawNetDamage - 1);
                 int actualRefund = Math.Min(damageRefund, maxRefund);
 
-                int predictedRemainingLife = player.TPlayer.statLife - args.Damage;
-                if (actualRefund > 0 && predictedRemainingLife > 0 && player.TPlayer.statLife > 0 && !player.TPlayer.dead)
+                if (actualRefund > 0 && !player.TPlayer.dead && player.TPlayer.statLife > 0)
                 {
                     player.TPlayer.statLife = Math.Min(player.TPlayer.statLifeMax2, player.TPlayer.statLife + actualRefund);
                     NetMessage.SendData((int)PacketTypes.PlayerHp, -1, -1, null, player.Index);
@@ -1288,6 +1313,9 @@ namespace ClassSystemPlugin
                 return;
             }
 
+            if (_recentDamageGraceUntil.TryGetValue(player.Index, out DateTime graceUntil) && DateTime.UtcNow < graceUntil)
+                return;
+
             double bonusMult = GetHoneyBonusMultiplier(state);
             if (bonusMult <= 0.0)
             {
@@ -1313,7 +1341,7 @@ namespace ClassSystemPlugin
                 {
                     acc -= healAmount;
                     int newLife = Math.Min(tPlayer.statLifeMax2, tPlayer.statLife + healAmount);
-                    if (newLife > tPlayer.statLife)
+                    if (newLife > tPlayer.statLife && !tPlayer.dead && tPlayer.statLife > 0)
                     {
                         tPlayer.statLife = newLife;
                         NetMessage.SendData((int)PacketTypes.PlayerHp, -1, -1, null, player.Index);
@@ -2145,6 +2173,7 @@ namespace ClassSystemPlugin
             _honeyRegenAccumulator.Remove(args.Who);
             _blockedWorldItemsByPlayer.Remove(args.Who);
             _playerDeadUntil.Remove(args.Who);
+            _recentDamageGraceUntil.Remove(args.Who);
 
             var keysToRemove = new List<long>();
             foreach (var kv in _itemTypeEjectCooldown)
