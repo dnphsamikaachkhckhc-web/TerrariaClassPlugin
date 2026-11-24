@@ -27,8 +27,8 @@ namespace ClassSystemPlugin
     {
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
-        public override string Description => "Class & starter-choice (/ch 1|2) system with SQLite persistence, proper death/respawn state tracking, cross-class item ejection away from the player, and zero-flicker permanent buffs/debuffs (no Max HP modification).";
-        public override Version Version => new Version(18, 0, 0);
+        public override string Description => "Class & starter-choice (/ch 1|2) system with SQLite persistence, per-class/pack initial Max HP, max 15 Life Crystals cap, proper death/respawn state tracking, cross-class item ejection away from the player, and zero-flicker permanent buffs/debuffs.";
+        public override Version Version => new Version(18, 3, 0);
 
         private const string ClassSelectPrompt =
             "Chat by Shokuya :3 Please select your class >w<\n\n" +
@@ -38,11 +38,15 @@ namespace ClassSystemPlugin
             "summon = Sm\n\n" +
             "/c and Me Rg Mg Sm";
 
+        private const int MaxLifeCrystalsPerClass = 15;
+        private const int HpPerLifeCrystal = 20;
+
         private SqliteConnection _db;
         private bool _dbReady;
         private readonly Dictionary<int, PlayerClassState> _playerStates = new Dictionary<int, PlayerClassState>();
         private readonly Dictionary<int, Vector2> _frozenPositions = new Dictionary<int, Vector2>();
         private readonly Dictionary<int, DateTime> _warnCooldown = new Dictionary<int, DateTime>();
+        private readonly Dictionary<int, DateTime> _lifeCrystalWarnCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, DateTime> _serverBroadcastCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, string> _lastBroadcastPhase = new Dictionary<int, string>();
         private readonly Dictionary<int, DateTime> _dropWarnCooldown = new Dictionary<int, DateTime>();
@@ -51,6 +55,7 @@ namespace ClassSystemPlugin
         private readonly Dictionary<int, DateTime> _buffRefreshCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, DateTime> _lockedBuffRestoreCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, DateTime> _legacyBuffPurgeCooldown = new Dictionary<int, DateTime>();
+        private readonly Dictionary<int, int> _lastAppliedMaxHp = new Dictionary<int, int>();
         private readonly Dictionary<int, double> _honeyRegenAccumulator = new Dictionary<int, double>();
         private readonly Dictionary<int, HashSet<int>> _blockedWorldItemsByPlayer = new Dictionary<int, HashSet<int>>();
         private readonly Dictionary<int, DateTime> _playerDeadUntil = new Dictionary<int, DateTime>();
@@ -261,6 +266,130 @@ namespace ClassSystemPlugin
             base.Dispose(disposing);
         }
 
+        // กำหนด Max HP เริ่มต้นตามสายและแพ็ก /ch
+        private int? GetClassStarterMaxHp(PlayerClassState state)
+        {
+            if (state == null || string.IsNullOrEmpty(state.ClassName) || state.StarterChoice <= 0)
+                return null;
+
+            string c = state.ClassName.ToLowerInvariant();
+            int ch = state.StarterChoice;
+
+            if (c == "warrior")
+            {
+                if (ch == 1) return 160;
+                if (ch == 2) return 80;
+            }
+            else if (c == "ranger")
+            {
+                if (ch == 1 || ch == 2) return 40;
+            }
+            else if (c == "mage")
+            {
+                if (ch == 1 || ch == 2) return 60;
+            }
+            else if (c == "summoner")
+            {
+                if (ch == 1) return 20;
+                if (ch == 2) return 60;
+            }
+
+            return null;
+        }
+
+        // เพดาน Max HP สูงสุด (เริ่มต้น + Life Crystal สูงสุด 15 เม็ด = +300 HP)
+        private int? GetClassMaxAllowedHp(PlayerClassState state)
+        {
+            int? starter = GetClassStarterMaxHp(state);
+            if (!starter.HasValue) return null;
+            return starter.Value + (MaxLifeCrystalsPerClass * HpPerLifeCrystal);
+        }
+
+        private int GetClampedMaxHpForPlayer(TSPlayer player, PlayerClassState state)
+        {
+            int starter = GetClassStarterMaxHp(state) ?? 20;
+            int maxAllowed = GetClassMaxAllowedHp(state) ?? (starter + MaxLifeCrystalsPerClass * HpPerLifeCrystal);
+
+            int currentRawMax = player?.TPlayer != null
+                ? Math.Max(player.TPlayer.statLifeMax, player.TPlayer.statLifeMax2)
+                : starter;
+
+            if (currentRawMax <= starter)
+                return starter;
+
+            int bonusFromCrystals = currentRawMax - starter;
+            int crystalsCount = Math.Min(MaxLifeCrystalsPerClass, Math.Max(0, bonusFromCrystals / HpPerLifeCrystal));
+            int clamped = starter + (crystalsCount * HpPerLifeCrystal);
+
+            return Math.Min(maxAllowed, Math.Max(starter, clamped));
+        }
+
+        private int GetUsedLifeCrystalsCount(TSPlayer player, PlayerClassState state)
+        {
+            int starter = GetClassStarterMaxHp(state) ?? 20;
+            int clampedMax = GetClampedMaxHpForPlayer(player, state);
+            return Math.Min(MaxLifeCrystalsPerClass, Math.Max(0, (clampedMax - starter) / HpPerLifeCrystal));
+        }
+
+        private void ApplyClassStarterMaxHp(TSPlayer player, PlayerClassState state, bool refillToMax = true)
+        {
+            if (player?.TPlayer == null || !player.Active) return;
+
+            int? starterMaxHp = GetClassStarterMaxHp(state);
+            if (!starterMaxHp.HasValue) return;
+
+            int targetMaxHp = Math.Max(20, starterMaxHp.Value);
+            var tPlayer = player.TPlayer;
+
+            tPlayer.statLifeMax = targetMaxHp;
+            tPlayer.statLifeMax2 = targetMaxHp;
+
+            if (refillToMax || tPlayer.statLife > targetMaxHp || tPlayer.statLife <= 0)
+            {
+                tPlayer.statLife = targetMaxHp;
+            }
+
+            _lastAppliedMaxHp[player.Index] = targetMaxHp;
+
+            NetMessage.SendData((int)PacketTypes.PlayerHp, -1, -1, null, player.Index);
+            NetMessage.SendData((int)PacketTypes.PlayerHp, player.Index, -1, null, player.Index);
+        }
+
+        private void MaintainClassMaxHp(TSPlayer player, PlayerClassState state)
+        {
+            if (player?.TPlayer == null || !player.Active || IsPlayerDeadState(player)) return;
+
+            int? starterMaxHp = GetClassStarterMaxHp(state);
+            if (!starterMaxHp.HasValue) return;
+
+            int targetMaxHp = GetClampedMaxHpForPlayer(player, state);
+            var tPlayer = player.TPlayer;
+
+            bool changed = false;
+            if (tPlayer.statLifeMax != targetMaxHp)
+            {
+                tPlayer.statLifeMax = targetMaxHp;
+                changed = true;
+            }
+            if (tPlayer.statLifeMax2 != targetMaxHp)
+            {
+                tPlayer.statLifeMax2 = targetMaxHp;
+                changed = true;
+            }
+            if (tPlayer.statLife > targetMaxHp)
+            {
+                tPlayer.statLife = targetMaxHp;
+                changed = true;
+            }
+
+            if (changed || !_lastAppliedMaxHp.TryGetValue(player.Index, out int prevMax) || prevMax != targetMaxHp)
+            {
+                _lastAppliedMaxHp[player.Index] = targetMaxHp;
+                NetMessage.SendData((int)PacketTypes.PlayerHp, -1, -1, null, player.Index);
+                NetMessage.SendData((int)PacketTypes.PlayerHp, player.Index, -1, null, player.Index);
+            }
+        }
+
         private bool IsPlayerDeadState(TSPlayer player)
         {
             if (player?.TPlayer == null) return true;
@@ -326,6 +455,7 @@ namespace ClassSystemPlugin
                         {
                             player.TPlayer.dead = false;
                         }
+                        MaintainClassMaxHp(player, dbState);
                         EnsurePermanentClassBuffs(player, dbState, true);
                     }
                 }
@@ -716,6 +846,39 @@ namespace ClassSystemPlugin
 
             var player = TShock.Players[args.Msg.whoAmI];
             if (player == null || !player.Active) return;
+
+            // บล็อกการใช้ Life Crystal เกิน 15 เม็ด (PacketTypes.PlayerHp = 16)
+            if (args.MsgID == PacketTypes.PlayerHp && player.IsLoggedIn && player.Account != null)
+            {
+                var state = GetPlayerState(player);
+                int? maxAllowedHp = GetClassMaxAllowedHp(state);
+                if (maxAllowedHp.HasValue)
+                {
+                    try
+                    {
+                        long pos = args.Msg.reader.BaseStream.Position;
+                        byte targetId = args.Msg.reader.ReadByte();
+                        short statLife = args.Msg.reader.ReadInt16();
+                        short statLifeMax = args.Msg.reader.ReadInt16();
+                        args.Msg.reader.BaseStream.Position = pos;
+
+                        if (targetId == player.Index && statLifeMax > maxAllowedHp.Value)
+                        {
+                            args.Handled = true;
+                            MaintainClassMaxHp(player, state);
+
+                            if (!_lifeCrystalWarnCooldown.TryGetValue(player.Index, out DateTime lastWarn) ||
+                                (DateTime.UtcNow - lastWarn).TotalSeconds >= 3)
+                            {
+                                _lifeCrystalWarnCooldown[player.Index] = DateTime.UtcNow;
+                                player.SendWarningMessage($"[ClassSystem] Maximum {MaxLifeCrystalsPerClass} Life Crystals allowed for {state.ClassName.ToUpper()} (/ch {state.StarterChoice})! Max HP cap: {maxAllowedHp.Value}.");
+                            }
+                            return;
+                        }
+                    }
+                    catch { }
+                }
+            }
 
             if (args.MsgID == PacketTypes.ItemOwner)
             {
@@ -1673,9 +1836,12 @@ namespace ClassSystemPlugin
                     EnforceAllowedInventory(args.Player, savedState.ClassName);
                     if (!IsPlayerDeadState(args.Player))
                     {
+                        MaintainClassMaxHp(args.Player, savedState);
                         EnsurePermanentClassBuffs(args.Player, savedState, true);
                     }
-                    args.Player.SendSuccessMessage($"[ClassSystem] Welcome back! Class: {savedState.ClassName.ToUpper()} (Pack /ch {savedState.StarterChoice})");
+                    int crystals = GetUsedLifeCrystalsCount(args.Player, savedState);
+                    int curMax = GetClampedMaxHpForPlayer(args.Player, savedState);
+                    args.Player.SendSuccessMessage($"[ClassSystem] Welcome back! Class: {savedState.ClassName.ToUpper()} (Pack /ch {savedState.StarterChoice}) | Max HP: {curMax} (Life Crystals: {crystals}/{MaxLifeCrystalsPerClass})");
                 }
                 else
                 {
@@ -1715,6 +1881,7 @@ namespace ClassSystemPlugin
             _pluginGrantedGodMode.Remove(args.Who);
             _frozenPositions.Remove(args.Who);
             _warnCooldown.Remove(args.Who);
+            _lifeCrystalWarnCooldown.Remove(args.Who);
             _serverBroadcastCooldown.Remove(args.Who);
             _lastBroadcastPhase.Remove(args.Who);
             _dropWarnCooldown.Remove(args.Who);
@@ -1722,6 +1889,7 @@ namespace ClassSystemPlugin
             _buffRefreshCooldown.Remove(args.Who);
             _lockedBuffRestoreCooldown.Remove(args.Who);
             _legacyBuffPurgeCooldown.Remove(args.Who);
+            _lastAppliedMaxHp.Remove(args.Who);
             _honeyRegenAccumulator.Remove(args.Who);
             _blockedWorldItemsByPlayer.Remove(args.Who);
             _playerDeadUntil.Remove(args.Who);
@@ -1857,6 +2025,7 @@ namespace ClassSystemPlugin
                         return;
                     }
 
+                    MaintainClassMaxHp(player, state);
                     MaintainBlockedWorldItems(player);
 
                     if (HasAnyDisallowedItemInInventory(player, state.ClassName))
@@ -1974,6 +2143,7 @@ namespace ClassSystemPlugin
                     continue;
                 }
 
+                MaintainClassMaxHp(player, state);
                 ApplyHoneyRegenBonus(player, state, honeyDeltaSec);
                 ApplyBrokenArmorDefenseEffect(player, state);
 
@@ -2112,7 +2282,7 @@ namespace ClassSystemPlugin
                 string info = (currentState == null || string.IsNullOrEmpty(currentState.ClassName))
                     ? ClassSelectPrompt
                     : (currentState.StarterChoice > 0
-                        ? $"{currentState.ClassName.ToUpper()} (Pack: /ch {currentState.StarterChoice})"
+                        ? $"{currentState.ClassName.ToUpper()} (Pack: /ch {currentState.StarterChoice}) | Max HP: {GetClampedMaxHpForPlayer(args.Player, currentState)}/{GetClassMaxAllowedHp(currentState)} (Life Crystals: {GetUsedLifeCrystalsCount(args.Player, currentState)}/{MaxLifeCrystalsPerClass})"
                         : GetStarterChoicePrompt(currentState.ClassName));
                 args.Player.SendInfoMessage(info);
                 return;
@@ -2183,9 +2353,10 @@ namespace ClassSystemPlugin
             GiveStarterItems(args.Player, state.ClassName, choice);
             ClearWebAndTeleportToSpawn(args.Player);
             CleanDisallowedSpeedBuffs(args.Player, state, true);
+            ApplyClassStarterMaxHp(args.Player, state, true);
             EnsurePermanentClassBuffs(args.Player, state, true);
 
-            args.Player.SendSuccessMessage($"[ClassSystem] Starter pack /ch {choice} selected for {state.ClassName.ToUpper()}! Weapons cleared, starter gear granted, buffs active, GodMode disabled, and released from the Underworld.");
+            args.Player.SendSuccessMessage($"[ClassSystem] Starter pack /ch {choice} selected for {state.ClassName.ToUpper()}! Starter HP: {GetClassStarterMaxHp(state)} (Max cap with {MaxLifeCrystalsPerClass} Life Crystals: {GetClassMaxAllowedHp(state)}), weapons cleared, starter gear granted, buffs active, GodMode disabled, and released from the Underworld.");
             TShock.Utils.Broadcast($"[ClassSystem] {args.Player.Name} picked starter pack /ch {choice} for {state.ClassName.ToUpper()} and joined the surface!", Color.LightGreen);
         }
 
@@ -2216,6 +2387,7 @@ namespace ClassSystemPlugin
             {
                 DeleteStateFromDB(target.Account.ID);
                 _playerStates.Remove(target.Account.ID);
+                _lastAppliedMaxHp.Remove(target.Index);
                 _lastBroadcastPhase.Remove(target.Index);
                 ClearPlayerDeadState(target);
 
@@ -2241,6 +2413,7 @@ namespace ClassSystemPlugin
             };
             SaveStateToDB(target.Account.ID, newState);
             _playerStates[target.Account.ID] = newState;
+            _lastAppliedMaxHp.Remove(target.Index);
             _lastBroadcastPhase.Remove(target.Index);
             ClearPlayerDeadState(target);
 
