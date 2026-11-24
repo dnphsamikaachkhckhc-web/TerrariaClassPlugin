@@ -27,8 +27,8 @@ namespace ClassSystemPlugin
     {
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
-        public override string Description => "Class & starter-choice (/ch 1|2) system with forced client-side Swiftness/Slow buff purge, custom base movement speed multiplier per class/choice, solid-ground Underworld spawn detection, zero-damage lock against NPCs & GodMode invulnerability while logging in/choosing class/starter pack, cross-class crafting/cursor/inventory ejection, NetGetData PlayerHp packet handling, incremental Life Crystal tracking, SlimeStaff for summoner /ch 1, and permanent class/choice buffs & debuffs.";
-        public override Version Version => new Version(17, 4, 1);
+        public override string Description => "Class & starter-choice (/ch 1|2) system with forced client-side Swiftness/Slow buff purge via PlayerAddBuff/PlayerBuff, custom base movement speed multiplier per class/choice, solid-ground Underworld spawn detection, zero-damage lock against NPCs & GodMode invulnerability while logging in/choosing class/starter pack, cross-class crafting/cursor/inventory ejection, NetGetData PlayerHp packet handling, incremental Life Crystal tracking, SlimeStaff for summoner /ch 1, and permanent class/choice buffs & debuffs.";
+        public override Version Version => new Version(17, 4, 2);
 
         private const string ClassSelectPrompt =
             "Chat by Shokuya :3 Please select your class >w<\n\n" +
@@ -548,11 +548,9 @@ namespace ClassSystemPlugin
             {
                 _legacyBuffPurgeCooldown[player.Index] = DateTime.UtcNow;
 
-                // ส่งเวลาบัฟ = 0 ไปให้ Client เพื่อให้ Client ลบไอคอนบัฟ Swiftness และ Slow ออกจากหน้าจอทันที
-                NetMessage.SendData((int)PacketTypes.AddPlayerBuff, player.Index, -1, null, player.Index, BuffID.Swiftness, 0);
-                NetMessage.SendData((int)PacketTypes.AddPlayerBuff, player.Index, -1, null, player.Index, BuffID.Slow, 0);
+                NetMessage.SendData((int)PacketTypes.PlayerAddBuff, player.Index, -1, null, player.Index, BuffID.Swiftness, 0);
+                NetMessage.SendData((int)PacketTypes.PlayerAddBuff, player.Index, -1, null, player.Index, BuffID.Slow, 0);
 
-                // ซิงก์ตารางบัฟทั้งหมดทับอีกรอบเพื่อป้องกันบัฟค้าง
                 NetMessage.SendData((int)PacketTypes.PlayerBuff, -1, -1, null, player.Index);
                 NetMessage.SendData((int)PacketTypes.PlayerBuff, player.Index, -1, null, player.Index);
             }
@@ -1309,7 +1307,7 @@ namespace ClassSystemPlugin
             }
             if (removed)
             {
-                NetMessage.SendData((int)PacketTypes.AddPlayerBuff, player.Index, -1, null, player.Index, BuffID.Webbed, 0);
+                NetMessage.SendData((int)PacketTypes.PlayerAddBuff, player.Index, -1, null, player.Index, BuffID.Webbed, 0);
                 NetMessage.SendData((int)PacketTypes.PlayerBuff, -1, -1, null, player.Index);
                 NetMessage.SendData((int)PacketTypes.PlayerBuff, player.Index, -1, null, player.Index);
             }
