@@ -33,8 +33,8 @@ namespace ClassSystemPlugin
     {
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
-        public override string Description => "Class & starter-choice (/ch 1|2) system with SQLite persistence, boss-gated Life Crystal quotas (3 base + 2 per boss: King Slime, EoC, EoW/BoC, Queen Bee, Deerclops, Skeletron up to 15), per-class/pack Max HP caps (Melee /ch 1 up to 460), 15s Cursed penalty & 2s crystal refund, proper death/respawn state tracking, cross-class item ejection, and zero-flicker permanent buffs/debuffs.";
-        public override Version Version => new Version(18, 9, 0);
+        public override string Description => "Class & starter-choice (/ch 1|2) system with SQLite persistence, boss-gated Life Crystal quotas (3 base + 2 per boss: King Slime, EoC, EoW/BoC, Queen Bee, Deerclops, Skeletron up to 15), guaranteed 15s Cursed debuff & 2s crystal refund on any over-phase Life Crystal use, per-class/pack Max HP caps (Melee /ch 1 up to 460), proper death/respawn state tracking, cross-class item ejection, and zero-flicker permanent buffs/debuffs.";
+        public override Version Version => new Version(18, 10, 0);
 
         private const string ClassSelectPrompt =
             "Chat by Shokuya :3 Please select your class >w<\n\n" +
@@ -59,6 +59,7 @@ namespace ClassSystemPlugin
         private readonly Dictionary<int, DateTime> _warnCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, DateTime> _lifeCrystalPenaltyCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, DateTime> _crystalUseTriggerCooldown = new Dictionary<int, DateTime>();
+        private readonly Dictionary<int, DateTime> _cursedPenaltyUntilUtc = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, List<PendingLifeCrystalRefund>> _pendingCrystalRefunds = new Dictionary<int, List<PendingLifeCrystalRefund>>();
         private readonly Dictionary<int, DateTime> _serverBroadcastCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, string> _lastBroadcastPhase = new Dictionary<int, string>();
@@ -420,49 +421,59 @@ namespace ClassSystemPlugin
             return false;
         }
 
-        private void TryHandleAbove400LifeCrystalUse(TSPlayer player, PlayerClassState state)
+        // ดักจับการกดใช้ Life Crystal ทั้งกรณี:
+        // 1) กดเกินโควตาของเฟสปัจจุบัน (ติดดีบัฟ Cursed 15 วินาที + คืน Life Crystal ภายใน 2 วินาที ทันทีไม่ว่าเลือดจะอยู่ที่ 400 หรือเท่าไหร่ก็ตาม)
+        // 2) สาย Melee /ch 1 กดเพิ่มเลือดช่วง 400 -> 460 เมื่อเฟสปลดล็อกถึง
+        private void TryHandleLifeCrystalUse(TSPlayer player, PlayerClassState state)
         {
             if (player?.TPlayer == null || !player.Active || IsPlayerDeadState(player)) return;
             if (state == null || string.IsNullOrEmpty(state.ClassName) || state.StarterChoice <= 0) return;
 
             int? maxAllowedHp = GetClassMaxAllowedHp(state);
-            if (!maxAllowedHp.HasValue || maxAllowedHp.Value <= 400) return;
-
-            int currentMax = GetClampedMaxHpForPlayer(player, state);
-            if (currentMax < 400) return;
+            if (!maxAllowedHp.HasValue) return;
 
             var heldItem = player.TPlayer.HeldItem;
             bool holdingCrystal = heldItem != null && !heldItem.IsAir && heldItem.type == ItemID.LifeCrystal && player.TPlayer.controlUseItem;
             if (!holdingCrystal) return;
 
+            int currentMax = GetClampedMaxHpForPlayer(player, state);
+            int usedCrystals = GetUsedLifeCrystalsCount(player, state);
+            int phaseLimit = GetUnlockedLifeCrystalLimit();
+
+            bool isOverPhaseQuota = (usedCrystals >= phaseLimit || currentMax >= maxAllowedHp.Value);
+            bool isAboveVanilla400Upgrade = (!isOverPhaseQuota && maxAllowedHp.Value > 400 && currentMax >= 400);
+
+            if (!isOverPhaseQuota && !isAboveVanilla400Upgrade) return;
+
             if (_crystalUseTriggerCooldown.TryGetValue(player.Index, out DateTime lastUse) &&
-                (DateTime.UtcNow - lastUse).TotalMilliseconds < 350)
+                (DateTime.UtcNow - lastUse).TotalMilliseconds < 400)
             {
                 return;
             }
             _crystalUseTriggerCooldown[player.Index] = DateTime.UtcNow;
 
+            if (isOverPhaseQuota)
+            {
+                // หักคริสตัลถ้ามีอยู่ในตัวแล้วตั้งคิวคืนใน 2 วินาที หรือถ้าตัวเกมยังไม่หัก (เช่นตอน 400 HP) ก็ลงโทษ Cursed ทันทีโดยไม่เสียของ
+                bool consumed = ConsumeOneLifeCrystalFromPlayer(player);
+                TriggerOverLimitLifeCrystalPenalty(player, state, consumed ? 1 : 0);
+                return;
+            }
+
+            // กรณีกดเพิ่มเลือดช่วง 400 -> 460 (Melee /ch 1 เมื่อปลดล็อกเฟสถึง)
             if (!ConsumeOneLifeCrystalFromPlayer(player)) return;
 
-            if (currentMax < maxAllowedHp.Value)
-            {
-                int newMaxHp = Math.Min(maxAllowedHp.Value, currentMax + HpPerLifeCrystal);
-                player.TPlayer.statLifeMax = newMaxHp;
-                player.TPlayer.statLifeMax2 = newMaxHp;
-                player.TPlayer.statLife = newMaxHp;
-                _lastAppliedMaxHp[player.Index] = newMaxHp;
+            int newMaxHp = Math.Min(maxAllowedHp.Value, currentMax + HpPerLifeCrystal);
+            player.TPlayer.statLifeMax = newMaxHp;
+            player.TPlayer.statLifeMax2 = newMaxHp;
+            player.TPlayer.statLife = newMaxHp;
+            _lastAppliedMaxHp[player.Index] = newMaxHp;
 
-                NetMessage.SendData((int)PacketTypes.PlayerHp, -1, -1, null, player.Index);
-                NetMessage.SendData((int)PacketTypes.PlayerHp, player.Index, -1, null, player.Index);
+            NetMessage.SendData((int)PacketTypes.PlayerHp, -1, -1, null, player.Index);
+            NetMessage.SendData((int)PacketTypes.PlayerHp, player.Index, -1, null, player.Index);
 
-                int crystalsUsed = GetUsedLifeCrystalsCount(player, state);
-                int phaseLimit = GetUnlockedLifeCrystalLimit();
-                player.SendSuccessMessage($"[ClassSystem] Life Crystal absorbed! Max HP: {newMaxHp}/{maxAllowedHp.Value} (Life Crystals: {crystalsUsed}/{phaseLimit}).");
-            }
-            else
-            {
-                TriggerOverLimitLifeCrystalPenalty(player, state, 1);
-            }
+            int updatedUsedCrystals = GetUsedLifeCrystalsCount(player, state);
+            player.SendSuccessMessage($"[ClassSystem] Life Crystal absorbed! Max HP: {newMaxHp}/{maxAllowedHp.Value} (Life Crystals: {updatedUsedCrystals}/{phaseLimit}).");
         }
 
         private void TriggerOverLimitLifeCrystalPenalty(TSPlayer player, PlayerClassState state, int refundedAmount = 1)
@@ -471,21 +482,25 @@ namespace ClassSystemPlugin
 
             MaintainClassMaxHp(player, state);
 
-            // ติดสถานะ Cursed 15 วินาที
+            // ติดสถานะ Cursed 15 วินาที และล็อกไม่ให้ถูกล้างออกก่อนครบเวลา
+            _cursedPenaltyUntilUtc[player.Index] = DateTime.UtcNow.AddSeconds(CursedPenaltySeconds);
             player.SetBuff(BuffID.Cursed, CursedPenaltyTicks, true);
 
-            // คิวคืน Life Crystal ภายใน 2 วินาที
-            if (!_pendingCrystalRefunds.TryGetValue(player.Index, out var list))
+            // คิวคืน Life Crystal ภายใน 2 วินาที (เฉพาะกรณีที่คริสตัลถูกหักออกจากกระเป๋าไปแล้ว)
+            if (refundedAmount > 0)
             {
-                list = new List<PendingLifeCrystalRefund>();
-                _pendingCrystalRefunds[player.Index] = list;
-            }
+                if (!_pendingCrystalRefunds.TryGetValue(player.Index, out var list))
+                {
+                    list = new List<PendingLifeCrystalRefund>();
+                    _pendingCrystalRefunds[player.Index] = list;
+                }
 
-            list.Add(new PendingLifeCrystalRefund
-            {
-                RefundAtUtc = DateTime.UtcNow.AddSeconds(CrystalRefundDelaySeconds),
-                Amount = Math.Max(1, refundedAmount)
-            });
+                list.Add(new PendingLifeCrystalRefund
+                {
+                    RefundAtUtc = DateTime.UtcNow.AddSeconds(CrystalRefundDelaySeconds),
+                    Amount = refundedAmount
+                });
+            }
 
             if (!_lifeCrystalPenaltyCooldown.TryGetValue(player.Index, out DateTime lastWarn) ||
                 (DateTime.UtcNow - lastWarn).TotalSeconds >= 1.5)
@@ -494,7 +509,29 @@ namespace ClassSystemPlugin
                 int maxCap = GetClassMaxAllowedHp(state) ?? 0;
                 int usedCrystals = GetUsedLifeCrystalsCount(player, state);
                 int phaseLimit = GetUnlockedLifeCrystalLimit();
-                player.SendWarningMessage($"[ClassSystem] Current phase Life Crystal cap reached for {state.ClassName.ToUpper()} (/ch {state.StarterChoice}) — Max HP: {maxCap} (Life Crystals: {usedCrystals}/{phaseLimit})! You are Cursed for {CursedPenaltySeconds}s and your Life Crystal will be refunded in {CrystalRefundDelaySeconds:0}s.");
+                string refundText = refundedAmount > 0
+                    ? $" and your Life Crystal will be refunded in {CrystalRefundDelaySeconds:0}s"
+                    : "";
+                player.SendWarningMessage($"[ClassSystem] Current phase Life Crystal cap reached for {state.ClassName.ToUpper()} (/ch {state.StarterChoice}) — Max HP: {maxCap} (Life Crystals: {usedCrystals}/{phaseLimit})! You are Cursed for {CursedPenaltySeconds}s{refundText}.");
+            }
+        }
+
+        private void MaintainActiveCursedPenalty(TSPlayer player)
+        {
+            if (player?.TPlayer == null || !player.Active || IsPlayerDeadState(player)) return;
+            if (!_cursedPenaltyUntilUtc.TryGetValue(player.Index, out DateTime untilUtc)) return;
+
+            double remainingSeconds = (untilUtc - DateTime.UtcNow).TotalSeconds;
+            if (remainingSeconds <= 0)
+            {
+                _cursedPenaltyUntilUtc.Remove(player.Index);
+                return;
+            }
+
+            if (!HasBuff(player, BuffID.Cursed))
+            {
+                int remainingTicks = Math.Max(60, (int)Math.Ceiling(remainingSeconds * 60.0));
+                player.SetBuff(BuffID.Cursed, remainingTicks, true);
             }
         }
 
@@ -609,6 +646,7 @@ namespace ClassSystemPlugin
             player.TPlayer.statLife = 0;
             _playerDeadUntil[player.Index] = DateTime.UtcNow.AddSeconds(lockSeconds);
             _honeyRegenAccumulator.Remove(player.Index);
+            _cursedPenaltyUntilUtc.Remove(player.Index);
         }
 
         private void ClearPlayerDeadState(TSPlayer player)
@@ -1106,7 +1144,9 @@ namespace ClassSystemPlugin
                 {
                     var state = GetPlayerState(player);
                     int[] lockedBuffs = GetLockedBuffsForState(state);
-                    if (lockedBuffs.Length > 0)
+                    bool hasActiveCursedPenalty = _cursedPenaltyUntilUtc.TryGetValue(player.Index, out DateTime cursedUntil) && DateTime.UtcNow < cursedUntil;
+
+                    if (lockedBuffs.Length > 0 || hasActiveCursedPenalty)
                     {
                         if (args.MsgID == PacketTypes.PlayerAddBuff)
                         {
@@ -1118,11 +1158,21 @@ namespace ClassSystemPlugin
                                 int buffTime = args.Msg.reader.ReadInt32();
                                 args.Msg.reader.BaseStream.Position = pos;
 
-                                if (targetId == player.Index && Array.IndexOf(lockedBuffs, (int)buffType) >= 0 && buffTime <= 0)
+                                if (targetId == player.Index && buffTime <= 0)
                                 {
-                                    args.Handled = true;
-                                    RestoreMissingLockedBuffs(player, state, new[] { (int)buffType }, true);
-                                    return;
+                                    if (hasActiveCursedPenalty && buffType == BuffID.Cursed)
+                                    {
+                                        args.Handled = true;
+                                        MaintainActiveCursedPenalty(player);
+                                        return;
+                                    }
+
+                                    if (Array.IndexOf(lockedBuffs, (int)buffType) >= 0)
+                                    {
+                                        args.Handled = true;
+                                        RestoreMissingLockedBuffs(player, state, new[] { (int)buffType }, true);
+                                        return;
+                                    }
                                 }
                             }
                             catch { }
@@ -1142,6 +1192,11 @@ namespace ClassSystemPlugin
                                         if (bType > 0) incomingBuffs.Add(bType);
                                     }
                                     args.Msg.reader.BaseStream.Position = pos;
+
+                                    if (hasActiveCursedPenalty && !incomingBuffs.Contains(BuffID.Cursed))
+                                    {
+                                        MaintainActiveCursedPenalty(player);
+                                    }
 
                                     var missing = new List<int>();
                                     foreach (int lockId in lockedBuffs)
@@ -2077,6 +2132,7 @@ namespace ClassSystemPlugin
             _warnCooldown.Remove(args.Who);
             _lifeCrystalPenaltyCooldown.Remove(args.Who);
             _crystalUseTriggerCooldown.Remove(args.Who);
+            _cursedPenaltyUntilUtc.Remove(args.Who);
             _pendingCrystalRefunds.Remove(args.Who);
             _serverBroadcastCooldown.Remove(args.Who);
             _lastBroadcastPhase.Remove(args.Who);
@@ -2221,7 +2277,7 @@ namespace ClassSystemPlugin
                         return;
                     }
 
-                    TryHandleAbove400LifeCrystalUse(player, state);
+                    TryHandleLifeCrystalUse(player, state);
                     MaintainClassMaxHp(player, state);
                     MaintainBlockedWorldItems(player);
 
@@ -2342,7 +2398,7 @@ namespace ClassSystemPlugin
                     continue;
                 }
 
-                TryHandleAbove400LifeCrystalUse(player, state);
+                TryHandleLifeCrystalUse(player, state);
                 MaintainClassMaxHp(player, state);
                 ApplyHoneyRegenBonus(player, state, honeyDeltaSec);
                 ApplyBrokenArmorDefenseEffect(player, state);
@@ -2351,6 +2407,7 @@ namespace ClassSystemPlugin
                 {
                     ClearWebBuff(player);
                     CleanDisallowedSpeedBuffs(player, state, false);
+                    MaintainActiveCursedPenalty(player);
                     MaintainBlockedWorldItems(player);
                     EnforceAllowedInventory(player, state.ClassName);
                     EnsurePermanentClassBuffs(player, state, false);
@@ -2588,6 +2645,7 @@ namespace ClassSystemPlugin
                 DeleteStateFromDB(target.Account.ID);
                 _playerStates.Remove(target.Account.ID);
                 _lastAppliedMaxHp.Remove(target.Index);
+                _cursedPenaltyUntilUtc.Remove(target.Index);
                 _pendingCrystalRefunds.Remove(target.Index);
                 _lastBroadcastPhase.Remove(target.Index);
                 ClearPlayerDeadState(target);
@@ -2615,6 +2673,7 @@ namespace ClassSystemPlugin
             SaveStateToDB(target.Account.ID, newState);
             _playerStates[target.Account.ID] = newState;
             _lastAppliedMaxHp.Remove(target.Index);
+            _cursedPenaltyUntilUtc.Remove(target.Index);
             _pendingCrystalRefunds.Remove(target.Index);
             _lastBroadcastPhase.Remove(target.Index);
             ClearPlayerDeadState(target);
