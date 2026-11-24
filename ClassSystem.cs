@@ -33,8 +33,8 @@ namespace ClassSystemPlugin
     {
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
-        public override string Description => "Class & starter-choice (/ch 1|2) system with SQLite persistence, per-class/pack Max HP caps (Melee /ch 1 up to 460 past vanilla 400 client cap), max 15 Life Crystals cap with 15s Cursed penalty & 2s crystal refund, proper death/respawn state tracking, cross-class item ejection away from the player, and zero-flicker permanent buffs/debuffs.";
-        public override Version Version => new Version(18, 7, 0);
+        public override string Description => "Class & starter-choice (/ch 1|2) system with SQLite persistence, boss-gated Life Crystal quotas (3 base + 2 per boss: King Slime, EoC, EoW/BoC, Queen Bee, Deerclops, Skeletron up to 15), per-class/pack Max HP caps (Melee /ch 1 up to 460), 15s Cursed penalty & 2s crystal refund, proper death/respawn state tracking, cross-class item ejection, and zero-flicker permanent buffs/debuffs.";
+        public override Version Version => new Version(18, 9, 0);
 
         private const string ClassSelectPrompt =
             "Chat by Shokuya :3 Please select your class >w<\n\n" +
@@ -44,6 +44,8 @@ namespace ClassSystemPlugin
             "summon = Sm\n\n" +
             "/c and Me Rg Mg Sm";
 
+        private const int StarterPhaseLifeCrystalLimit = 3;
+        private const int CrystalsPerBossMilestone = 2;
         private const int MaxLifeCrystalsPerClass = 15;
         private const int HpPerLifeCrystal = 20;
         private const int CursedPenaltySeconds = 15;
@@ -277,6 +279,29 @@ namespace ClassSystemPlugin
             base.Dispose(disposing);
         }
 
+        // โควตา Life Crystal ตามบอสที่ปราบได้ในโลก:
+        // เริ่มเกม = 3 เม็ด
+        // +2 King Slime (NPC.downedSlimeKing)
+        // +2 Eye of Cthulhu (NPC.downedBoss1)
+        // +2 Eater of Worlds / Brain of Cthulhu (NPC.downedBoss2)
+        // +2 Queen Bee (NPC.downedQueenBee)
+        // +2 Deerclops (NPC.downedDeerclops)
+        // +2 Skeletron (NPC.downedBoss3)
+        // รวมสูงสุด = 15 เม็ด
+        private int GetUnlockedLifeCrystalLimit()
+        {
+            int limit = StarterPhaseLifeCrystalLimit;
+
+            if (NPC.downedSlimeKing) limit += CrystalsPerBossMilestone;
+            if (NPC.downedBoss1) limit += CrystalsPerBossMilestone;
+            if (NPC.downedBoss2) limit += CrystalsPerBossMilestone;
+            if (NPC.downedQueenBee) limit += CrystalsPerBossMilestone;
+            if (NPC.downedDeerclops) limit += CrystalsPerBossMilestone;
+            if (NPC.downedBoss3) limit += CrystalsPerBossMilestone;
+
+            return Math.Min(MaxLifeCrystalsPerClass, Math.Max(0, limit));
+        }
+
         // กำหนด Max HP เริ่มต้นตามสายและแพ็ก /ch
         private int? GetClassStarterMaxHp(PlayerClassState state)
         {
@@ -308,8 +333,18 @@ namespace ClassSystemPlugin
             return null;
         }
 
-        // เพดาน Max HP สูงสุดของแต่ละสาย/แพ็ก (ฐานเริ่มต้น + Life Crystal สูงสุด 15 เม็ด = +300 HP)
+        // เพดาน Max HP ที่อนุญาตในเฟสปัจจุบันของแต่ละสาย/แพ็ก
         private int? GetClassMaxAllowedHp(PlayerClassState state)
+        {
+            int? starter = GetClassStarterMaxHp(state);
+            if (!starter.HasValue) return null;
+
+            int unlockedCrystals = GetUnlockedLifeCrystalLimit();
+            return starter.Value + (unlockedCrystals * HpPerLifeCrystal);
+        }
+
+        // เพดาน Max HP สูงสุดเมื่อปลดล็อกครบ 15 เม็ด (ใช้แสดงผลในคำสั่ง /class)
+        private int? GetClassFullCapHp(PlayerClassState state)
         {
             int? starter = GetClassStarterMaxHp(state);
             if (!starter.HasValue) return null;
@@ -320,7 +355,8 @@ namespace ClassSystemPlugin
         private int GetClampedMaxHpForPlayer(TSPlayer player, PlayerClassState state)
         {
             int starter = GetClassStarterMaxHp(state) ?? 20;
-            int maxAllowed = GetClassMaxAllowedHp(state) ?? (starter + MaxLifeCrystalsPerClass * HpPerLifeCrystal);
+            int maxAllowed = GetClassMaxAllowedHp(state) ?? (starter + GetUnlockedLifeCrystalLimit() * HpPerLifeCrystal);
+            int allowedCrystals = GetUnlockedLifeCrystalLimit();
 
             int currentRawMax = player?.TPlayer != null
                 ? Math.Max(player.TPlayer.statLifeMax, player.TPlayer.statLifeMax2)
@@ -330,7 +366,7 @@ namespace ClassSystemPlugin
                 return Math.Min(maxAllowed, starter);
 
             int bonusFromCrystals = currentRawMax - starter;
-            int crystalsCount = Math.Min(MaxLifeCrystalsPerClass, Math.Max(0, bonusFromCrystals / HpPerLifeCrystal));
+            int crystalsCount = Math.Min(allowedCrystals, Math.Max(0, bonusFromCrystals / HpPerLifeCrystal));
             int clamped = starter + (crystalsCount * HpPerLifeCrystal);
 
             return Math.Min(maxAllowed, Math.Max(starter, clamped));
@@ -340,7 +376,7 @@ namespace ClassSystemPlugin
         {
             int starter = GetClassStarterMaxHp(state) ?? 20;
             int clampedMax = GetClampedMaxHpForPlayer(player, state);
-            return Math.Min(MaxLifeCrystalsPerClass, Math.Max(0, (clampedMax - starter) / HpPerLifeCrystal));
+            return Math.Min(GetUnlockedLifeCrystalLimit(), Math.Max(0, (clampedMax - starter) / HpPerLifeCrystal));
         }
 
         private bool ConsumeOneLifeCrystalFromPlayer(TSPlayer player)
@@ -420,7 +456,8 @@ namespace ClassSystemPlugin
                 NetMessage.SendData((int)PacketTypes.PlayerHp, player.Index, -1, null, player.Index);
 
                 int crystalsUsed = GetUsedLifeCrystalsCount(player, state);
-                player.SendSuccessMessage($"[ClassSystem] Life Crystal absorbed! Max HP: {newMaxHp}/{maxAllowedHp.Value} (Life Crystals: {crystalsUsed}/{MaxLifeCrystalsPerClass}).");
+                int phaseLimit = GetUnlockedLifeCrystalLimit();
+                player.SendSuccessMessage($"[ClassSystem] Life Crystal absorbed! Max HP: {newMaxHp}/{maxAllowedHp.Value} (Life Crystals: {crystalsUsed}/{phaseLimit}).");
             }
             else
             {
@@ -456,7 +493,8 @@ namespace ClassSystemPlugin
                 _lifeCrystalPenaltyCooldown[player.Index] = DateTime.UtcNow;
                 int maxCap = GetClassMaxAllowedHp(state) ?? 0;
                 int usedCrystals = GetUsedLifeCrystalsCount(player, state);
-                player.SendWarningMessage($"[ClassSystem] Max HP cap reached for {state.ClassName.ToUpper()} (/ch {state.StarterChoice}) — Max HP: {maxCap} (Life Crystals: {usedCrystals}/{MaxLifeCrystalsPerClass})! You are Cursed for {CursedPenaltySeconds}s and your Life Crystal will be refunded in {CrystalRefundDelaySeconds:0}s.");
+                int phaseLimit = GetUnlockedLifeCrystalLimit();
+                player.SendWarningMessage($"[ClassSystem] Current phase Life Crystal cap reached for {state.ClassName.ToUpper()} (/ch {state.StarterChoice}) — Max HP: {maxCap} (Life Crystals: {usedCrystals}/{phaseLimit})! You are Cursed for {CursedPenaltySeconds}s and your Life Crystal will be refunded in {CrystalRefundDelaySeconds:0}s.");
             }
         }
 
@@ -1006,7 +1044,7 @@ namespace ClassSystemPlugin
             var player = TShock.Players[args.Msg.whoAmI];
             if (player == null || !player.Active) return;
 
-            // บล็อกการใช้ Life Crystal เกินเพดานสาย (PacketTypes.PlayerHp = 16) + ติด Cursed 15 วิ + คืน Life Crystal ภายใน 2 วิ
+            // บล็อกการใช้ Life Crystal เกินโควตาของเฟสปัจจุบัน (PacketTypes.PlayerHp = 16) + ติด Cursed 15 วิ + คืน Life Crystal ภายใน 2 วิ
             if (args.MsgID == PacketTypes.PlayerHp && player.IsLoggedIn && player.Account != null)
             {
                 var state = GetPlayerState(player);
@@ -1994,9 +2032,10 @@ namespace ClassSystemPlugin
                         EnsurePermanentClassBuffs(args.Player, savedState, true);
                     }
                     int crystals = GetUsedLifeCrystalsCount(args.Player, savedState);
+                    int phaseLimit = GetUnlockedLifeCrystalLimit();
                     int curMax = GetClampedMaxHpForPlayer(args.Player, savedState);
                     int capMax = GetClassMaxAllowedHp(savedState) ?? curMax;
-                    args.Player.SendSuccessMessage($"[ClassSystem] Welcome back! Class: {savedState.ClassName.ToUpper()} (Pack /ch {savedState.StarterChoice}) | Max HP: {curMax}/{capMax} (Life Crystals: {crystals}/{MaxLifeCrystalsPerClass})");
+                    args.Player.SendSuccessMessage($"[ClassSystem] Welcome back! Class: {savedState.ClassName.ToUpper()} (Pack /ch {savedState.StarterChoice}) | Max HP: {curMax}/{capMax} (Life Crystals: {crystals}/{phaseLimit})");
                 }
                 else
                 {
@@ -2443,7 +2482,7 @@ namespace ClassSystemPlugin
                 string info = (currentState == null || string.IsNullOrEmpty(currentState.ClassName))
                     ? ClassSelectPrompt
                     : (currentState.StarterChoice > 0
-                        ? $"{currentState.ClassName.ToUpper()} (Pack: /ch {currentState.StarterChoice}) | Max HP: {GetClampedMaxHpForPlayer(args.Player, currentState)}/{GetClassMaxAllowedHp(currentState)} (Life Crystals: {GetUsedLifeCrystalsCount(args.Player, currentState)}/{MaxLifeCrystalsPerClass})"
+                        ? $"{currentState.ClassName.ToUpper()} (Pack: /ch {currentState.StarterChoice}) | Max HP: {GetClampedMaxHpForPlayer(args.Player, currentState)}/{GetClassMaxAllowedHp(currentState)} (Full Cap: {GetClassFullCapHp(currentState)}) | Life Crystals: {GetUsedLifeCrystalsCount(args.Player, currentState)}/{GetUnlockedLifeCrystalLimit()}"
                         : GetStarterChoicePrompt(currentState.ClassName));
                 args.Player.SendInfoMessage(info);
                 return;
@@ -2517,7 +2556,7 @@ namespace ClassSystemPlugin
             ApplyClassStarterMaxHp(args.Player, state, true);
             EnsurePermanentClassBuffs(args.Player, state, true);
 
-            args.Player.SendSuccessMessage($"[ClassSystem] Starter pack /ch {choice} selected for {state.ClassName.ToUpper()}! Starter HP: {GetClassStarterMaxHp(state)} (Max HP cap: {GetClassMaxAllowedHp(state)}, up to {MaxLifeCrystalsPerClass} Life Crystals), weapons cleared, starter gear granted, buffs active, GodMode disabled, and released from the Underworld.");
+            args.Player.SendSuccessMessage($"[ClassSystem] Starter pack /ch {choice} selected for {state.ClassName.ToUpper()}! Starter HP: {GetClassStarterMaxHp(state)} (Current Phase Cap: {GetClassMaxAllowedHp(state)}, Life Crystals: {GetUnlockedLifeCrystalLimit()}/{MaxLifeCrystalsPerClass}), weapons cleared, starter gear granted, buffs active, GodMode disabled, and released from the Underworld.");
             TShock.Utils.Broadcast($"[ClassSystem] {args.Player.Name} picked starter pack /ch {choice} for {state.ClassName.ToUpper()} and joined the surface!", Color.LightGreen);
         }
 
