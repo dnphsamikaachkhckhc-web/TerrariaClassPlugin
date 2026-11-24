@@ -27,8 +27,8 @@ namespace ClassSystemPlugin
     {
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
-        public override string Description => "Class & starter-choice (/ch 1|2) system with Underworld GodMode invulnerability & safe non-solid spawn detection while logging in/choosing class/starter pack, NetGetData PlayerHp packet handling, incremental Life Crystal tracking, strict instant cross-class ejection, SlimeStaff for summoner /ch 1, smooth native client movement/jump buffs, custom prompts, server-wide broadcasts, inventory weapon wipe, and permanent class/choice buffs & debuffs.";
-        public override Version Version => new Version(17, 1, 0);
+        public override string Description => "Class & starter-choice (/ch 1|2) system with solid-ground Underworld spawn detection, zero-damage lock against NPCs & GodMode invulnerability while logging in/choosing class/starter pack, cross-class crafting/cursor/inventory ejection, NetGetData PlayerHp packet handling, incremental Life Crystal tracking, SlimeStaff for summoner /ch 1, smooth native client buffs, and permanent class/choice buffs & debuffs.";
+        public override Version Version => new Version(17, 3, 0);
 
         private const string ClassSelectPrompt =
             "Chat by Shokuya :3 Please select your class >w<\n\n" +
@@ -46,6 +46,7 @@ namespace ClassSystemPlugin
         private readonly Dictionary<int, DateTime> _serverBroadcastCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, string> _lastBroadcastPhase = new Dictionary<int, string>();
         private readonly Dictionary<int, DateTime> _dropWarnCooldown = new Dictionary<int, DateTime>();
+        private readonly Dictionary<int, DateTime> _craftWarnCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, DateTime> _slotEjectCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, DateTime> _crystalWarnCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, DateTime> _buffRefreshCooldown = new Dictionary<int, DateTime>();
@@ -265,6 +266,16 @@ namespace ClassSystemPlugin
             if (state == null || string.IsNullOrEmpty(state.ClassName) || state.StarterChoice <= 0)
                 return true;
             return false;
+        }
+
+        private void DisarmLockedPlayer(TSPlayer player)
+        {
+            if (player?.TPlayer == null) return;
+            player.TPlayer.controlUseItem = false;
+            player.TPlayer.itemAnimation = 0;
+            player.TPlayer.itemAnimationMax = 0;
+            player.TPlayer.itemTime = 0;
+            CancelActivePlayerProjectiles(player);
         }
 
         private void SetUnderworldGodMode(TSPlayer player, bool enable)
@@ -643,7 +654,6 @@ namespace ClassSystemPlugin
             var player = TShock.Players[args.ID];
             if (player == null || !player.Active) return;
 
-            // เป็นอมตะ 100% ระหว่างที่ยังล็อกอิน/เลือกคลาส/เลือกอาวุธในนรก
             if (IsPlayerInSelectionLock(player))
             {
                 args.Handled = true;
@@ -911,14 +921,25 @@ namespace ClassSystemPlugin
             return droppedIndex;
         }
 
-        private void NotifyBlockedPickup(TSPlayer player, string itemName)
+        private void NotifyBlockedPickup(TSPlayer player, string itemName, bool fromCraftingOrCursor = false)
         {
             if (player == null) return;
+            var state = GetPlayerState(player);
+            string className = state?.ClassName ?? "class";
+
+            if (fromCraftingOrCursor)
+            {
+                if (!_craftWarnCooldown.TryGetValue(player.Index, out DateTime lastCraftWarn) || (DateTime.UtcNow - lastCraftWarn).TotalSeconds >= 2)
+                {
+                    _craftWarnCooldown[player.Index] = DateTime.UtcNow;
+                    player.SendErrorMessage($"[ClassSystem] Crafting/holding '{itemName}' blocked — {className.ToUpper()} cannot craft or use items from other classes! Ejected onto the ground.");
+                }
+                return;
+            }
+
             if (!_dropWarnCooldown.TryGetValue(player.Index, out DateTime lastWarn) || (DateTime.UtcNow - lastWarn).TotalSeconds >= 2)
             {
                 _dropWarnCooldown[player.Index] = DateTime.UtcNow;
-                var state = GetPlayerState(player);
-                string className = state?.ClassName ?? "class";
                 player.SendWarningMessage($"[ClassSystem] Dropped '{itemName}' onto the ground (not deleted) — {className.ToUpper()} cannot use or pick up items from other classes.");
             }
         }
@@ -934,7 +955,7 @@ namespace ClassSystemPlugin
             return true;
         }
 
-        private void EjectDisallowedItemSafely(TSPlayer player, int netSlotIndex, Item itemToDrop, int fallbackType, int fallbackStack, byte fallbackPrefix = 0)
+        private void EjectDisallowedItemSafely(TSPlayer player, int netSlotIndex, Item itemToDrop, int fallbackType, int fallbackStack, byte fallbackPrefix = 0, bool isCursorOrCraft = false)
         {
             if (player?.TPlayer == null) return;
             if (!CanEjectSlotNow(player.Index, netSlotIndex)) return;
@@ -969,7 +990,7 @@ namespace ClassSystemPlugin
                 ClearPlayerNetSlot(player, netSlotIndex);
             }
 
-            NotifyBlockedPickup(player, itemName);
+            NotifyBlockedPickup(player, itemName, isCursorOrCraft || netSlotIndex == 58);
         }
 
         private void ClearPlayerNetSlot(TSPlayer player, int netSlotIndex)
@@ -1078,12 +1099,21 @@ namespace ClassSystemPlugin
 
             var tPlayer = player.TPlayer;
 
-            for (int i = 0; i < tPlayer.inventory.Length && i < 59; i++)
+            if (tPlayer.inventory.Length > 58)
+            {
+                Item cursorItem = tPlayer.inventory[58];
+                if (cursorItem != null && !cursorItem.IsAir && cursorItem.type > ItemID.None && !IsItemAllowedForClass(cursorItem, currentClass))
+                {
+                    EjectDisallowedItemSafely(player, 58, cursorItem, cursorItem.type, cursorItem.stack, cursorItem.prefix, true);
+                }
+            }
+
+            for (int i = 0; i < tPlayer.inventory.Length && i < 58; i++)
             {
                 Item item = tPlayer.inventory[i];
                 if (item != null && !item.IsAir && item.type > ItemID.None && !IsItemAllowedForClass(item, currentClass))
                 {
-                    EjectDisallowedItemSafely(player, i, item, item.type, item.stack, item.prefix);
+                    EjectDisallowedItemSafely(player, i, item, item.type, item.stack, item.prefix, false);
                 }
             }
 
@@ -1092,13 +1122,13 @@ namespace ClassSystemPlugin
                 Item armorItem = tPlayer.armor[i];
                 if (armorItem != null && !armorItem.IsAir && armorItem.type > ItemID.None && !IsItemAllowedForClass(armorItem, currentClass))
                 {
-                    EjectDisallowedItemSafely(player, 59 + i, armorItem, armorItem.type, armorItem.stack, armorItem.prefix);
+                    EjectDisallowedItemSafely(player, 59 + i, armorItem, armorItem.type, armorItem.stack, armorItem.prefix, false);
                 }
             }
 
             if (tPlayer.trashItem != null && !tPlayer.trashItem.IsAir && tPlayer.trashItem.type > ItemID.None && !IsItemAllowedForClass(tPlayer.trashItem, currentClass))
             {
-                EjectDisallowedItemSafely(player, 179, tPlayer.trashItem, tPlayer.trashItem.type, tPlayer.trashItem.stack, tPlayer.trashItem.prefix);
+                EjectDisallowedItemSafely(player, 179, tPlayer.trashItem, tPlayer.trashItem.type, tPlayer.trashItem.stack, tPlayer.trashItem.prefix, false);
             }
         }
 
@@ -1109,12 +1139,12 @@ namespace ClassSystemPlugin
             return new Vector2(tileX * 16f, tileY * 16f);
         }
 
-        private bool IsTileAreaClear(int centerTileX, int feetTileY)
+        private bool IsTileStandableGround(int centerTileX, int feetTileY)
         {
             if (centerTileX < 50 || centerTileX > Main.maxTilesX - 50 || feetTileY < 50 || feetTileY > Main.maxTilesY - 30)
                 return false;
 
-            // ตรวจพื้นที่ขนาดกว้าง 2 บล็อก สูง 3 บล็อก (ตัวผู้เล่น) ต้องไม่มีบล็อกทึบและไม่มีลาวา/น้ำ
+            // 1. พื้นที่ตัวผู้เล่น (กว้าง 3 ช่อง x สูง 4 ช่อง) ต้องโล่ง ไม่มีบล็อกทึบและไม่มีลาวา/น้ำ
             for (int dx = -1; dx <= 1; dx++)
             {
                 for (int dy = -3; dy <= 0; dy++)
@@ -1127,6 +1157,16 @@ namespace ClassSystemPlugin
                         return false;
                 }
             }
+
+            // 2. บล็อกใต้เท้าตรงตำแหน่ง (centerTileX, feetTileY + 1) ต้องเป็นพื้นแข็งที่ยืนได้ (ไม่ลอยกลางอากาศและไม่ใช่ลาวา)
+            var floorTile = Main.tile[centerTileX, feetTileY + 1];
+            if (floorTile == null || floorTile.liquid > 0)
+                return false;
+
+            bool hasSolidFloor = floorTile.active() && (Main.tileSolid[floorTile.type] || Main.tileSolidTop[floorTile.type]);
+            if (!hasSolidFloor)
+                return false;
+
             return true;
         }
 
@@ -1136,25 +1176,25 @@ namespace ClassSystemPlugin
             {
                 int cx = (int)(_cachedSafeUnderworldPos.Value.X / 16f);
                 int cy = (int)(_cachedSafeUnderworldPos.Value.Y / 16f) + 3;
-                if (IsTileAreaClear(cx, cy))
+                if (IsTileStandableGround(cx, cy))
                 {
                     return _cachedSafeUnderworldPos.Value;
                 }
             }
 
             int startX = Main.maxTilesX / 2;
-            int minY = Math.Max(100, Main.maxTilesY - 190);
-            int maxY = Math.Max(minY + 10, Main.maxTilesY - 45);
+            int minY = Math.Max(100, Main.maxTilesY - 195);
+            int maxY = Math.Max(minY + 10, Main.maxTilesY - 40);
 
-            // สแกนหาช่องว่างโล่งๆ ในนรก รอบๆ จุดกึ่งกลางโลก
-            for (int offsetX = 0; offsetX <= 250; offsetX += 2)
+            // สแกนหาพื้นยืนที่ปลอดภัยในนรก (มีพื้นรองรับใต้เท้า + ไม่มีลาวา + ไม่จมบล็อก)
+            for (int offsetX = 0; offsetX <= 300; offsetX += 2)
             {
                 int[] candidateXs = offsetX == 0 ? new[] { startX } : new[] { startX + offsetX, startX - offsetX };
                 foreach (int tx in candidateXs)
                 {
                     for (int ty = minY; ty <= maxY; ty++)
                     {
-                        if (IsTileAreaClear(tx, ty))
+                        if (IsTileStandableGround(tx, ty))
                         {
                             Vector2 safePos = new Vector2(tx * 16f, (ty - 3) * 16f);
                             _cachedSafeUnderworldPos = safePos;
@@ -1193,8 +1233,8 @@ namespace ClassSystemPlugin
         {
             if (player == null || !player.Active) return;
 
-            // เปิดอมตะตลอดเวลาที่อยู่ในช่วงล็อกในนรก
             SetUnderworldGodMode(player, true);
+            DisarmLockedPlayer(player);
 
             Vector2 hellPos = GetUnderworldPosition();
             _frozenPositions[player.Index] = hellPos;
@@ -1202,6 +1242,7 @@ namespace ClassSystemPlugin
             if (Vector2.Distance(player.TPlayer.position, hellPos) > 64f)
             {
                 player.TPlayer.velocity = Vector2.Zero;
+                player.TPlayer.fallStart = (int)(hellPos.Y / 16f);
                 player.Teleport(hellPos.X, hellPos.Y);
             }
 
@@ -1225,7 +1266,6 @@ namespace ClassSystemPlugin
         {
             if (player == null) return;
 
-            // ปิดอมตะของปลั๊กอินทันทีเมื่อเลือกคลาสและเลือกอาวุธครบแล้ว
             SetUnderworldGodMode(player, false);
 
             _frozenPositions.Remove(player.Index);
@@ -1420,6 +1460,7 @@ namespace ClassSystemPlugin
             _serverBroadcastCooldown.Remove(args.Who);
             _lastBroadcastPhase.Remove(args.Who);
             _dropWarnCooldown.Remove(args.Who);
+            _craftWarnCooldown.Remove(args.Who);
             _crystalWarnCooldown.Remove(args.Who);
             _buffRefreshCooldown.Remove(args.Who);
             _lastSyncedMaxLife.Remove(args.Who);
@@ -1613,7 +1654,8 @@ namespace ClassSystemPlugin
                     player.TPlayer.itemAnimation = 0;
                     player.TPlayer.itemTime = 0;
                     CancelActivePlayerProjectiles(player);
-                    EjectDisallowedItemSafely(player, args.Slot, testItem, args.Type, args.Stack, (byte)args.Prefix);
+                    bool isCursorOrCraft = (args.Slot == 58);
+                    EjectDisallowedItemSafely(player, args.Slot, testItem, args.Type, args.Stack, (byte)args.Prefix, isCursorOrCraft);
                 }
             }
         }
@@ -1638,6 +1680,7 @@ namespace ClassSystemPlugin
                 {
                     _honeyRegenAccumulator.Remove(player.Index);
                     SetUnderworldGodMode(player, true);
+                    DisarmLockedPlayer(player);
                     if (runPeriodicSync)
                     {
                         ApplyUnderworldLock(player, false);
@@ -1650,6 +1693,7 @@ namespace ClassSystemPlugin
                 {
                     _honeyRegenAccumulator.Remove(player.Index);
                     SetUnderworldGodMode(player, true);
+                    DisarmLockedPlayer(player);
                     if (runPeriodicSync)
                     {
                         ApplyUnderworldLock(player, true);
@@ -1667,6 +1711,7 @@ namespace ClassSystemPlugin
                     string choicePrompt = GetStarterChoicePrompt(state.ClassName);
                     _honeyRegenAccumulator.Remove(player.Index);
                     SetUnderworldGodMode(player, true);
+                    DisarmLockedPlayer(player);
                     if (runPeriodicSync)
                     {
                         ApplyUnderworldLock(player, true);
@@ -1706,7 +1751,18 @@ namespace ClassSystemPlugin
             if (playerIndex < 0 || playerIndex >= TShock.Players.Length) return;
 
             var tsPlayer = TShock.Players[playerIndex];
-            if (tsPlayer == null || !tsPlayer.IsLoggedIn || tsPlayer.Account == null) return;
+            if (tsPlayer == null || !tsPlayer.Active) return;
+
+            // ห้ามทำดาเมจใส่มอนสเตอร์/บอสทุกชนิด หากยังล็อกอิน/เลือกคลาส/เลือกไอเทมไม่ครบ
+            if (IsPlayerInSelectionLock(tsPlayer))
+            {
+                args.Damage = 0;
+                args.Handled = true;
+                DisarmLockedPlayer(tsPlayer);
+                return;
+            }
+
+            if (!tsPlayer.IsLoggedIn || tsPlayer.Account == null) return;
 
             var state = GetPlayerState(tsPlayer);
             if (state == null || string.IsNullOrEmpty(state.ClassName)) return;
