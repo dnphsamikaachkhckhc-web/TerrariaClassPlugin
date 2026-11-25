@@ -33,8 +33,8 @@ namespace ClassSystemPlugin
     {
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
-        public override string Description => "Class & starter-choice (/ch 1|2) system with SQLite persistence, boss-gated Life Crystal quotas (3 base + 2 per boss up to 15), guaranteed 15s Cursed debuff & 2s crystal refund on any over-phase Life Crystal use, per-class/pack Max HP caps (Melee /ch 1 up to 460), multiplayer death-desync fix (no ghost-walking gibs), cross-class item ejection, anti-clear permanent buffs/debuffs, and smooth boss sync.";
-        public override Version Version => new Version(18, 13, 0);
+        public override string Description => "Class & starter-choice (/ch 1|2) system with SQLite persistence, boss-gated Life Crystal quotas (3 base + 2 per boss up to 15), guaranteed 15s Cursed debuff & 2s crystal refund on any over-phase Life Crystal use, per-class/pack Max HP caps (Melee /ch 1 up to 460), multiplayer death-desync fix (no ghost-walking gibs), cross-class item ejection, force-synced anti-clear buffs/debuffs, and smooth boss sync.";
+        public override Version Version => new Version(18, 14, 0);
 
         private const string ClassSelectPrompt =
             "Chat by Shokuya :3 Please select your class >w<\n\n" +
@@ -465,7 +465,7 @@ namespace ClassSystemPlugin
             MaintainClassMaxHp(player, state);
 
             _cursedPenaltyUntilUtc[player.Index] = DateTime.UtcNow.AddSeconds(CursedPenaltySeconds);
-            player.SetBuff(BuffID.Cursed, CursedPenaltyTicks, true);
+            ForceSyncBuffToPlayer(player, BuffID.Cursed, CursedPenaltyTicks);
 
             if (refundedAmount > 0)
             {
@@ -496,6 +496,14 @@ namespace ClassSystemPlugin
             }
         }
 
+        private void ForceSyncBuffToPlayer(TSPlayer player, int buffId, int ticks)
+        {
+            if (player?.TPlayer == null || !player.Active) return;
+            player.SetBuff(buffId, ticks, true);
+            NetMessage.SendData((int)PacketTypes.PlayerAddBuff, player.Index, -1, null, player.Index, buffId, ticks);
+            NetMessage.SendData((int)PacketTypes.PlayerAddBuff, -1, player.Index, null, player.Index, buffId, ticks);
+        }
+
         private void MaintainActiveCursedPenalty(TSPlayer player)
         {
             if (player?.TPlayer == null || !player.Active || IsPlayerDeadState(player)) return;
@@ -511,7 +519,7 @@ namespace ClassSystemPlugin
             int remainingTicks = Math.Max(60, (int)Math.Ceiling(remainingSeconds * 60.0));
             if (!HasBuff(player, BuffID.Cursed) || GetBuffRemainingTicks(player.TPlayer, BuffID.Cursed) < 30)
             {
-                player.SetBuff(BuffID.Cursed, remainingTicks, true);
+                ForceSyncBuffToPlayer(player, BuffID.Cursed, remainingTicks);
             }
         }
 
@@ -876,8 +884,7 @@ namespace ClassSystemPlugin
             }
             else if (c == "ranger")
             {
-                bool hasImmunity = HasBrokenArmorImmunityItem(tPlayer);
-                list.Add(hasImmunity ? BuffID.WitheredArmor : BuffID.BrokenArmor);
+                list.Add(BuffID.BrokenArmor);
                 if (ch == 1)
                 {
                     list.Add(BuffID.Archery);
@@ -889,8 +896,7 @@ namespace ClassSystemPlugin
             }
             else if (c == "mage")
             {
-                bool hasImmunity = HasBrokenArmorImmunityItem(tPlayer);
-                list.Add(hasImmunity ? BuffID.WitheredArmor : BuffID.BrokenArmor);
+                list.Add(BuffID.BrokenArmor);
                 if (ch == 1)
                 {
                     list.Add(BuffID.MagicPower);
@@ -919,7 +925,7 @@ namespace ClassSystemPlugin
 
             if (!bypassCooldown &&
                 _lockedBuffRestoreCooldown.TryGetValue(player.Index, out DateTime lastRestore) &&
-                (DateTime.UtcNow - lastRestore).TotalMilliseconds < 350)
+                (DateTime.UtcNow - lastRestore).TotalMilliseconds < 200)
             {
                 return;
             }
@@ -928,7 +934,7 @@ namespace ClassSystemPlugin
 
             foreach (int buffId in missingBuffIds)
             {
-                player.SetBuff(buffId, PermanentBuffDurationTicks, true);
+                ForceSyncBuffToPlayer(player, buffId, PermanentBuffDurationTicks);
             }
         }
 
@@ -998,7 +1004,7 @@ namespace ClassSystemPlugin
                         exists = true;
                         if (player.TPlayer.buffTime[i] < 3600)
                         {
-                            player.SetBuff(buffId, PermanentBuffDurationTicks, true);
+                            ForceSyncBuffToPlayer(player, buffId, PermanentBuffDurationTicks);
                         }
                         break;
                     }
@@ -1006,7 +1012,7 @@ namespace ClassSystemPlugin
 
                 if (!exists)
                 {
-                    player.SetBuff(buffId, PermanentBuffDurationTicks, true);
+                    ForceSyncBuffToPlayer(player, buffId, PermanentBuffDurationTicks);
                 }
             }
         }
@@ -1075,24 +1081,6 @@ namespace ClassSystemPlugin
             for (int i = 0; i < Player.maxBuffs; i++)
             {
                 if (player.TPlayer.buffType[i] == buffId && player.TPlayer.buffTime[i] > 0)
-                {
-                    return true;
-                }
-            }
-            return false;
-        }
-
-        private bool HasBrokenArmorImmunityItem(Player tPlayer)
-        {
-            if (tPlayer == null) return false;
-            for (int i = 3; i < 10 && i < tPlayer.armor.Length; i++)
-            {
-                Item acc = tPlayer.armor[i];
-                if (acc == null || acc.IsAir) continue;
-                if (acc.type == ItemID.ArmorPolish ||
-                    acc.type == ItemID.ArmorBracing ||
-                    acc.type == ItemID.AnkhCharm ||
-                    acc.type == ItemID.AnkhShield)
                 {
                     return true;
                 }
