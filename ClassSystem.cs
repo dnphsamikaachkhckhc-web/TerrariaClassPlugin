@@ -33,8 +33,8 @@ namespace ClassSystemPlugin
     {
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
-        public override string Description => "Class & starter-choice (/ch 1|2) system with SQLite persistence, boss-gated Life Crystal quotas (3 base + 2 per boss up to 15), guaranteed 15s Cursed debuff & 2s crystal refund on any over-phase Life Crystal use, per-class/pack Max HP caps (Melee /ch 1 up to 460), multiplayer death-desync fix (no ghost-walking gibs), cross-class item ejection, and zero-flicker permanent buffs/debuffs.";
-        public override Version Version => new Version(18, 11, 0);
+        public override string Description => "Class & starter-choice (/ch 1|2) system with SQLite persistence, boss-gated Life Crystal quotas (3 base + 2 per boss up to 15), guaranteed 15s Cursed debuff & 2s crystal refund on any over-phase Life Crystal use, per-class/pack Max HP caps (Melee /ch 1 up to 460), multiplayer death-desync fix (no ghost-walking gibs), cross-class item ejection, anti-clear permanent buffs/debuffs, and smooth boss sync.";
+        public override Version Version => new Version(18, 13, 0);
 
         private const string ClassSelectPrompt =
             "Chat by Shokuya :3 Please select your class >w<\n\n" +
@@ -508,11 +508,24 @@ namespace ClassSystemPlugin
                 return;
             }
 
-            if (!HasBuff(player, BuffID.Cursed))
+            int remainingTicks = Math.Max(60, (int)Math.Ceiling(remainingSeconds * 60.0));
+            if (!HasBuff(player, BuffID.Cursed) || GetBuffRemainingTicks(player.TPlayer, BuffID.Cursed) < 30)
             {
-                int remainingTicks = Math.Max(60, (int)Math.Ceiling(remainingSeconds * 60.0));
                 player.SetBuff(BuffID.Cursed, remainingTicks, true);
             }
+        }
+
+        private int GetBuffRemainingTicks(Player tPlayer, int buffId)
+        {
+            if (tPlayer == null) return 0;
+            for (int i = 0; i < Player.maxBuffs; i++)
+            {
+                if (tPlayer.buffType[i] == buffId)
+                {
+                    return tPlayer.buffTime[i];
+                }
+            }
+            return 0;
         }
 
         private void ProcessPendingLifeCrystalRefunds(TSPlayer player)
@@ -574,10 +587,8 @@ namespace ClassSystemPlugin
             if (player?.TPlayer == null || !player.Active || IsPlayerDeadState(player)) return;
 
             var tPlayer = player.TPlayer;
-            // ห้ามแตะต้องหรือส่ง PacketTypes.PlayerHp เด็ดขาดถ้าเลือดเหลือน้อยกว่าหรือเท่ากับ 0 หรือตัวละครกำลังตาย
             if (tPlayer.dead || tPlayer.statLife <= 0) return;
 
-            // เว้นช่วง 400ms หลังเพิ่งโดนดาเมจเพื่อป้องกันการยิงแพ็กเก็ตสวนจังหวะตาย (ป้องกันบัคตัวบิดเบี้ยวเดินได้หลังตาย)
             if (_recentDamageGraceUntil.TryGetValue(player.Index, out DateTime graceUntil) && DateTime.UtcNow < graceUntil)
                 return;
 
@@ -603,13 +614,12 @@ namespace ClassSystemPlugin
                 maxChanged = true;
             }
 
-            if (maxChanged || !_lastAppliedMaxHp.TryGetValue(player.Index, out int prevMax) || prevMax != targetMaxHp)
+            if (maxChanged && (!_lastAppliedMaxHp.TryGetValue(player.Index, out int prevMax) || prevMax != targetMaxHp))
             {
                 _lastAppliedMaxHp[player.Index] = targetMaxHp;
                 if (!tPlayer.dead && tPlayer.statLife > 0)
                 {
                     NetMessage.SendData((int)PacketTypes.PlayerHp, -1, -1, null, player.Index);
-                    NetMessage.SendData((int)PacketTypes.PlayerHp, player.Index, -1, null, player.Index);
                 }
             }
         }
@@ -832,6 +842,10 @@ namespace ClassSystemPlugin
                 list.Add(BuffID.Weak);
                 list.Add(BuffID.Endurance);
             }
+            else if (c == "ranger" || c == "mage")
+            {
+                list.Add(BuffID.BrokenArmor);
+            }
 
             return list.ToArray();
         }
@@ -905,7 +919,7 @@ namespace ClassSystemPlugin
 
             if (!bypassCooldown &&
                 _lockedBuffRestoreCooldown.TryGetValue(player.Index, out DateTime lastRestore) &&
-                (DateTime.UtcNow - lastRestore).TotalMilliseconds < 400)
+                (DateTime.UtcNow - lastRestore).TotalMilliseconds < 350)
             {
                 return;
             }
@@ -952,27 +966,37 @@ namespace ClassSystemPlugin
             if (player == null || player.TPlayer == null || !player.Active || IsPlayerDeadState(player)) return;
             if (state == null || string.IsNullOrEmpty(state.ClassName) || state.StarterChoice <= 0) return;
 
-            if (!forceInitial &&
+            int[] requiredBuffs = GetPermanentBuffsForState(state, player.TPlayer);
+            if (requiredBuffs.Length == 0) return;
+
+            bool hasMissingBuff = false;
+            foreach (int buffId in requiredBuffs)
+            {
+                if (!HasBuff(player.TPlayer, buffId))
+                {
+                    hasMissingBuff = true;
+                    break;
+                }
+            }
+
+            if (!forceInitial && !hasMissingBuff &&
                 _buffRefreshCooldown.TryGetValue(player.Index, out DateTime lastCd) &&
-                (DateTime.UtcNow - lastCd).TotalSeconds < 3.0)
+                (DateTime.UtcNow - lastCd).TotalSeconds < 2.0)
             {
                 return;
             }
 
             _buffRefreshCooldown[player.Index] = DateTime.UtcNow;
 
-            int[] requiredBuffs = GetPermanentBuffsForState(state, player.TPlayer);
-            if (requiredBuffs.Length == 0) return;
-
             foreach (int buffId in requiredBuffs)
             {
                 bool exists = false;
                 for (int i = 0; i < Player.maxBuffs; i++)
                 {
-                    if (player.TPlayer.buffType[i] == buffId)
+                    if (player.TPlayer.buffType[i] == buffId && player.TPlayer.buffTime[i] > 0)
                     {
                         exists = true;
-                        if (player.TPlayer.buffTime[i] > 0 && player.TPlayer.buffTime[i] < 3600)
+                        if (player.TPlayer.buffTime[i] < 3600)
                         {
                             player.SetBuff(buffId, PermanentBuffDurationTicks, true);
                         }
@@ -1099,7 +1123,6 @@ namespace ClassSystemPlugin
 
                         if (targetId == player.Index)
                         {
-                            // ถ้าผู้เล่นส่งค่าเลือด <= 0 ให้ถือว่ากำลังตาย อย่าส่ง PlayerHp สวนกลับเด็ดขาด
                             if (statLife <= 0)
                             {
                                 _recentDamageGraceUntil[player.Index] = DateTime.UtcNow.AddMilliseconds(600);
@@ -1219,7 +1242,7 @@ namespace ClassSystemPlugin
 
                                     if (missing.Count > 0)
                                     {
-                                        RestoreMissingLockedBuffs(player, state, missing, false);
+                                        RestoreMissingLockedBuffs(player, state, missing, true);
                                     }
                                 }
                                 else
@@ -1246,7 +1269,6 @@ namespace ClassSystemPlugin
                 return;
             }
 
-            // บันทึกช่วงเวลาปลอดภัยหลังโดนดาเมจ เพื่อไม่ให้ระบบ Max HP ยิงแพ็กเก็ตสวนจังหวะตาย
             _recentDamageGraceUntil[player.Index] = DateTime.UtcNow.AddMilliseconds(500);
 
             if (IsPlayerDeadState(player) || player.TPlayer == null || player.TPlayer.dead || player.TPlayer.statLife <= 0)
@@ -1270,11 +1292,9 @@ namespace ClassSystemPlugin
             int damageRefund = (int)Math.Floor(extraDefenseSaved * defenseEffectiveness);
             if (damageRefund > 0)
             {
-                // คำนวณดาเมจสุทธิที่ผู้เล่นโดนจริง (หลังหักเกราะเดิม 50% ของ Broken Armor)
                 int rawNetDamage = Math.Max(1, args.Damage - (int)Math.Floor(defAt50Percent * defenseEffectiveness));
                 int remainingAfterHit = player.TPlayer.statLife - rawNetDamage;
 
-                // ถ้านัดนี้ทำให้เลือดเหลือ <= 0 (ตายแน่นอน) ห้ามคืนเลือดหรือส่ง PlayerHp สวนกลับเด็ดขาด!
                 if (remainingAfterHit <= 0)
                 {
                     _recentDamageGraceUntil[player.Index] = DateTime.UtcNow.AddMilliseconds(1000);
@@ -2356,7 +2376,7 @@ namespace ClassSystemPlugin
             double honeyDeltaSec = Math.Min(1.0, (now - _lastHoneyTick).TotalSeconds);
             _lastHoneyTick = now;
 
-            bool runPeriodicSync = (now - _lastTickSync).TotalMilliseconds >= 100;
+            bool runPeriodicSync = (now - _lastTickSync).TotalMilliseconds >= 500;
             if (runPeriodicSync)
             {
                 _lastTickSync = now;
