@@ -26,8 +26,8 @@ namespace ClassSystemPlugin
     {
         public int ItemType { get; set; }
         public string ItemName { get; set; }
-        public DateTime ExpiresAtUtc { get; set; }
-        public int LastCountdownShown { get; set; } = int.MaxValue;
+        public DateTime NextTickAtUtc { get; set; }
+        public int CurrentStep { get; set; } = 0; // 1 -> 10
         public DateTime LastWarningSentUtc { get; set; } = DateTime.MinValue;
     }
 
@@ -42,8 +42,8 @@ namespace ClassSystemPlugin
     {
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
-        public override string Description => "Class & starter-choice (/ch 1|2) system with SQLite persistence, boss-gated Life Crystal quotas (3 base + 2 per boss up to 15), guaranteed 15s Cursed debuff & 2s crystal refund on any over-phase Life Crystal use, per-class/pack Max HP caps (Melee /ch 1 up to 460, Melee /ch 2 starts at 100 with permanent Bleeding), multiplayer death-desync fix, cross-class item ejection, and 10s Stoned death punishment for wearing debuff-cleansing items.";
-        public override Version Version => new Version(18, 18, 1);
+        public override string Description => "Class & starter-choice (/ch 1|2) system with SQLite persistence, boss-gated Life Crystal quotas (3 base + 2 per boss up to 15), guaranteed 15s Cursed debuff & 2s crystal refund on any over-phase Life Crystal use, per-class/pack Max HP caps (Melee /ch 1 up to 460, Melee /ch 2 starts at 100 with permanent Bleeding), Summoner /ch 1 Foxparks starter, multiplayer death-desync fix, cross-class item ejection, and 1-10s scaling true-damage (1..10) Webbed punishment for wearing debuff-cleansing items.";
+        public override Version Version => new Version(18, 18, 5);
 
         private const string ClassSelectPrompt =
             "Chat by Shokuya :3 Please select your class >w<\n" +
@@ -59,7 +59,8 @@ namespace ClassSystemPlugin
         private const int CursedPenaltySeconds = 15;
         private const int CursedPenaltyTicks = CursedPenaltySeconds * 60; // 900 ticks (15s)
         private const double CrystalRefundDelaySeconds = 2.0;
-        private const double DebuffClearPunishmentSeconds = 10.0;
+        private const int DebuffClearPunishmentSeconds = 10;
+        private const short FoxparksItemId = 5551;
 
         private SqliteConnection _db;
         private bool _dbReady;
@@ -636,15 +637,38 @@ namespace ClassSystemPlugin
             return list.ToArray();
         }
 
-        private void SendCountdownTextAbovePlayer(TSPlayer player, int secondsLeft)
+        private void SendCountdownTextAbovePlayer(TSPlayer player, int stepNumber, int trueDamageDealt)
         {
             if (player?.TPlayer == null || !player.Active) return;
 
             Vector2 pos = player.TPlayer.Top;
-            string text = $"{secondsLeft}s";
-            int colorRaw = unchecked((int)Color.Red.PackedValue);
+            string text = $"{stepNumber}s (-{trueDamageDealt} True DMG)";
+            int colorRaw = unchecked((int)Color.OrangeRed.PackedValue);
 
             NetMessage.SendData(81, -1, -1, Terraria.Localization.NetworkText.FromLiteral(text), colorRaw, pos.X, pos.Y);
+        }
+
+        private void ApplyTrueDamageTick(TSPlayer player, int trueDamage)
+        {
+            if (player?.TPlayer == null || !player.Active || IsPlayerDeadState(player)) return;
+            int dmg = Math.Max(1, trueDamage);
+
+            _recentDamageGraceUntil[player.Index] = DateTime.UtcNow.AddMilliseconds(750);
+
+            int currentLife = player.TPlayer.statLife;
+            if (currentLife <= 0) return;
+
+            int newLife = Math.Max(0, currentLife - dmg);
+            player.TPlayer.statLife = newLife;
+
+            if (newLife <= 0)
+            {
+                KillPlayerFromPunishment(player);
+                return;
+            }
+
+            NetMessage.SendData((int)PacketTypes.PlayerHp, -1, -1, null, player.Index);
+            NetMessage.SendData((int)PacketTypes.PlayerHp, player.Index, -1, null, player.Index);
         }
 
         private void KillPlayerFromPunishment(TSPlayer player)
@@ -652,7 +676,7 @@ namespace ClassSystemPlugin
             if (player == null) return;
 
             _debuffClearPunishments.Remove(player.Index);
-            ClearBuffFromPlayer(player, BuffID.Stoned);
+            ClearBuffFromPlayer(player, BuffID.Webbed);
             MarkPlayerDead(player, 95.0);
 
             if (player.Active && player.TPlayer != null)
@@ -661,7 +685,7 @@ namespace ClassSystemPlugin
                 player.TPlayer.statLife = 0;
                 NetMessage.SendData((int)PacketTypes.PlayerHp, -1, -1, null, player.Index);
                 NetMessage.SendData((int)PacketTypes.PlayerHp, player.Index, -1, null, player.Index);
-                NetMessage.SendData(118, -1, -1, Terraria.Localization.NetworkText.FromLiteral($"{player.Name} was petrified for wearing a debuff-clearing item."), player.Index, 0, 0, 0);
+                NetMessage.SendData(118, -1, -1, Terraria.Localization.NetworkText.FromLiteral($"{player.Name} was tangled in webs by true damage for wearing a debuff-clearing item."), player.Index, 0, 0, 0);
             }
         }
 
@@ -672,7 +696,7 @@ namespace ClassSystemPlugin
                 if (player != null && _debuffClearPunishments.ContainsKey(player.Index))
                 {
                     _debuffClearPunishments.Remove(player.Index);
-                    ClearBuffFromPlayer(player, BuffID.Stoned);
+                    ClearBuffFromPlayer(player, BuffID.Webbed);
                 }
                 return;
             }
@@ -683,8 +707,8 @@ namespace ClassSystemPlugin
             {
                 if (_debuffClearPunishments.Remove(player.Index))
                 {
-                    ClearBuffFromPlayer(player, BuffID.Stoned);
-                    player.SendSuccessMessage("[ClassSystem] Debuff-clearing item removed. Stoned timer cancelled.");
+                    ClearBuffFromPlayer(player, BuffID.Webbed);
+                    player.SendSuccessMessage("[ClassSystem] Debuff-clearing item removed. True-damage Webbed timer cancelled.");
                 }
                 return;
             }
@@ -696,39 +720,44 @@ namespace ClassSystemPlugin
                 {
                     ItemType = equippedClearItem.type,
                     ItemName = string.IsNullOrWhiteSpace(equippedClearItem.Name) ? Lang.GetItemNameValue(equippedClearItem.type) : equippedClearItem.Name,
-                    ExpiresAtUtc = now.AddSeconds(DebuffClearPunishmentSeconds),
-                    LastCountdownShown = int.MaxValue,
-                    LastWarningSentUtc = now
+                    NextTickAtUtc = now,
+                    CurrentStep = 0,
+                    LastWarningSentUtc = DateTime.MinValue
                 };
                 _debuffClearPunishments[player.Index] = punishment;
-                player.SendWarningMessage($"Please remove {punishment.ItemName} >:(");
-                SendCountdownTextAbovePlayer(player, (int)DebuffClearPunishmentSeconds);
-                punishment.LastCountdownShown = (int)DebuffClearPunishmentSeconds;
-            }
-            else if ((now - punishment.LastWarningSentUtc).TotalSeconds >= 2.5)
-            {
-                punishment.LastWarningSentUtc = now;
-                player.SendWarningMessage($"Please remove {punishment.ItemName} >:(");
             }
 
-            double remainingSec = (punishment.ExpiresAtUtc - now).TotalSeconds;
-            if (remainingSec <= 0)
+            int remainingSteps = Math.Max(1, DebuffClearPunishmentSeconds - punishment.CurrentStep);
+            int remainingTicks = Math.Max(60, remainingSteps * 60);
+            if (!HasBuff(player, BuffID.Webbed) || GetBuffRemainingTicks(player.TPlayer, BuffID.Webbed) < 30)
             {
-                KillPlayerFromPunishment(player);
-                return;
+                ForceSyncBuffToPlayer(player, BuffID.Webbed, remainingTicks);
             }
 
-            int remainingTicks = Math.Max(60, (int)Math.Ceiling(remainingSec * 60.0));
-            if (!HasBuff(player, BuffID.Stoned) || GetBuffRemainingTicks(player.TPlayer, BuffID.Stoned) < 30)
+            if (now >= punishment.NextTickAtUtc)
             {
-                ForceSyncBuffToPlayer(player, BuffID.Stoned, remainingTicks);
-            }
+                punishment.CurrentStep++;
+                punishment.NextTickAtUtc = now.AddSeconds(1.0);
 
-            int ceilSec = (int)Math.Ceiling(remainingSec);
-            if (ceilSec < punishment.LastCountdownShown && ceilSec >= 1)
-            {
-                punishment.LastCountdownShown = ceilSec;
-                SendCountdownTextAbovePlayer(player, ceilSec);
+                int stepNumber = punishment.CurrentStep;
+                int trueDamage = Math.Clamp(stepNumber, 1, DebuffClearPunishmentSeconds);
+
+                ApplyTrueDamageTick(player, trueDamage);
+
+                if (player.Active && !IsPlayerDeadState(player))
+                {
+                    SendCountdownTextAbovePlayer(player, stepNumber, trueDamage);
+                    if ((now - punishment.LastWarningSentUtc).TotalSeconds >= 1.0)
+                    {
+                        punishment.LastWarningSentUtc = now;
+                        player.SendWarningMessage($"Please remove {punishment.ItemName} >:( [{stepNumber}s | -{trueDamage} True DMG | Webbed]");
+                    }
+                }
+
+                if (stepNumber >= DebuffClearPunishmentSeconds && player.Active && !IsPlayerDeadState(player))
+                {
+                    KillPlayerFromPunishment(player);
+                }
             }
         }
 
@@ -917,7 +946,7 @@ namespace ClassSystemPlugin
             if (player == null || !player.Active) return;
 
             ClearPlayerDeadState(player);
-            ClearBuffFromPlayer(player, BuffID.Stoned);
+            ClearBuffFromPlayer(player, BuffID.Webbed);
 
             if (player.IsLoggedIn && player.Account != null)
             {
@@ -1356,9 +1385,9 @@ namespace ClassSystemPlugin
                 if (player.IsLoggedIn && player.Account != null && !IsPlayerDeadState(player))
                 {
                     bool hasActiveCursedPenalty = _cursedPenaltyUntilUtc.TryGetValue(player.Index, out DateTime cursedUntil) && DateTime.UtcNow < cursedUntil;
-                    bool hasActiveStonedPenalty = _debuffClearPunishments.TryGetValue(player.Index, out var stPunish) && DateTime.UtcNow < stPunish.ExpiresAtUtc;
+                    bool hasActiveWebbedPenalty = _debuffClearPunishments.TryGetValue(player.Index, out var wbPunish) && wbPunish.CurrentStep < DebuffClearPunishmentSeconds;
 
-                    if (hasActiveCursedPenalty || hasActiveStonedPenalty)
+                    if (hasActiveCursedPenalty || hasActiveWebbedPenalty)
                     {
                         if (args.MsgID == PacketTypes.PlayerAddBuff)
                         {
@@ -1379,7 +1408,7 @@ namespace ClassSystemPlugin
                                         return;
                                     }
 
-                                    if (hasActiveStonedPenalty && buffType == BuffID.Stoned)
+                                    if (hasActiveWebbedPenalty && buffType == BuffID.Webbed)
                                     {
                                         args.Handled = true;
                                         var state = GetPlayerState(player);
@@ -1411,7 +1440,7 @@ namespace ClassSystemPlugin
                                         MaintainActiveCursedPenalty(player);
                                     }
 
-                                    if (hasActiveStonedPenalty && !incomingBuffs.Contains(BuffID.Stoned))
+                                    if (hasActiveWebbedPenalty && !incomingBuffs.Contains(BuffID.Webbed))
                                     {
                                         var state = GetPlayerState(player);
                                         MaintainDebuffClearPunishment(player, state);
@@ -2629,7 +2658,10 @@ namespace ClassSystemPlugin
 
                 if (runPeriodicSync)
                 {
-                    ClearWebBuff(player);
+                    if (!_debuffClearPunishments.ContainsKey(player.Index))
+                    {
+                        ClearWebBuff(player);
+                    }
                     CleanDisallowedSpeedBuffs(player, state, false);
                     MaintainActiveCursedPenalty(player);
                     MaintainBlockedWorldItems(player);
@@ -2694,7 +2726,7 @@ namespace ClassSystemPlugin
             }
             else if (c == "summoner")
             {
-                if (choice == 1) return new[] { (ItemID.SlimeStaff, 1) };
+                if (choice == 1) return new[] { (FoxparksItemId, 1) };
                 if (choice == 2) return new[] { (ItemID.ThornWhip, 1) };
             }
             return Array.Empty<(short, int)>();
@@ -2873,7 +2905,7 @@ namespace ClassSystemPlugin
                 _pendingCrystalRefunds.Remove(target.Index);
                 _debuffClearPunishments.Remove(target.Index);
                 _lastBroadcastPhase.Remove(target.Index);
-                ClearBuffFromPlayer(target, BuffID.Stoned);
+                ClearBuffFromPlayer(target, BuffID.Webbed);
                 ClearPlayerDeadState(target);
 
                 CleanDisallowedSpeedBuffs(target, null, true);
@@ -2903,7 +2935,7 @@ namespace ClassSystemPlugin
             _pendingCrystalRefunds.Remove(target.Index);
             _debuffClearPunishments.Remove(target.Index);
             _lastBroadcastPhase.Remove(target.Index);
-            ClearBuffFromPlayer(target, BuffID.Stoned);
+            ClearBuffFromPlayer(target, BuffID.Webbed);
             ClearPlayerDeadState(target);
 
             CleanDisallowedSpeedBuffs(target, newState, true);
