@@ -42,8 +42,8 @@ namespace ClassSystemPlugin
     {
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
-        public override string Description => "Class & starter-choice (/ch 1|2) system with SQLite persistence, boss-gated Life Crystal quotas (3 base + 2 per boss up to 15), guaranteed 15s Cursed debuff & 2s crystal refund on any over-phase Life Crystal use, per-class/pack Max HP caps (Melee /ch 1 up to 460, Melee /ch 2 starts at 100 with permanent Bleeding), Summoner /ch 1 Foxparks starter, multiplayer death-desync fix, cross-class item ejection, and 1-10s scaling true-damage (1..10) Webbed punishment for wearing debuff-cleansing items.";
-        public override Version Version => new Version(18, 18, 5);
+        public override string Description => "Class & starter-choice (/ch 1|2) system with SQLite persistence, boss-gated Life Crystal quotas (3 base + 2 per boss up to 15), guaranteed 15s Cursed debuff & 2s crystal refund on any over-phase Life Crystal use, per-class/pack Max HP caps (Melee /ch 1 up to 460, Melee /ch 2 starts at 100 with permanent Bleeding), Summoner /ch 1 Foxparks starter (ID 5664), multiplayer death-desync fix, cross-class item ejection, and 1-10s scaling true-damage (1..10) Webbed punishment for wearing debuff-cleansing items.";
+        public override Version Version => new Version(18, 18, 6);
 
         private const string ClassSelectPrompt =
             "Chat by Shokuya :3 Please select your class >w<\n" +
@@ -60,7 +60,7 @@ namespace ClassSystemPlugin
         private const int CursedPenaltyTicks = CursedPenaltySeconds * 60; // 900 ticks (15s)
         private const double CrystalRefundDelaySeconds = 2.0;
         private const int DebuffClearPunishmentSeconds = 10;
-        private const short FoxparksItemId = 5551;
+        private const short FoxparksItemId = 5664;
 
         private SqliteConnection _db;
         private bool _dbReady;
