@@ -43,7 +43,7 @@ namespace ClassSystemPlugin
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
         public override string Description => "Class & starter-choice (/ch 1|2) system with SQLite persistence, boss-gated Life Crystal quotas (3 base + 2 per boss up to 15), guaranteed 15s Cursed debuff & 2s crystal refund on any over-phase Life Crystal use, per-class/pack Max HP caps (Melee /ch 1 up to 460, Melee /ch 2 starts at 100 with permanent Bleeding), multiplayer death-desync fix, cross-class item ejection, and 10s Stoned death punishment for wearing debuff-cleansing items.";
-        public override Version Version => new Version(18, 18, 0);
+        public override Version Version => new Version(18, 18, 1);
 
         private const string ClassSelectPrompt =
             "Chat by Shokuya :3 Please select your class >w<\n" +
@@ -574,12 +574,6 @@ namespace ClassSystemPlugin
                 return true;
             }
 
-            string hover = (item.hoverName ?? "").ToLowerInvariant();
-            if (hover.Contains("debuff") || hover.Contains("immunity") || hover.Contains("immune"))
-            {
-                return true;
-            }
-
             return false;
         }
 
@@ -648,7 +642,7 @@ namespace ClassSystemPlugin
 
             Vector2 pos = player.TPlayer.Top;
             string text = $"{secondsLeft}s";
-            int colorRaw = Color.Red.PackedValue;
+            int colorRaw = unchecked((int)Color.Red.PackedValue);
 
             NetMessage.SendData(81, -1, -1, Terraria.Localization.NetworkText.FromLiteral(text), colorRaw, pos.X, pos.Y);
         }
@@ -667,7 +661,7 @@ namespace ClassSystemPlugin
                 player.TPlayer.statLife = 0;
                 NetMessage.SendData((int)PacketTypes.PlayerHp, -1, -1, null, player.Index);
                 NetMessage.SendData((int)PacketTypes.PlayerHp, player.Index, -1, null, player.Index);
-                player.KillMe(PlayerDeathReason.LegacyDefault(), 9999, 0);
+                NetMessage.SendData(118, -1, -1, Terraria.Localization.NetworkText.FromLiteral($"{player.Name} was petrified for wearing a debuff-clearing item."), player.Index, 0, 0, 0);
             }
         }
 
