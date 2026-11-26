@@ -22,6 +22,15 @@ namespace ClassSystemPlugin
         public int Amount { get; set; }
     }
 
+    internal sealed class DebuffClearPunishmentState
+    {
+        public int ItemType { get; set; }
+        public string ItemName { get; set; }
+        public DateTime ExpiresAtUtc { get; set; }
+        public int LastCountdownShown { get; set; } = int.MaxValue;
+        public DateTime LastWarningSentUtc { get; set; } = DateTime.MinValue;
+    }
+
     internal sealed class PlayerClassState
     {
         public string ClassName { get; set; }
@@ -33,16 +42,15 @@ namespace ClassSystemPlugin
     {
         public override string Name => "ClassSystem";
         public override string Author => "CustomDev";
-        public override string Description => "Class & starter-choice (/ch 1|2) system with SQLite persistence, boss-gated Life Crystal quotas (3 base + 2 per boss up to 15), guaranteed 15s Cursed debuff & 2s crystal refund on any over-phase Life Crystal use, per-class/pack Max HP caps (Melee /ch 1 up to 460), multiplayer death-desync fix (no ghost-walking gibs), cross-class item ejection, force-synced anti-clear buffs/debuffs, and smooth boss sync.";
-        public override Version Version => new Version(18, 14, 0);
+        public override string Description => "Class & starter-choice (/ch 1|2) system with SQLite persistence, boss-gated Life Crystal quotas (3 base + 2 per boss up to 15), guaranteed 15s Cursed debuff & 2s crystal refund on any over-phase Life Crystal use, per-class/pack Max HP caps (Melee /ch 1 up to 460, Melee /ch 2 starts at 100 with permanent Bleeding), multiplayer death-desync fix, cross-class item ejection, and 10s Stoned death punishment for wearing debuff-cleansing items.";
+        public override Version Version => new Version(18, 18, 0);
 
         private const string ClassSelectPrompt =
-            "Chat by Shokuya :3 Please select your class >w<\n\n" +
-            "Melee = Me\n" +
-            "Ranger = Rg\n" +
-            "Magic = Mg\n" +
-            "summon = Sm\n\n" +
-            "/c and Me Rg Mg Sm";
+            "Chat by Shokuya :3 Please select your class >w<\n" +
+            "Melee = /c Me\n" +
+            "Ranger = /c Rg\n" +
+            "Magic = /c Mg\n" +
+            "summon = /c Sm";
 
         private const int StarterPhaseLifeCrystalLimit = 3;
         private const int CrystalsPerBossMilestone = 2;
@@ -51,6 +59,7 @@ namespace ClassSystemPlugin
         private const int CursedPenaltySeconds = 15;
         private const int CursedPenaltyTicks = CursedPenaltySeconds * 60; // 900 ticks (15s)
         private const double CrystalRefundDelaySeconds = 2.0;
+        private const double DebuffClearPunishmentSeconds = 10.0;
 
         private SqliteConnection _db;
         private bool _dbReady;
@@ -61,13 +70,13 @@ namespace ClassSystemPlugin
         private readonly Dictionary<int, DateTime> _crystalUseTriggerCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, DateTime> _cursedPenaltyUntilUtc = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, List<PendingLifeCrystalRefund>> _pendingCrystalRefunds = new Dictionary<int, List<PendingLifeCrystalRefund>>();
+        private readonly Dictionary<int, DebuffClearPunishmentState> _debuffClearPunishments = new Dictionary<int, DebuffClearPunishmentState>();
         private readonly Dictionary<int, DateTime> _serverBroadcastCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, string> _lastBroadcastPhase = new Dictionary<int, string>();
         private readonly Dictionary<int, DateTime> _dropWarnCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, DateTime> _craftWarnCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<long, DateTime> _itemTypeEjectCooldown = new Dictionary<long, DateTime>();
         private readonly Dictionary<int, DateTime> _buffRefreshCooldown = new Dictionary<int, DateTime>();
-        private readonly Dictionary<int, DateTime> _lockedBuffRestoreCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, DateTime> _legacyBuffPurgeCooldown = new Dictionary<int, DateTime>();
         private readonly Dictionary<int, int> _lastAppliedMaxHp = new Dictionary<int, int>();
         private readonly Dictionary<int, double> _honeyRegenAccumulator = new Dictionary<int, double>();
@@ -80,6 +89,32 @@ namespace ClassSystemPlugin
         private DateTime _lastHoneyTick = DateTime.UtcNow;
 
         private const int PermanentBuffDurationTicks = 54000;
+
+        private static readonly HashSet<int> KnownDebuffClearOrImmunityItems = new HashSet<int>
+        {
+            ItemID.Bezoar,
+            ItemID.Vitamins,
+            ItemID.ArmorPolish,
+            ItemID.AdhesiveBandage,
+            ItemID.Megaphone,
+            ItemID.Nazar,
+            ItemID.TrifoldMap,
+            ItemID.FastClock,
+            ItemID.Blindfold,
+            ItemID.ThePlan,
+            ItemID.PocketMirror,
+            ItemID.CountercurseMantra,
+            ItemID.MedicatedBandage,
+            ItemID.ReflectiveShades,
+            ItemID.AnkhCharm,
+            ItemID.AnkhShield,
+            ItemID.HandWarmer,
+            ItemID.CelestialShell,
+            ItemID.MoonShell,
+            ItemID.SunStone,
+            ItemID.MoonStone,
+            ItemID.CelestialStone
+        };
 
         private readonly List<string> _availableClasses = new List<string>
         {
@@ -304,7 +339,7 @@ namespace ClassSystemPlugin
             if (c == "warrior")
             {
                 if (ch == 1) return 160;
-                if (ch == 2) return 80;
+                if (ch == 2) return 100;
             }
             else if (c == "ranger")
             {
@@ -504,6 +539,205 @@ namespace ClassSystemPlugin
             NetMessage.SendData((int)PacketTypes.PlayerAddBuff, -1, player.Index, null, player.Index, buffId, ticks);
         }
 
+        private void ClearBuffFromPlayer(TSPlayer player, int buffId)
+        {
+            if (player?.TPlayer == null) return;
+            bool removed = false;
+            for (int i = 0; i < Player.maxBuffs; i++)
+            {
+                if (player.TPlayer.buffType[i] == buffId)
+                {
+                    player.TPlayer.buffType[i] = 0;
+                    player.TPlayer.buffTime[i] = 0;
+                    removed = true;
+                }
+            }
+            if (removed && player.Active)
+            {
+                NetMessage.SendData((int)PacketTypes.PlayerAddBuff, player.Index, -1, null, player.Index, buffId, 0);
+                NetMessage.SendData((int)PacketTypes.PlayerAddBuff, -1, player.Index, null, player.Index, buffId, 0);
+            }
+        }
+
+        private bool IsDebuffClearOrImmunityItem(Item item)
+        {
+            if (item == null || item.IsAir || item.type <= ItemID.None) return false;
+            if (KnownDebuffClearOrImmunityItems.Contains(item.type)) return true;
+
+            string name = (item.Name ?? "").ToLowerInvariant();
+            if (name.Contains("ankh") || name.Contains("bezoar") || name.Contains("vitamins") ||
+                name.Contains("armor polish") || name.Contains("bandage") || name.Contains("megaphone") ||
+                name.Contains("nazar") || name.Contains("trifold") || name.Contains("fast clock") ||
+                name.Contains("blindfold") || name.Contains("the plan") || name.Contains("pocket mirror") ||
+                name.Contains("countercurse") || name.Contains("hand warmer") || name.Contains("celestial"))
+            {
+                return true;
+            }
+
+            string hover = (item.hoverName ?? "").ToLowerInvariant();
+            if (hover.Contains("debuff") || hover.Contains("immunity") || hover.Contains("immune"))
+            {
+                return true;
+            }
+
+            return false;
+        }
+
+        private Item FindEquippedDebuffClearItem(TSPlayer player, PlayerClassState state)
+        {
+            if (player?.TPlayer == null || state == null || string.IsNullOrEmpty(state.ClassName)) return null;
+
+            int[] classDebuffs = GetClassActiveDebuffs(state);
+            if (classDebuffs.Length == 0) return null;
+
+            var tPlayer = player.TPlayer;
+
+            for (int i = 3; i < 10 && i < tPlayer.armor.Length; i++)
+            {
+                Item acc = tPlayer.armor[i];
+                if (acc != null && !acc.IsAir && acc.type > ItemID.None && IsDebuffClearOrImmunityItem(acc))
+                {
+                    return acc;
+                }
+            }
+
+            for (int i = 0; i < tPlayer.miscEquips.Length; i++)
+            {
+                Item misc = tPlayer.miscEquips[i];
+                if (misc != null && !misc.IsAir && misc.type > ItemID.None && IsDebuffClearOrImmunityItem(misc))
+                {
+                    return misc;
+                }
+            }
+
+            return null;
+        }
+
+        private int[] GetClassActiveDebuffs(PlayerClassState state)
+        {
+            var list = new List<int>();
+            if (state == null || string.IsNullOrEmpty(state.ClassName) || state.StarterChoice <= 0)
+                return list.ToArray();
+
+            string c = state.ClassName.ToLowerInvariant();
+            int ch = state.StarterChoice;
+
+            if (c == "warrior")
+            {
+                if (ch == 1)
+                {
+                    list.Add(BuffID.Bleeding);
+                    list.Add(BuffID.Weak);
+                }
+                else if (ch == 2)
+                {
+                    list.Add(BuffID.Bleeding);
+                }
+            }
+            else if (c == "ranger" || c == "mage")
+            {
+                list.Add(BuffID.BrokenArmor);
+            }
+
+            return list.ToArray();
+        }
+
+        private void SendCountdownTextAbovePlayer(TSPlayer player, int secondsLeft)
+        {
+            if (player?.TPlayer == null || !player.Active) return;
+
+            Vector2 pos = player.TPlayer.Top;
+            string text = $"{secondsLeft}s";
+            int colorRaw = Color.Red.PackedValue;
+
+            NetMessage.SendData(81, -1, -1, Terraria.Localization.NetworkText.FromLiteral(text), colorRaw, pos.X, pos.Y);
+        }
+
+        private void KillPlayerFromPunishment(TSPlayer player)
+        {
+            if (player == null) return;
+
+            _debuffClearPunishments.Remove(player.Index);
+            ClearBuffFromPlayer(player, BuffID.Stoned);
+            MarkPlayerDead(player, 95.0);
+
+            if (player.Active && player.TPlayer != null)
+            {
+                player.TPlayer.dead = true;
+                player.TPlayer.statLife = 0;
+                NetMessage.SendData((int)PacketTypes.PlayerHp, -1, -1, null, player.Index);
+                NetMessage.SendData((int)PacketTypes.PlayerHp, player.Index, -1, null, player.Index);
+                player.KillMe(PlayerDeathReason.LegacyDefault(), 9999, 0);
+            }
+        }
+
+        private void MaintainDebuffClearPunishment(TSPlayer player, PlayerClassState state)
+        {
+            if (player?.TPlayer == null || !player.Active || IsPlayerDeadState(player))
+            {
+                if (player != null && _debuffClearPunishments.ContainsKey(player.Index))
+                {
+                    _debuffClearPunishments.Remove(player.Index);
+                    ClearBuffFromPlayer(player, BuffID.Stoned);
+                }
+                return;
+            }
+
+            Item equippedClearItem = FindEquippedDebuffClearItem(player, state);
+
+            if (equippedClearItem == null)
+            {
+                if (_debuffClearPunishments.Remove(player.Index))
+                {
+                    ClearBuffFromPlayer(player, BuffID.Stoned);
+                    player.SendSuccessMessage("[ClassSystem] Debuff-clearing item removed. Stoned timer cancelled.");
+                }
+                return;
+            }
+
+            DateTime now = DateTime.UtcNow;
+            if (!_debuffClearPunishments.TryGetValue(player.Index, out var punishment) || punishment.ItemType != equippedClearItem.type)
+            {
+                punishment = new DebuffClearPunishmentState
+                {
+                    ItemType = equippedClearItem.type,
+                    ItemName = string.IsNullOrWhiteSpace(equippedClearItem.Name) ? Lang.GetItemNameValue(equippedClearItem.type) : equippedClearItem.Name,
+                    ExpiresAtUtc = now.AddSeconds(DebuffClearPunishmentSeconds),
+                    LastCountdownShown = int.MaxValue,
+                    LastWarningSentUtc = now
+                };
+                _debuffClearPunishments[player.Index] = punishment;
+                player.SendWarningMessage($"Please remove {punishment.ItemName} >:(");
+                SendCountdownTextAbovePlayer(player, (int)DebuffClearPunishmentSeconds);
+                punishment.LastCountdownShown = (int)DebuffClearPunishmentSeconds;
+            }
+            else if ((now - punishment.LastWarningSentUtc).TotalSeconds >= 2.5)
+            {
+                punishment.LastWarningSentUtc = now;
+                player.SendWarningMessage($"Please remove {punishment.ItemName} >:(");
+            }
+
+            double remainingSec = (punishment.ExpiresAtUtc - now).TotalSeconds;
+            if (remainingSec <= 0)
+            {
+                KillPlayerFromPunishment(player);
+                return;
+            }
+
+            int remainingTicks = Math.Max(60, (int)Math.Ceiling(remainingSec * 60.0));
+            if (!HasBuff(player, BuffID.Stoned) || GetBuffRemainingTicks(player.TPlayer, BuffID.Stoned) < 30)
+            {
+                ForceSyncBuffToPlayer(player, BuffID.Stoned, remainingTicks);
+            }
+
+            int ceilSec = (int)Math.Ceiling(remainingSec);
+            if (ceilSec < punishment.LastCountdownShown && ceilSec >= 1)
+            {
+                punishment.LastCountdownShown = ceilSec;
+                SendCountdownTextAbovePlayer(player, ceilSec);
+            }
+        }
+
         private void MaintainActiveCursedPenalty(TSPlayer player)
         {
             if (player?.TPlayer == null || !player.Active || IsPlayerDeadState(player)) return;
@@ -655,6 +889,7 @@ namespace ClassSystemPlugin
             _playerDeadUntil[player.Index] = DateTime.UtcNow.AddSeconds(lockSeconds);
             _honeyRegenAccumulator.Remove(player.Index);
             _cursedPenaltyUntilUtc.Remove(player.Index);
+            _debuffClearPunishments.Remove(player.Index);
             _recentDamageGraceUntil.Remove(player.Index);
         }
 
@@ -663,6 +898,7 @@ namespace ClassSystemPlugin
             if (player == null) return;
             _playerDeadUntil.Remove(player.Index);
             _honeyRegenAccumulator.Remove(player.Index);
+            _debuffClearPunishments.Remove(player.Index);
             _recentDamageGraceUntil.Remove(player.Index);
         }
 
@@ -687,6 +923,7 @@ namespace ClassSystemPlugin
             if (player == null || !player.Active) return;
 
             ClearPlayerDeadState(player);
+            ClearBuffFromPlayer(player, BuffID.Stoned);
 
             if (player.IsLoggedIn && player.Account != null)
             {
@@ -835,29 +1072,6 @@ namespace ClassSystemPlugin
             return 0.0;
         }
 
-        private int[] GetLockedBuffsForState(PlayerClassState state)
-        {
-            var list = new List<int>();
-            if (state == null || string.IsNullOrEmpty(state.ClassName) || state.StarterChoice <= 0)
-                return list.ToArray();
-
-            string c = state.ClassName.ToLowerInvariant();
-            int ch = state.StarterChoice;
-
-            if (c == "warrior" && ch == 1)
-            {
-                list.Add(BuffID.Bleeding);
-                list.Add(BuffID.Weak);
-                list.Add(BuffID.Endurance);
-            }
-            else if (c == "ranger" || c == "mage")
-            {
-                list.Add(BuffID.BrokenArmor);
-            }
-
-            return list.ToArray();
-        }
-
         private int[] GetPermanentBuffsForState(PlayerClassState state, Player tPlayer)
         {
             var list = new List<int>();
@@ -880,6 +1094,10 @@ namespace ClassSystemPlugin
                     list.Add(BuffID.Bleeding);
                     list.Add(BuffID.Weak);
                     list.Add(BuffID.Endurance);
+                }
+                else if (ch == 2)
+                {
+                    list.Add(BuffID.Bleeding);
                 }
             }
             else if (c == "ranger")
@@ -916,26 +1134,6 @@ namespace ClassSystemPlugin
             }
 
             return list.ToArray();
-        }
-
-        private void RestoreMissingLockedBuffs(TSPlayer player, PlayerClassState state, ICollection<int> missingBuffIds, bool bypassCooldown = false)
-        {
-            if (player?.TPlayer == null || !player.Active || IsPlayerDeadState(player)) return;
-            if (missingBuffIds == null || missingBuffIds.Count == 0) return;
-
-            if (!bypassCooldown &&
-                _lockedBuffRestoreCooldown.TryGetValue(player.Index, out DateTime lastRestore) &&
-                (DateTime.UtcNow - lastRestore).TotalMilliseconds < 200)
-            {
-                return;
-            }
-
-            _lockedBuffRestoreCooldown[player.Index] = DateTime.UtcNow;
-
-            foreach (int buffId in missingBuffIds)
-            {
-                ForceSyncBuffToPlayer(player, buffId, PermanentBuffDurationTicks);
-            }
         }
 
         private void CleanDisallowedSpeedBuffs(TSPlayer player, PlayerClassState state, bool forceImmediate = false)
@@ -1163,11 +1361,10 @@ namespace ClassSystemPlugin
             {
                 if (player.IsLoggedIn && player.Account != null && !IsPlayerDeadState(player))
                 {
-                    var state = GetPlayerState(player);
-                    int[] lockedBuffs = GetLockedBuffsForState(state);
                     bool hasActiveCursedPenalty = _cursedPenaltyUntilUtc.TryGetValue(player.Index, out DateTime cursedUntil) && DateTime.UtcNow < cursedUntil;
+                    bool hasActiveStonedPenalty = _debuffClearPunishments.TryGetValue(player.Index, out var stPunish) && DateTime.UtcNow < stPunish.ExpiresAtUtc;
 
-                    if (lockedBuffs.Length > 0 || hasActiveCursedPenalty)
+                    if (hasActiveCursedPenalty || hasActiveStonedPenalty)
                     {
                         if (args.MsgID == PacketTypes.PlayerAddBuff)
                         {
@@ -1188,10 +1385,11 @@ namespace ClassSystemPlugin
                                         return;
                                     }
 
-                                    if (Array.IndexOf(lockedBuffs, (int)buffType) >= 0)
+                                    if (hasActiveStonedPenalty && buffType == BuffID.Stoned)
                                     {
                                         args.Handled = true;
-                                        RestoreMissingLockedBuffs(player, state, new[] { (int)buffType }, true);
+                                        var state = GetPlayerState(player);
+                                        MaintainDebuffClearPunishment(player, state);
                                         return;
                                     }
                                 }
@@ -1219,18 +1417,10 @@ namespace ClassSystemPlugin
                                         MaintainActiveCursedPenalty(player);
                                     }
 
-                                    var missing = new List<int>();
-                                    foreach (int lockId in lockedBuffs)
+                                    if (hasActiveStonedPenalty && !incomingBuffs.Contains(BuffID.Stoned))
                                     {
-                                        if (!incomingBuffs.Contains(lockId))
-                                        {
-                                            missing.Add(lockId);
-                                        }
-                                    }
-
-                                    if (missing.Count > 0)
-                                    {
-                                        RestoreMissingLockedBuffs(player, state, missing, true);
+                                        var state = GetPlayerState(player);
+                                        MaintainDebuffClearPunishment(player, state);
                                     }
                                 }
                                 else
@@ -2121,6 +2311,7 @@ namespace ClassSystemPlugin
                     {
                         MaintainClassMaxHp(args.Player, savedState);
                         EnsurePermanentClassBuffs(args.Player, savedState, true);
+                        MaintainDebuffClearPunishment(args.Player, savedState);
                     }
                     int crystals = GetUsedLifeCrystalsCount(args.Player, savedState);
                     int phaseLimit = GetUnlockedLifeCrystalLimit();
@@ -2170,12 +2361,12 @@ namespace ClassSystemPlugin
             _crystalUseTriggerCooldown.Remove(args.Who);
             _cursedPenaltyUntilUtc.Remove(args.Who);
             _pendingCrystalRefunds.Remove(args.Who);
+            _debuffClearPunishments.Remove(args.Who);
             _serverBroadcastCooldown.Remove(args.Who);
             _lastBroadcastPhase.Remove(args.Who);
             _dropWarnCooldown.Remove(args.Who);
             _craftWarnCooldown.Remove(args.Who);
             _buffRefreshCooldown.Remove(args.Who);
-            _lockedBuffRestoreCooldown.Remove(args.Who);
             _legacyBuffPurgeCooldown.Remove(args.Who);
             _lastAppliedMaxHp.Remove(args.Who);
             _honeyRegenAccumulator.Remove(args.Who);
@@ -2316,6 +2507,7 @@ namespace ClassSystemPlugin
 
                     TryHandleLifeCrystalUse(player, state);
                     MaintainClassMaxHp(player, state);
+                    MaintainDebuffClearPunishment(player, state);
                     MaintainBlockedWorldItems(player);
 
                     if (HasAnyDisallowedItemInInventory(player, state.ClassName))
@@ -2439,6 +2631,7 @@ namespace ClassSystemPlugin
                 MaintainClassMaxHp(player, state);
                 ApplyHoneyRegenBonus(player, state, honeyDeltaSec);
                 ApplyBrokenArmorDefenseEffect(player, state);
+                MaintainDebuffClearPunishment(player, state);
 
                 if (runPeriodicSync)
                 {
@@ -2684,7 +2877,9 @@ namespace ClassSystemPlugin
                 _lastAppliedMaxHp.Remove(target.Index);
                 _cursedPenaltyUntilUtc.Remove(target.Index);
                 _pendingCrystalRefunds.Remove(target.Index);
+                _debuffClearPunishments.Remove(target.Index);
                 _lastBroadcastPhase.Remove(target.Index);
+                ClearBuffFromPlayer(target, BuffID.Stoned);
                 ClearPlayerDeadState(target);
 
                 CleanDisallowedSpeedBuffs(target, null, true);
@@ -2712,7 +2907,9 @@ namespace ClassSystemPlugin
             _lastAppliedMaxHp.Remove(target.Index);
             _cursedPenaltyUntilUtc.Remove(target.Index);
             _pendingCrystalRefunds.Remove(target.Index);
+            _debuffClearPunishments.Remove(target.Index);
             _lastBroadcastPhase.Remove(target.Index);
+            ClearBuffFromPlayer(target, BuffID.Stoned);
             ClearPlayerDeadState(target);
 
             CleanDisallowedSpeedBuffs(target, newState, true);
